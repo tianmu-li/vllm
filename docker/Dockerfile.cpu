@@ -77,7 +77,7 @@ ENV LD_PRELOAD="/usr/lib/x86_64-linux-gnu/libtcmalloc_minimal.so.4:/usr/lib/llvm
 ######################### arm64 BASE IMAGE #########################
 FROM base-common AS base-arm64
 
-ENV LD_PRELOAD="/usr/lib/aarch64-linux-gnu/libtcmalloc_minimal.so.4"
+ENV LD_PRELOAD="/usr/lib/aarch64-linux-gnu/libtcmalloc_minimal.so.4:/usr/lib/llvm-14/lib/libomp.so.5"
 
 ######################### BASE IMAGE #########################
 FROM base-${TARGETARCH} AS base
