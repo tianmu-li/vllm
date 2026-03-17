@@ -54,6 +54,25 @@ if hasattr(torch.ops._xpu_C, "int4_gemm_w4a8"):
         input_2d = input.view(-1, input.shape[-1])
         M = input_2d.size(0)
         N = q_weight.size(1)
+        return torch.empty((M, N), dtype=input.dtype, device=input.device)
+
+
+if hasattr(torch.ops._xpu_C, "int8_gemm_w8a8"):
+
+    @register_fake("_xpu_C::int8_gemm_w8a8")
+    def _int8_gemm_w8a8_fake(
+        input: torch.Tensor,
+        input_scales: torch.Tensor,
+        input_zero_points: torch.Tensor,
+        q_weight: torch.Tensor,
+        weight_scale: torch.Tensor,
+        weight_zero_points: torch.Tensor,
+        group_size: int,
+        bias: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        input_2d = input.view(-1, input.shape[-1])
+        M = input_2d.size(0)
+        N = q_weight.size(1)
         return torch.empty((M, N), dtype=torch.float16, device=input.device)
 
 
@@ -109,7 +128,7 @@ _OPS_REGISTERED = False
 class xpu_ops:
     @staticmethod
     @torch.compile
-    def dynamic_per_token_quant_ref(
+    def dynamic_per_token_int4_int8_quant_ref(
         input: torch.Tensor, use_sym_quant: bool, bits: int
     ):
         original_sizes = input.size()

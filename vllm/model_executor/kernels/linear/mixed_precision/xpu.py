@@ -112,7 +112,10 @@ class XPUw4A8IntLinearKernel(MPLinearKernel):
                 f"XPUw4A8Int requires int4 weights, got {c.weight_type}",
             )
         if c.zero_points:
-            return False, "XPUw4A8Int only supports symmetric weight quantization"
+            # Note: The w4a8 kernel supports asymmetric quantization,
+            # but the current implementation uses symmetric (zero_points=0).
+            # TODO: Enable asymmetric quantization by loading and passing zero points.
+            return False, "XPUw4A8Int currently configured for symmetric quantization"
         if c.group_size != -1 and c.group_size % 32 != 0:
             return (
                 False,
@@ -171,7 +174,7 @@ class XPUw4A8IntLinearKernel(MPLinearKernel):
 
         # TODO: static and asymmetric quantization case
         # Common code for CompressedTensorsW4A8Int does not read act symmetry data
-        quant_x, x_scale, x_zero = ops.dynamic_per_token_quant_ref(reshaped_x, True, 8)
+        quant_x, x_scale, x_zero = ops.dynamic_per_token_int4_int8_quant_ref(reshaped_x, True, 8)
 
         out = torch.ops._xpu_C.int4_gemm_w4a8(
             quant_x,
@@ -185,4 +188,79 @@ class XPUw4A8IntLinearKernel(MPLinearKernel):
             bias,
         )
 
+        return out.to(x.dtype)
+
+
+class XPUw8A8IntLinearKernel(MPLinearKernel):
+    """XPU kernel for W8A8 integer quantization using oneDNN int8_gemm_w8a8.
+
+    Weights are symmetric or asymmetric (per-channel or per-group) quantized int8.
+    Activations are dynamically quantized per-token to symmetric or asymmetric int8.
+    Currently configured for symmetric quantization (zero points set to zero).
+    """
+
+    @classmethod
+    def get_min_capability(cls) -> int:
+        return -1
+
+    @classmethod
+    def can_implement(cls, c: MPLinearLayerConfig) -> tuple[bool, str | None]:
+        if not current_platform.is_xpu():
+            return False, "XPUw8A8Int only supported on XPU"
+        if c.act_type not in (torch.bfloat16, torch.float16):
+            return False, "XPUw8A8Int requires BF16/FP16 activations"
+        if c.weight_type != scalar_types.int8:
+            return (
+                False,
+                f"XPUw8A8Int requires int8 weights, got {c.weight_type}",
+            )
+        if c.zero_points:
+            # Note: The kernel now supports asymmetric quantization,
+            # but the current implementation uses symmetric (zero_points=0).
+            # TODO: Enable asymmetric quantization by loading and passing zero points.
+            return False, "XPUw8A8Int currently configured for symmetric quantization"
+        if c.group_size != -1 and c.group_size % 32 != 0:
+            return (
+                False,
+                f"Group size ({c.group_size}) not supported by XPUw8A8Int, "
+                "must be a multiple of 32 or -1 (per-channel)",
+            )
+        in_size, out_size = c.partition_weight_shape
+        if in_size % 8 != 0 or out_size % 8 != 0:
+            return (
+                False,
+                f"in/out sizes ({in_size}, {out_size}) must be multiples of 8",
+            )
+        return True, None
+
+    def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
+        # Transpose weight scale from [N, K/gs] or [N, 1] to [K/gs, N] or [1, N]
+        # so that the C++ kernel receives scales in [num_groups, n] format.
+        layer.weight_scale.data = layer.weight_scale.data.t().contiguous()
+
+    def apply_weights(
+        self,
+        layer: torch.nn.Module,
+        x: torch.Tensor,
+        bias: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        reshaped_x = x.reshape(-1, x.shape[-1])  # [M, K]
+        from vllm._xpu_ops import xpu_ops as ops
+
+        # Symmetric per-token quantization; zero point is set to zero.
+        quant_x, x_scale, x_zero = ops.dynamic_per_token_int4_int8_quant_ref(reshaped_x, True, 8)
+
+        # For symmetric quantization, weight zero points are zero
+        weight_zero = torch.zeros_like(layer.weight_scale, dtype=torch.int32)
+
+        out = torch.ops._xpu_C.int8_gemm_w8a8(
+            quant_x,
+            x_scale,
+            x_zero,                   # activation zero points (zero for symmetric)
+            layer.weight_packed.t(),  # [K, N] NT-format view
+            layer.weight_scale,       # [K/gs, N] or [1, N]
+            weight_zero,              # weight zero points (zero for symmetric)
+            self.config.group_size,
+            bias,
+        )
         return out.to(x.dtype)
