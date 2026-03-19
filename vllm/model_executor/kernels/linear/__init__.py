@@ -49,7 +49,6 @@ from vllm.model_executor.kernels.linear.mixed_precision.marlin import (
 )
 from vllm.model_executor.kernels.linear.mixed_precision.xpu import (
     XPUw4A8IntLinearKernel,
-    XPUw8A8IntLinearKernel,
     XPUwNa16LinearKernel,
 )
 from vllm.model_executor.kernels.linear.scaled_mm import (
@@ -86,6 +85,7 @@ from vllm.model_executor.kernels.linear.scaled_mm.triton import (
 )
 from vllm.model_executor.kernels.linear.scaled_mm.xpu import (
     XPUFP8ScaledMMLinearKernel,
+    XPUInt8ScaledMMLinearKernel,
 )
 from vllm.model_executor.layers.quantization.utils.quant_utils import QuantKey
 from vllm.platforms import PlatformEnum, current_platform
@@ -100,6 +100,7 @@ _POSSIBLE_INT8_KERNELS: dict[PlatformEnum, list[type[Int8ScaledMMLinearKernel]]]
         TritonInt8ScaledMMLinearKernel,
     ],
     PlatformEnum.ROCM: [AiterInt8ScaledMMLinearKernel, TritonInt8ScaledMMLinearKernel],
+    PlatformEnum.XPU: [XPUInt8ScaledMMLinearKernel],
 }
 
 # in priority/performance order (when available)
@@ -140,7 +141,7 @@ _POSSIBLE_KERNELS: dict[PlatformEnum, list[type[MPLinearKernel]]] = {
         ExllamaLinearKernel,
     ],
     PlatformEnum.XPU: [
-        XPUw8A8IntLinearKernel,
+        XPUInt8ScaledMMLinearKernel,
         XPUw4A8IntLinearKernel,
         XPUwNa16LinearKernel,
     ],
@@ -396,6 +397,6 @@ __all__ = [
     "MacheteLinearKernel",
     "MarlinLinearKernel",
     "XPUw4A8IntLinearKernel",
-    "XPUw8A8IntLinearKernel",
+    "XPUInt8ScaledMMLinearKernel",
     "XPUwNa16LinearKernel",
 ]
