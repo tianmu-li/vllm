@@ -152,6 +152,14 @@ class CompressedTensorsMoEMethod(FusedMoEMethodBase):
                 weight_quant, input_quant, layer.moe_config
             )
         elif quant_config._is_dynamic_token_w8a8(weight_quant, input_quant):
+            if current_platform.is_cpu():
+                from .compressed_tensors_moe_w8a8_int8 import (
+                    CPUSGLIW8A8Int8MoEMethod,
+                )
+
+                return CPUSGLIW8A8Int8MoEMethod(
+                    weight_quant, input_quant, layer.moe_config
+                )
             from .compressed_tensors_moe_w8a8_int8 import (
                 CompressedTensorsW8A8Int8MoEMethod,
             )
@@ -159,6 +167,18 @@ class CompressedTensorsMoEMethod(FusedMoEMethodBase):
             return CompressedTensorsW8A8Int8MoEMethod(
                 weight_quant, input_quant, layer.moe_config
             )
+        elif quant_config._is_fp8_w8a16(weight_quant, input_quant):
+            if not current_platform.is_cpu():
+                raise RuntimeError(
+                    "FP8 W8A16 MoE (weight-only FP8, BF16/FP16 activations) is only "
+                    "supported on CPU via the SGL fused_experts_cpu kernel. "
+                    "For GPU, use W8A8 FP8 quantization instead."
+                )
+            from .compressed_tensors_moe_w8a16_fp8_cpu import (
+                CPUSGLFp8W8A16MoEMethod,
+            )
+
+            return CPUSGLFp8W8A16MoEMethod(weight_quant, layer.moe_config)
         elif quant_config._is_fp8_w4a8_sm90(weight_quant, input_quant):
             from .compressed_tensors_moe_w4a8_fp8 import (
                 CompressedTensorsW4A8Fp8MoEMethod,
