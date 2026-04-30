@@ -22,6 +22,25 @@ inline Vectorized<scalar_t> convert_from_float_ext(const Vectorized<float>& a, c
   return at::vec::convert_from_float<scalar_t>(a, b);
 }
 
+// allow f16, bf16
+template <typename scalar_t, typename std::enable_if_t<is_reduced_floating_point_v<scalar_t>, int> = 1>
+inline std::tuple<Vectorized<float>, Vectorized<float>> load_float_vec2(const scalar_t* __restrict__ data) {
+  using bVec = at::vec::Vectorized<scalar_t>;
+  using fVec = at::vec::Vectorized<float>;
+  bVec x_vec = bVec::loadu(data);
+  fVec x0, x1;
+  std::tie(x0, x1) = at::vec::convert_to_float(x_vec);
+  return std::make_tuple(x0, x1);
+}
+
+// allow f32
+inline std::tuple<Vectorized<float>, Vectorized<float>> load_float_vec2(const float* __restrict__ data) {
+  using fVec = at::vec::Vectorized<float>;
+  fVec x0 = fVec::loadu(data);
+  fVec x1 = fVec::loadu(data + fVec::size());
+  return std::make_tuple(x0, x1);
+}
+
 #if defined(CPU_CAPABILITY_AVX512)
 
 // `at::vec::convert_from_float<>` from PyTorch doesn't have avx512-bf16 intrinsics
@@ -34,8 +53,7 @@ inline Vectorized<at::BFloat16> convert_from_float_ext<at::BFloat16>(const Vecto
 #define CVT_BF16_TO_FP32(a) \
     _mm512_castsi512_ps(_mm512_slli_epi32(_mm512_cvtepu16_epi32(a), 16))
 
-#define CVT_FP16_TO_FP32(a) \
-    _mm512_cvtps_ph(a, (_MM_FROUND_TO_NEAREST_INT | _MM_FROUND_NO_EXC))
+#define CVT_FP16_TO_FP32(a) _mm512_cvtph_ps(a)
 
 // this doesn't handle NaN.
 inline __m512bh cvt_e4m3_bf16_intrinsic_no_nan(__m256i fp8_vec) {
@@ -113,10 +131,31 @@ inline __m512bh CVT_FP8_TO_BF16(__m256i a) {
 #endif
 }
 
+// faster version of float8_e4m3fn conversion to bfloat16
+//
+// we mapped cuda implementation from below link and vectorized with avx512:
+// https://github.com/thu-pacman/chitu/blob/1ed2078ec26581ebdca05b7306d4385f86edaa7c/csrc/cuda/marlin/marlin_gemm/dequant.h#L387
+//
+inline __attribute__((always_inline)) __m512bh CVT_FP8_TO_BF16_EXT(__m256i a) {
+  const __m512i mask0 = _mm512_set1_epi16(0x80);  // sign bit
+  const __m512i mask1 = _mm512_set1_epi16(0x7F);  // exponent and mantissa
+  const __m512i mask2 = _mm512_set1_epi16(0x4000);
+
+  __m512i x = _mm512_cvtepu8_epi16(a);
+  __m512i vsign = _mm512_and_si512(x, mask0);
+  vsign = _mm512_slli_epi16(vsign, 8);
+
+  __m512i vexp_and_mant = _mm512_and_si512(x, mask1);
+  vexp_and_mant = _mm512_slli_epi16(vexp_and_mant, 4);
+
+  // _MM_TERNLOG_A | _MM_TERNLOG_B | _MM_TERNLOG_C: 0b11111110
+  return (__m512bh)(_mm512_ternarylogic_epi32(vsign, mask2, vexp_and_mant, 0b11111110));
+}
+
 #endif
 
 // vector to scalar reduction
-#if defined(CPU_CAPABILITY_AVX512) && 0
+#if defined(CPU_CAPABILITY_AVX512)
 inline float vec_reduce_sum(const Vectorized<float>& a) {
   return _mm512_reduce_add_ps(__m512(a));
 }
@@ -294,15 +333,5 @@ inline std::tuple<__m512i, __m512i> transpose_2x32_16bit(__m512i r0, __m512i r1)
 #pragma GCC diagnostic pop
 
 #endif
-
-// TODO: debug print, remove me later
-template<typename scalar_t>
-void print_array(scalar_t* ptr, int size) {
-  for (int d = 0; d < size; ++d) {
-    if (d % 16 == 0) { std::cout << std::endl; }
-    std::cout << ptr[d] << " ";
-  }
-  std::cout << std::endl;
-}
 
 } // anonymous namespace

@@ -292,7 +292,7 @@ void weight_packed_linear_kernel_impl(
   const bool use_brgemm = (M > 4) || (!std::is_same_v<scalar_t, at::BFloat16>);
 
   // l2 cache block for n
-  int64_t cache_blocks_nb = get_cache_blocks<scalar_t>(BLOCK_N, K);
+  int64_t cache_blocks_nb = get_cache_blocks<scalar_t>(BLOCK_N * K);
 
   // parallel on [MB, NB]
   AT_DISPATCH_BOOL(bias != nullptr, has_bias, [&] {

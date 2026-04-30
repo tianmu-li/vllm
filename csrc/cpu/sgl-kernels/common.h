@@ -185,11 +185,37 @@ inline void parallel_2d(int m, int n, const func_t& f) {
 #endif
 }
 
+// limit max cache blocks when we need to do pre-unpack for weights, e.g. fp8
+#define MAX_CACHE_BLOCK_SIZE 4
+
 template <typename T>
-int get_cache_blocks(int BLOCK_SIZE, int K) {
+inline int get_cache_blocks(int chunk_size) {
   // L2 2MB and ratio of 50%
   const int L2_size = 2048 * 1024 >> 1;
-  return std::max(1, int(L2_size / (BLOCK_SIZE * K * sizeof(T))));
+  return std::max(1, int(L2_size / (chunk_size * sizeof(T))));
+}
+
+template <>
+inline int get_cache_blocks<at::Float8_e4m3fn>(int chunk_size) {
+  // fp8 uses bf16 as accumulate type
+  int cache_block_size = get_cache_blocks<at::BFloat16>(chunk_size);
+  return std::min(MAX_CACHE_BLOCK_SIZE, cache_block_size);
+}
+
+// 2d sequential loop in range : [mb0, mb1), [nb0, nb1)
+template <typename T, typename func_t>
+inline void loop_2d(int64_t mb0, int64_t mb1, int64_t nb0, int64_t nb1, int64_t chunk_size, const func_t& f) {
+  // get number of blocks for L2 in most inner loop
+  int64_t cache_blocks_nb = get_cache_blocks<T>(chunk_size);
+
+  // loop order: [NB / cache_blocks_nb, MB, cache_blocks_nb]
+  for (int64_t nbb = nb0; nbb < nb1; nbb += cache_blocks_nb) {
+    for (int64_t mb = mb0; mb < mb1; ++mb) {
+      for (int64_t nb = nbb; nb < std::min(nbb + cache_blocks_nb, nb1); ++nb) {
+        f(mb, nb, nb - nbb);
+      }
+    }
+  }
 }
 
 // data indexing for dimension collapse
