@@ -121,6 +121,9 @@ class CPUSGLFp8W8A16MoEMethod(CompressedTensorsMoEMethod):
         set_weight_attrs(w13_weight_scale, extra_weight_attrs)
         set_weight_attrs(w2_weight_scale, extra_weight_attrs)
 
+        layer.w13_input_scale = None
+        layer.w2_input_scale = None
+
     def process_weights_after_loading(self, layer: FusedMoE) -> None:
         N_w13, K = layer.w13_weight.shape[1], layer.w13_weight.shape[2]
         N_w2, K_w2 = layer.w2_weight.shape[1], layer.w2_weight.shape[2]

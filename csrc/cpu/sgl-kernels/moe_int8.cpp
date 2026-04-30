@@ -407,6 +407,85 @@ void tinygemm_kernel(
   }
 }
 
+#if defined(CPU_CAPABILITY_AVX512) && defined(CPUBLAS_BRGEMM_U8I8I32)
+
+// Stage 1 brgemm epilogue: int32 raw accumulation -> dequant -> SiLU -> mul -> BF16/FP16
+template <typename scalar_t>
+inline void brgemm_silu_and_mul_epilogue(
+    scalar_t* __restrict__ output,
+    const int32_t* __restrict__ C0,
+    const int32_t* __restrict__ C1,
+    const int32_t* __restrict__ Bcomp0,
+    const int32_t* __restrict__ Bcomp1,
+    const float* __restrict__ As,
+    const float* __restrict__ Bs0,
+    const float* __restrict__ Bs1,
+    int64_t m_size, int64_t n_size, int64_t N) {
+
+  using fVec = at::vec::Vectorized<float>;
+  const fVec one(1.f);
+
+  for (int64_t m = 0; m < m_size; ++m) {
+    const __m512 va_scale = _mm512_set1_ps(As[m]);
+    scalar_t* out = output + m * N;
+    const int32_t* c0 = C0 + m * block_size_n();
+    const int32_t* c1 = C1 + m * block_size_n();
+
+    // dequantize: (raw_int32 - compensation) * a_scale * b_scale
+    // n_size == block_size_n() == 32 (guaranteed by TORCH_CHECK in caller)
+    fVec x0 = fVec(_mm512_mul_ps(_mm512_mul_ps(
+        _mm512_cvtepi32_ps(_mm512_sub_epi32(
+            _mm512_loadu_si512(c0), _mm512_loadu_si512(Bcomp0))),
+        va_scale), _mm512_loadu_ps(Bs0)));
+    fVec x1 = fVec(_mm512_mul_ps(_mm512_mul_ps(
+        _mm512_cvtepi32_ps(_mm512_sub_epi32(
+            _mm512_loadu_si512(c0 + 16), _mm512_loadu_si512(Bcomp0 + 16))),
+        va_scale), _mm512_loadu_ps(Bs0 + 16)));
+    fVec y0 = fVec(_mm512_mul_ps(_mm512_mul_ps(
+        _mm512_cvtepi32_ps(_mm512_sub_epi32(
+            _mm512_loadu_si512(c1), _mm512_loadu_si512(Bcomp1))),
+        va_scale), _mm512_loadu_ps(Bs1)));
+    fVec y1 = fVec(_mm512_mul_ps(_mm512_mul_ps(
+        _mm512_cvtepi32_ps(_mm512_sub_epi32(
+            _mm512_loadu_si512(c1 + 16), _mm512_loadu_si512(Bcomp1 + 16))),
+        va_scale), _mm512_loadu_ps(Bs1 + 16)));
+
+    // silu(x) * y
+    x0 = x0 / (one + x0.neg().exp_u20()) * y0;
+    x1 = x1 / (one + x1.neg().exp_u20()) * y1;
+
+    // convert to BF16/FP16 and store
+    _mm512_storeu_si512(
+        reinterpret_cast<__m512i*>(out),
+        (__m512i)(convert_from_float_ext<scalar_t>(x0, x1)));
+  }
+}
+
+// Stage 2 brgemm epilogue: int32 raw accumulation -> dequant -> float32 (for copy_mul_stub)
+inline void brgemm_dequant_epilogue(
+    float* __restrict__ C_float,
+    const int32_t* __restrict__ C_i32,
+    const int32_t* __restrict__ Bcomp,
+    const float* __restrict__ As,
+    const float* __restrict__ Bs,
+    int64_t m_size, int64_t n_size) {
+
+  for (int64_t m = 0; m < m_size; ++m) {
+    const __m512 va_scale = _mm512_set1_ps(As[m]);
+    const int32_t* c = C_i32 + m * block_size_n();
+    float* out = C_float + m * block_size_n();
+    for (int64_t d = 0; d < n_size; d += 16) {
+      __m512 x = _mm512_mul_ps(_mm512_mul_ps(
+          _mm512_cvtepi32_ps(_mm512_sub_epi32(
+              _mm512_loadu_si512(c + d), _mm512_loadu_si512(Bcomp + d))),
+          va_scale), _mm512_loadu_ps(Bs + d));
+      _mm512_storeu_ps(out + d, x);
+    }
+  }
+}
+
+#endif // CPU_CAPABILITY_AVX512 && CPUBLAS_BRGEMM_U8I8I32
+
 } // anonymous namespace
 
 template <typename scalar_t>
@@ -467,8 +546,13 @@ void fused_experts_int8_kernel_impl(
     // get local pointers
     int tid = at::get_thread_num();
     uint8_t* __restrict__ A = A_tmp + tid * BLOCK_M * K;
+    // C_tmp reused as int32 brgemm accumulator (sizeof(int32_t)==sizeof(float))
+    int32_t* __restrict__ C0_i32 = reinterpret_cast<int32_t*>(C_tmp + tid * 2 * BLOCK_M * BLOCK_N);
+    int32_t* __restrict__ C1_i32 = C0_i32 + BLOCK_M * BLOCK_N;
 
     alignas(64) float As[BLOCK_M];
+
+    bool is_brgemm_used = false;
 
     for (int64_t i = begin; i < end; ++i) {
       int64_t mb = i / NB;
@@ -484,6 +568,9 @@ void fused_experts_int8_kernel_impl(
       const int8_t* __restrict__ B1 = packed_w1 + expert_id * stride_e + nb1 * BLOCK_N * stride_n;
       const float* __restrict__ Bs0 = w1s + expert_id * 2 * N + nb0 * BLOCK_N;
       const float* __restrict__ Bs1 = w1s + expert_id * 2 * N + nb1 * BLOCK_N;
+      // compensation rows stored just after the VNNI-packed weight block
+      const int32_t* __restrict__ Bcomp0 = reinterpret_cast<const int32_t*>(B0 + BLOCK_N * K);
+      const int32_t* __restrict__ Bcomp1 = reinterpret_cast<const int32_t*>(B1 + BLOCK_N * K);
 
       // 1.a load A
       const int32_t* A_ids = sorted_ids + mb * BLOCK_M;
@@ -495,22 +582,50 @@ void fused_experts_int8_kernel_impl(
         As[m] = As_tmp[index];
       }
 
-      // fused 1.b: silu_and_mul(A @ B0, A @ B1)
       const int64_t offset = offsets[mb];
-      tinygemm_kernel(
-          /* A     */ A,
-          /* B0    */ B0,
-          /* B1    */ B1,
-          /* C     */ ic1 + offset * N + nb * BLOCK_N,
-          /* As    */ As,
-          /* Bs0   */ Bs0,
-          /* Bs1   */ Bs1,
-          /* M     */ m_size,
-          /* N     */ n_size,
-          /* K     */ K,
-          /* lda   */ K,
-          /* ldb   */ n_size,
-          /* ldc   */ N);
+#if defined(CPU_CAPABILITY_AVX512) && defined(CPUBLAS_BRGEMM_U8I8I32)
+      const bool use_brgemm = can_use_brgemm<int8_t>(m_size);
+      is_brgemm_used = is_brgemm_used || use_brgemm;
+      if (use_brgemm) {
+        at::native::cpublas::brgemm(
+            m_size, n_size, K, K, n_size, BLOCK_N,
+            false,
+            reinterpret_cast<const unsigned char*>(A),
+            reinterpret_cast<const signed char*>(B0),
+            C0_i32);
+        at::native::cpublas::brgemm(
+            m_size, n_size, K, K, n_size, BLOCK_N,
+            false,
+            reinterpret_cast<const unsigned char*>(A),
+            reinterpret_cast<const signed char*>(B1),
+            C1_i32);
+        brgemm_silu_and_mul_epilogue<scalar_t>(
+            ic1 + offset * N + nb * BLOCK_N,
+            C0_i32, C1_i32, Bcomp0, Bcomp1,
+            As, Bs0, Bs1, m_size, n_size, N);
+      } else
+#endif
+      {
+        // fused 1.b: silu_and_mul(A @ B0, A @ B1)
+        tinygemm_kernel(
+            /* A     */ A,
+            /* B0    */ B0,
+            /* B1    */ B1,
+            /* C     */ ic1 + offset * N + nb * BLOCK_N,
+            /* As    */ As,
+            /* Bs0   */ Bs0,
+            /* Bs1   */ Bs1,
+            /* M     */ m_size,
+            /* N     */ n_size,
+            /* K     */ K,
+            /* lda   */ K,
+            /* ldb   */ n_size,
+            /* ldc   */ N);
+      }
+    }
+
+    if (is_brgemm_used) {
+      at::native::cpublas::brgemm_release();
     }
   });
 
@@ -538,8 +653,10 @@ void fused_experts_int8_kernel_impl(
   at::parallel_for(0, MB2 * NB2, 0, [&](int64_t begin, int64_t end) {
     // get local pointers
     int tid = at::get_thread_num();
-    // we won't be using C1 for gemm2
     float* __restrict__ C = C_tmp + tid * 2 * BLOCK_M * BLOCK_N;
+    int32_t* __restrict__ C_i32 = reinterpret_cast<int32_t*>(C);
+
+    bool is_brgemm_used = false;
 
     for (int64_t i = begin; i < end; ++i) {
       int64_t mb = i / NB2;
@@ -558,20 +675,36 @@ void fused_experts_int8_kernel_impl(
       int32_t expert_id = expert_ids[mb];
       const int8_t* __restrict__ B = packed_w2 + expert_id * stride_e2 + nb * BLOCK_N * stride_oc;
       const float* __restrict__ Bs = w2s + expert_id * K + nb * BLOCK_N;
+      const int32_t* __restrict__ Bcomp = reinterpret_cast<const int32_t*>(B + BLOCK_N * IC);
 
-      // 2.a gemm: C = A @ B
-      tinygemm_kernel<scalar_t>(
-          /* A     */ A,
-          /* B     */ B,
-          /* C     */ C,
-          /* As    */ As,
-          /* Bs    */ Bs,
-          /* M     */ m_size,
-          /* N     */ n_size,
-          /* K     */ IC,
-          /* lda   */ IC,
-          /* ldb   */ n_size,
-          /* ldc   */ BLOCK_N);
+#if defined(CPU_CAPABILITY_AVX512) && defined(CPUBLAS_BRGEMM_U8I8I32)
+      const bool use_brgemm = can_use_brgemm<int8_t>(m_size);
+      is_brgemm_used = is_brgemm_used || use_brgemm;
+      if (use_brgemm) {
+        at::native::cpublas::brgemm(
+            m_size, n_size, IC, IC, n_size, BLOCK_N,
+            false,
+            reinterpret_cast<const unsigned char*>(A),
+            reinterpret_cast<const signed char*>(B),
+            C_i32);
+        brgemm_dequant_epilogue(C, C_i32, Bcomp, As, Bs, m_size, n_size);
+      } else
+#endif
+      {
+        // 2.a gemm: C = A @ B
+        tinygemm_kernel<scalar_t>(
+            /* A     */ A,
+            /* B     */ B,
+            /* C     */ C,
+            /* As    */ As,
+            /* Bs    */ Bs,
+            /* M     */ m_size,
+            /* N     */ n_size,
+            /* K     */ IC,
+            /* lda   */ IC,
+            /* ldb   */ n_size,
+            /* ldc   */ BLOCK_N);
+      }
 
       // 2.b copy from C to ic2 in original order
       //   and also mul topk_weights in float32
@@ -580,6 +713,10 @@ void fused_experts_int8_kernel_impl(
         float weight = topk_weights[index];
         copy_mul_stub(ic2 + index * K + nb * BLOCK_N, C + m * BLOCK_N, weight, n_size);
       }
+    }
+
+    if (is_brgemm_used) {
+      at::native::cpublas::brgemm_release();
     }
   });
 
@@ -653,6 +790,12 @@ void shared_expert_int8_kernel_impl(
 
   // here we only parallel on half of 2N to fuse silu_and_mul with gemm
   at::parallel_for(0, MB * NB, 0, [&](int64_t begin, int64_t end) {
+    int tid = at::get_thread_num();
+    int32_t* __restrict__ C0_i32 = reinterpret_cast<int32_t*>(C_tmp + tid * 2 * BLOCK_M * BLOCK_N);
+    int32_t* __restrict__ C1_i32 = C0_i32 + BLOCK_M * BLOCK_N;
+
+    bool is_brgemm_used = false;
+
     for (int64_t i = begin; i < end; ++i) {
       int64_t mb = i / NB;
       int64_t nb = i % NB;
@@ -671,22 +814,52 @@ void shared_expert_int8_kernel_impl(
       const int8_t* __restrict__ B1 = packed_w1 + nb1 * BLOCK_N * stride_n;
       const float* __restrict__ Bs0 = w1s + nb0 * BLOCK_N;
       const float* __restrict__ Bs1 = w1s + nb1 * BLOCK_N;
+      const int32_t* __restrict__ Bcomp0 = reinterpret_cast<const int32_t*>(B0 + BLOCK_N * K);
+      const int32_t* __restrict__ Bcomp1 = reinterpret_cast<const int32_t*>(B1 + BLOCK_N * K);
 
-      // fused 1.b: silu_and_mul(A @ B0, A @ B1)
-      tinygemm_kernel(
-          /* A     */ A,
-          /* B0    */ B0,
-          /* B1    */ B1,
-          /* C     */ ic1 + mb * BLOCK_M * N + nb * BLOCK_N,
-          /* As    */ As,
-          /* Bs0   */ Bs0,
-          /* Bs1   */ Bs1,
-          /* M     */ m_size,
-          /* N     */ n_size,
-          /* K     */ K,
-          /* lda   */ K,
-          /* ldb   */ n_size,
-          /* ldc   */ N);
+#if defined(CPU_CAPABILITY_AVX512) && defined(CPUBLAS_BRGEMM_U8I8I32)
+      const bool use_brgemm = can_use_brgemm<int8_t>(m_size);
+      is_brgemm_used = is_brgemm_used || use_brgemm;
+      if (use_brgemm) {
+        at::native::cpublas::brgemm(
+            m_size, n_size, K, K, n_size, BLOCK_N,
+            false,
+            reinterpret_cast<const unsigned char*>(A),
+            reinterpret_cast<const signed char*>(B0),
+            C0_i32);
+        at::native::cpublas::brgemm(
+            m_size, n_size, K, K, n_size, BLOCK_N,
+            false,
+            reinterpret_cast<const unsigned char*>(A),
+            reinterpret_cast<const signed char*>(B1),
+            C1_i32);
+        brgemm_silu_and_mul_epilogue<scalar_t>(
+            ic1 + mb * BLOCK_M * N + nb * BLOCK_N,
+            C0_i32, C1_i32, Bcomp0, Bcomp1,
+            As, Bs0, Bs1, m_size, n_size, N);
+      } else
+#endif
+      {
+        // fused 1.b: silu_and_mul(A @ B0, A @ B1)
+        tinygemm_kernel(
+            /* A     */ A,
+            /* B0    */ B0,
+            /* B1    */ B1,
+            /* C     */ ic1 + mb * BLOCK_M * N + nb * BLOCK_N,
+            /* As    */ As,
+            /* Bs0   */ Bs0,
+            /* Bs1   */ Bs1,
+            /* M     */ m_size,
+            /* N     */ n_size,
+            /* K     */ K,
+            /* lda   */ K,
+            /* ldb   */ n_size,
+            /* ldc   */ N);
+      }
+    }
+
+    if (is_brgemm_used) {
+      at::native::cpublas::brgemm_release();
     }
   });
 
@@ -713,8 +886,10 @@ void shared_expert_int8_kernel_impl(
   at::parallel_for(0, MB2 * NB2, 0, [&](int64_t begin, int64_t end) {
     // get local pointers
     int tid = at::get_thread_num();
-    // we won't be using C1 for gemm2
     float* __restrict__ C = C_tmp + tid * 2 * BLOCK_M * BLOCK_N;
+    int32_t* __restrict__ C_i32 = reinterpret_cast<int32_t*>(C);
+
+    bool is_brgemm_used = false;
 
     for (int64_t i = begin; i < end; ++i) {
       int64_t mb = i / NB2;
@@ -730,20 +905,36 @@ void shared_expert_int8_kernel_impl(
       // B shape [IC, n_size] in vnni format
       const int8_t* __restrict__ B = packed_w2 + nb * BLOCK_N * stride_oc;
       const float* __restrict__ Bs = w2s + nb * BLOCK_N;
+      const int32_t* __restrict__ Bcomp = reinterpret_cast<const int32_t*>(B + BLOCK_N * IC);
 
-      // 2.a gemm: C = A @ B
-      tinygemm_kernel<scalar_t>(
-          /* A     */ A,
-          /* B     */ B,
-          /* C     */ C,
-          /* As    */ As,
-          /* Bs    */ Bs,
-          /* M     */ m_size,
-          /* N     */ n_size,
-          /* K     */ IC,
-          /* lda   */ IC,
-          /* ldb   */ n_size,
-          /* ldc   */ BLOCK_N);
+#if defined(CPU_CAPABILITY_AVX512) && defined(CPUBLAS_BRGEMM_U8I8I32)
+      const bool use_brgemm = can_use_brgemm<int8_t>(m_size);
+      is_brgemm_used = is_brgemm_used || use_brgemm;
+      if (use_brgemm) {
+        at::native::cpublas::brgemm(
+            m_size, n_size, IC, IC, n_size, BLOCK_N,
+            false,
+            reinterpret_cast<const unsigned char*>(A),
+            reinterpret_cast<const signed char*>(B),
+            C_i32);
+        brgemm_dequant_epilogue(C, C_i32, Bcomp, As, Bs, m_size, n_size);
+      } else
+#endif
+      {
+        // 2.a gemm: C = A @ B
+        tinygemm_kernel<scalar_t>(
+            /* A     */ A,
+            /* B     */ B,
+            /* C     */ C,
+            /* As    */ As,
+            /* Bs    */ Bs,
+            /* M     */ m_size,
+            /* N     */ n_size,
+            /* K     */ IC,
+            /* lda   */ IC,
+            /* ldb   */ n_size,
+            /* ldc   */ BLOCK_N);
+      }
 
       // 2.b copy from C to output and add fused_experts_out
       scalar_t* __restrict__ out = output + mb * BLOCK_M * K + nb * BLOCK_N;
@@ -751,6 +942,10 @@ void shared_expert_int8_kernel_impl(
       for (int64_t m = 0; m < m_size; ++m) {
         add_mul_stub(out + m * K, C + m * BLOCK_N, fused_out + m * K, routed_scaling_factor, n_size);
       }
+    }
+
+    if (is_brgemm_used) {
+      at::native::cpublas::brgemm_release();
     }
   });
 }

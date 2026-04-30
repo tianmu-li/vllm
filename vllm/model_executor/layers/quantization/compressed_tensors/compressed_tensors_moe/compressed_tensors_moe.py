@@ -157,6 +157,7 @@ class CompressedTensorsMoEMethod(FusedMoEMethodBase):
                     CPUSGLIW8A8Int8MoEMethod,
                 )
 
+                logger.info_once("Using CPUSGLIW8A8Int8MoEMethod")
                 return CPUSGLIW8A8Int8MoEMethod(
                     weight_quant, input_quant, layer.moe_config
                 )
@@ -167,7 +168,15 @@ class CompressedTensorsMoEMethod(FusedMoEMethodBase):
             return CompressedTensorsW8A8Int8MoEMethod(
                 weight_quant, input_quant, layer.moe_config
             )
-        elif quant_config._is_fp8_w8a16(weight_quant, input_quant):
+        elif input_quant is None and quant_config._is_fp8_w8a16(
+            weight_quant, input_quant
+        ):
+            if weight_quant.strategy != QuantizationStrategy.BLOCK:
+                raise ValueError(
+                    "FP8 W8A16 MoE requires BLOCK quantization strategy "
+                    f"(got {weight_quant.strategy}). TENSOR and CHANNEL strategies "
+                    "are not supported for weight-only FP8 MoE."
+                )
             if not current_platform.is_cpu():
                 raise RuntimeError(
                     "FP8 W8A16 MoE (weight-only FP8, BF16/FP16 activations) is only "
@@ -178,6 +187,7 @@ class CompressedTensorsMoEMethod(FusedMoEMethodBase):
                 CPUSGLFp8W8A16MoEMethod,
             )
 
+            logger.info_once("Using CPUSGLFp8W8A16MoEMethod")
             return CPUSGLFp8W8A16MoEMethod(weight_quant, layer.moe_config)
         elif quant_config._is_fp8_w4a8_sm90(weight_quant, input_quant):
             from .compressed_tensors_moe_w4a8_fp8 import (
