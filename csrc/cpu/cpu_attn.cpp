@@ -17,7 +17,7 @@ torch::Tensor get_scheduler_metadata(
     const torch::Tensor& seq_lens, at::ScalarType dtype,
     const torch::Tensor& query_start_loc, const bool casual,
     const int64_t window_size, const std::string& isa_hint,
-    const bool enable_kv_split) {
+    const bool enable_kv_split, const bool enable_compute_balanced) {
   cpu_attention::ISA isa;
   if (isa_hint == "amx") {
     isa = cpu_attention::ISA::AMX;
@@ -60,6 +60,7 @@ torch::Tensor get_scheduler_metadata(
   input.casual = casual;
   input.isa = isa;
   input.enable_kv_split = enable_kv_split;
+  input.enable_compute_balanced = enable_compute_balanced;
 
   VLLM_DISPATCH_FLOATING_TYPES(dtype, "get_scheduler_metadata", [&]() {
     CPU_ATTN_DISPATCH(head_dim, isa, 0, [&]() {

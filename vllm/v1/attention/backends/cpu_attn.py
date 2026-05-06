@@ -202,6 +202,7 @@ class CPUAttentionMetadataBuilder(AttentionMetadataBuilder[CPUAttentionMetadata]
             sliding_window_size=self.window_size,
             isa=self.isa,
             enable_kv_split=envs.VLLM_CPU_ATTN_SPLIT_KV,
+            enable_compute_balanced=envs.VLLM_CPU_ATTN_COMPUTE_BALANCED,
         )
 
         attn_metadata = CPUAttentionMetadata(

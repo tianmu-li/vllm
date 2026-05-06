@@ -356,6 +356,40 @@ def varlen_with_paged_kv(
         **fp8_kwargs,
     )
 
+    metadata_cb = cpu_attn_get_scheduler_metadata(
+        num_reqs=num_seqs,
+        num_heads=num_query_heads,
+        num_kv_heads=num_kv_heads,
+        head_dim=head_size,
+        seq_lens=kv_lens_tensor,
+        dtype=dtype,
+        query_start_loc=cu_query_lens,
+        causal=True,
+        sliding_window_size=sliding_window if sliding_window is not None else -1,
+        isa=isa,
+        enable_kv_split=True,
+        enable_compute_balanced=True,
+    )
+
+    out_compute_balanced = torch.empty_like(query)
+    cpu_attention_with_kv_cache(
+        query=query,
+        key_cache=packed_key_cache,
+        value_cache=packed_value_cache,
+        output=out_compute_balanced,
+        query_start_loc=cu_query_lens,
+        seq_lens=kv_lens_tensor,
+        scale=scale,
+        causal=True,
+        alibi_slopes=alibi_slopes,
+        sliding_window=window_size,
+        block_table=block_tables,
+        softcap=soft_cap if soft_cap is not None else 0,
+        scheduler_metadata=metadata_cb,
+        s_aux=s_aux,
+        **fp8_kwargs,
+    )
+
     if is_fp8:
         # Build a float KV cache via the non-FP8 path and run float attention
         # to use as the reference.
@@ -413,6 +447,12 @@ def varlen_with_paged_kv(
     (
         torch.testing.assert_close(out_without_split, ref_output, atol=atol, rtol=rtol),
         f"{torch.max(torch.abs(out_without_split - ref_output))}",
+    )
+    (
+        torch.testing.assert_close(
+            out_compute_balanced, ref_output, atol=atol, rtol=rtol
+        ),
+        f"{torch.max(torch.abs(out_compute_balanced - ref_output))}",
     )
 
 

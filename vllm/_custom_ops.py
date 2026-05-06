@@ -3362,6 +3362,7 @@ def cpu_attn_get_scheduler_metadata(
     sliding_window_size: int,
     isa: str,
     enable_kv_split: bool,
+    enable_compute_balanced: bool = False,
 ) -> torch.Tensor:
     scheduler_metadata = torch.ops._C.get_scheduler_metadata(
         num_reqs,
@@ -3375,6 +3376,7 @@ def cpu_attn_get_scheduler_metadata(
         sliding_window_size,
         isa,
         enable_kv_split,
+        enable_compute_balanced,
     )
     return scheduler_metadata
 

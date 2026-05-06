@@ -392,6 +392,7 @@ class AttentionScheduler {
     int32_t max_num_q_per_iter;  // max Q head num can be hold in registers
     int32_t kv_block_alignment;  // context length alignment requirement
     bool enable_kv_split;
+    bool enable_compute_balanced;
   };
 
   static constexpr int32_t MaxQTileIterNum = 128;
@@ -425,8 +426,9 @@ class AttentionScheduler {
     const int32_t right_sliding_window_size = input.right_sliding_window_size;
     TORCH_CHECK_LE(split_kv_q_token_num_threshold * q_head_per_kv, 16);
 
-    // get total kv len
+    // get total kv len and total compute
     int64_t total_kv_len = 0;
+    int64_t total_compute = 0;
     for (int32_t req_id = 0; req_id < input.num_reqs; ++req_id) {
       const int32_t seq_len = input.seq_lens[req_id];
       const int32_t q_token_num =
@@ -451,12 +453,19 @@ class AttentionScheduler {
         int32_t curr_kv_len =
             aligned_kv_tile_pos_right - aligned_kv_tile_pos_left;
         total_kv_len += curr_kv_len;
+        total_compute += (int64_t)curr_kv_len * q_tile_token_num;
       }
     }
     const int64_t kv_len_per_thread =
         (((total_kv_len / thread_num) + kv_len_alignment - 1) /
          kv_len_alignment) *
         kv_len_alignment * (use_gqa ? input.num_heads_kv : input.num_heads_q);
+    const bool compute_balanced = input.enable_compute_balanced;
+    const int64_t compute_per_thread =
+        compute_balanced
+            ? (total_compute / thread_num) *
+                  (use_gqa ? input.num_heads_kv : input.num_heads_q)
+            : 0;
     std::vector<AttentionWorkItemGroup> workitems;
     std::vector<ReductionWorkItemGroup> reduce_workitems;
     workitems.reserve(1024);
@@ -465,7 +474,8 @@ class AttentionScheduler {
 
     // split tasks
     int32_t curr_thread_id = 0;
-    int64_t remaining_kv_len = kv_len_per_thread;
+    int64_t remaining_budget =
+        compute_balanced ? compute_per_thread : kv_len_per_thread;
     int32_t cum_split_num = 0;
     for (int32_t req_id = 0; req_id < input.num_reqs; ++req_id) {
       const int32_t seq_len = input.seq_lens[req_id];
@@ -492,18 +502,28 @@ class AttentionScheduler {
         int32_t curr_kv_len =
             aligned_kv_tile_pos_right - aligned_kv_tile_pos_left;
         int32_t kv_token_pos_start = aligned_kv_tile_pos_left;
+        // min_split_cost is in budget units (kv units for kv-only mode,
+        // q*kv compute units for compute-balanced mode).
+        const int64_t min_split_cost =
+            compute_balanced ? (int64_t)min_split_kv_len * q_tile_token_num
+                             : (int64_t)min_split_kv_len;
 
         while (curr_kv_len > 0) {
-          if (curr_kv_len <= (remaining_kv_len + min_split_kv_len) ||
+          // curr_cost must be inside the loop: curr_kv_len shrinks on each
+          // split.
+          const int64_t curr_cost =
+              compute_balanced ? (int64_t)curr_kv_len * q_tile_token_num
+                               : (int64_t)curr_kv_len;
+          if (curr_cost <= (remaining_budget + min_split_cost) ||
               curr_thread_id == (thread_num - 1)) {
             curr_workitem.q_token_num += q_tile_token_num;
             curr_workitem.total_kv_len += curr_kv_len;
-            remaining_kv_len -= curr_kv_len;
+            remaining_budget -= curr_cost;
             curr_kv_len = 0;
 
-            if (remaining_kv_len < 0) {
+            if (remaining_budget < 0) {
               // stop to accept more workitems
-              remaining_kv_len -= min_split_kv_len;
+              remaining_budget -= min_split_cost;
             }
 
             if (curr_workitem.kv_split_pos_start != 0) {
@@ -522,11 +542,11 @@ class AttentionScheduler {
             break;
           }
 
-          if (remaining_kv_len < min_split_kv_len &&
+          if (remaining_budget < min_split_cost &&
               (curr_workitem.total_kv_len > 0 ||
                workitem_num_per_thread[curr_thread_id] > 0)) {
-            // remaining_kv_len is too short, and have allocated workitems, just
-            // leave to next thread
+            // remaining budget is too small, and have allocated workitems,
+            // just leave to next thread
             if (curr_workitem.total_kv_len > 0) {
               workitems.emplace_back(curr_workitem);
               ++workitem_num_per_thread[curr_thread_id];
@@ -536,7 +556,8 @@ class AttentionScheduler {
 
             // switch to next thread
             ++curr_thread_id;
-            remaining_kv_len = kv_len_per_thread;
+            remaining_budget =
+                compute_balanced ? compute_per_thread : kv_len_per_thread;
 
             // retry this iteration
             continue;
@@ -560,12 +581,13 @@ class AttentionScheduler {
 
               // switch to next thread
               ++curr_thread_id;
-              remaining_kv_len = kv_len_per_thread;
+              remaining_budget =
+                  compute_balanced ? compute_per_thread : kv_len_per_thread;
             }
 
             curr_workitem.q_token_num += q_tile_token_num;
             curr_workitem.total_kv_len += curr_kv_len;
-            remaining_kv_len -= curr_kv_len;
+            remaining_budget -= curr_cost;
             curr_kv_len = 0;
             break;
           }
@@ -583,9 +605,22 @@ class AttentionScheduler {
                 req_id, token_id, q_tile_token_num, cum_split_num));
           }
 
-          int32_t spilt_size =
-              std::min(std::max(remaining_kv_len, (int64_t)min_split_kv_len),
-                       (int64_t)curr_kv_len);
+          // Convert remaining budget back to kv units for the split size.
+          // In compute-balanced mode: kv_units = remaining_budget /
+          // q_tile_token_num
+          int32_t spilt_size;
+          if (compute_balanced) {
+            int64_t kv_from_budget =
+                (remaining_budget / q_tile_token_num / kv_len_alignment) *
+                kv_len_alignment;
+            spilt_size = (int32_t)std::min(
+                std::max(kv_from_budget, (int64_t)min_split_kv_len),
+                (int64_t)curr_kv_len);
+          } else {
+            spilt_size = (int32_t)std::min(
+                std::max(remaining_budget, (int64_t)min_split_kv_len),
+                (int64_t)curr_kv_len);
+          }
           curr_workitem =
               AttentionWorkItemGroup(req_id, token_id, kv_token_pos_start,
                                      kv_token_pos_start + spilt_size);
@@ -606,7 +641,8 @@ class AttentionScheduler {
 
           // switch to next thread
           ++curr_thread_id;
-          remaining_kv_len = kv_len_per_thread;
+          remaining_budget =
+              compute_balanced ? compute_per_thread : kv_len_per_thread;
         }
       }
 
