@@ -762,6 +762,15 @@ void shm_reduce_scatter_sum(ThreadSHMContext* ctx, scalar_t* data,
 }
 
 template <typename scalar_t>
+void shm_allreduce_rsag_sum(ThreadSHMContext* ctx, scalar_t* data,
+                            size_t elem_num) {
+  const size_t chunk_elem_num = elem_num / ctx->group_size;
+  scalar_t* chunk_ptr = data + ctx->rank * chunk_elem_num;
+  shm_reduce_scatter_sum(ctx, data, chunk_ptr, elem_num);
+  shm_all_gather_sum(ctx, chunk_ptr, data, chunk_elem_num);
+}
+
+template <typename scalar_t>
 void shm_gather_impl(ThreadSHMContext* ctx, scalar_t* data, size_t elem_num,
                      scalar_t** outputs, const int dst) {
   CPU_KERNEL_GUARD_IN(shm_gather_impl)
@@ -1022,6 +1031,36 @@ void shm_allreduce(int64_t handle, torch::Tensor& data) {
                       data.data_ptr<scalar_t>(), data.numel());
     CPU_KERNEL_GUARD_OUT(shm_allreduce_sum)
   });
+}
+
+// RS+AG requires 4 rank-synchronisation barriers vs 2 for the flat all-reduce.
+// Each barrier costs ~5 µs on SPR, so RS+AG carries a ~10 µs fixed overhead.
+// The flat all-reduce transmits N× input bytes over cross-NUMA links; RS+AG
+// transmits 2× regardless of N, saving (N-2)/(N-1) × B bytes.  At N=2 the
+// savings are in L3 cache pressure rather than raw traffic, and the crossover
+// with measured ~50 GB/s cross-NUMA BW falls around 16–32 KiB.  Use 32 KiB as
+// a conservative threshold that keeps small-tensor latency at the flat-AR
+// floor.
+static constexpr int64_t RSAG_BYTE_THRESHOLD = 32 * 1024;
+
+void shm_allreduce_rsag(int64_t handle, torch::Tensor& data) {
+  TORCH_CHECK(data.is_contiguous())
+  VLLM_DISPATCH_FLOATING_TYPES(
+      data.scalar_type(), "shm_allreduce_rsag_sum", [&] {
+        auto ctx = SHMManager::get_singleton_instance(handle)->get_shm_ctx();
+        int64_t byte_count = data.numel() * (int64_t)sizeof(scalar_t);
+        if (byte_count < RSAG_BYTE_THRESHOLD ||
+            data.numel() % ctx->group_size != 0) {
+          CPU_KERNEL_GUARD_IN(shm_allreduce_sum)
+          shm_allreduce_sum(ctx, data.data_ptr<scalar_t>(), data.numel());
+          CPU_KERNEL_GUARD_OUT(shm_allreduce_sum)
+        } else {
+          CPU_KERNEL_GUARD_IN(shm_allreduce_rsag_sum)
+          shm_allreduce_rsag_sum(ctx, data.data_ptr<scalar_t>(),
+                                 (size_t)data.numel());
+          CPU_KERNEL_GUARD_OUT(shm_allreduce_rsag_sum)
+        }
+      });
 }
 
 void shm_reduce_scatter(int64_t handle, const torch::Tensor& data,

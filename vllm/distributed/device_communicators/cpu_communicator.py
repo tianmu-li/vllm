@@ -300,7 +300,7 @@ class _CPUSHMDistributed:
     def all_reduce(
         self, input: torch.Tensor, group: ProcessGroup | None = None
     ) -> None:
-        torch.ops._C.shm_allreduce(self.handle, input)
+        torch.ops._C.shm_allreduce_rsag(self.handle, input)
 
     def gather(
         self,
