@@ -1048,16 +1048,24 @@ void shm_allreduce_rsag(int64_t handle, torch::Tensor& data) {
   VLLM_DISPATCH_FLOATING_TYPES(
       data.scalar_type(), "shm_allreduce_rsag_sum", [&] {
         auto ctx = SHMManager::get_singleton_instance(handle)->get_shm_ctx();
-        int64_t byte_count = data.numel() * (int64_t)sizeof(scalar_t);
-        if (byte_count < RSAG_BYTE_THRESHOLD ||
-            data.numel() % ctx->group_size != 0) {
+        scalar_t* p = data.data_ptr<scalar_t>();
+        const int64_t numel = data.numel();
+        // Largest prefix where numel is divisible by group_size AND each
+        // per-rank chunk is a multiple of 64 bytes (required by memcpy_to_shm).
+        const int64_t elems_per_line = 64 / (int64_t)sizeof(scalar_t);
+        const int64_t align = (int64_t)ctx->group_size * elems_per_line;
+        const int64_t head = (numel / align) * align;
+        const int64_t tail = numel - head;
+        const int64_t head_bytes = head * (int64_t)sizeof(scalar_t);
+
+        if (head_bytes < RSAG_BYTE_THRESHOLD) {
           CPU_KERNEL_GUARD_IN(shm_allreduce_sum)
-          shm_allreduce_sum(ctx, data.data_ptr<scalar_t>(), data.numel());
+          shm_allreduce_sum(ctx, p, numel);
           CPU_KERNEL_GUARD_OUT(shm_allreduce_sum)
         } else {
           CPU_KERNEL_GUARD_IN(shm_allreduce_rsag_sum)
-          shm_allreduce_rsag_sum(ctx, data.data_ptr<scalar_t>(),
-                                 (size_t)data.numel());
+          shm_allreduce_rsag_sum(ctx, p, (size_t)head);
+          if (tail > 0) shm_allreduce_sum(ctx, p + head, (size_t)tail);
           CPU_KERNEL_GUARD_OUT(shm_allreduce_rsag_sum)
         }
       });
