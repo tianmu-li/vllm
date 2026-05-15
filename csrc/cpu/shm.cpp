@@ -693,6 +693,123 @@ void all_gather_impl(ThreadSHMContext* ctx, scalar_t* data, scalar_t* output,
 
 };  // namespace shm_cc_ops
 
+namespace shm_cc_ops {
+
+template <typename scalar_t, int RANKS>
+void pipelined_rsag_impl(ThreadSHMContext* ctx, scalar_t* data,
+                         size_t elem_num) {
+  CPU_KERNEL_GUARD_IN(pipelined_rsag_impl)
+  using vec_t = typename KernelVecType<scalar_t>::scalar_vec_t;
+  constexpr int64_t vec_elem_num = vec_t::get_elem_num();
+
+  const int64_t chunk_elem_num = (int64_t)elem_num / RANKS;
+  const int64_t align_elems = 64 / (int64_t)sizeof(scalar_t);
+  const int64_t max_per_iter_elem_num =
+      ((int64_t)(PER_THREAD_SHM_BUFFER_OFFSET / RANKS) /
+       (int64_t)sizeof(scalar_t) / align_elems) *
+      align_elems;
+
+  int thread_num = ctx->thread_num;
+  int64_t per_unit_elem_num =
+      MIN_THREAD_PROCESS_SIZE / (int64_t)sizeof(scalar_t);
+  int64_t total_units =
+      (chunk_elem_num + per_unit_elem_num - 1) / per_unit_elem_num;
+  int64_t per_thread_units = (total_units + thread_num - 1) / thread_num;
+  int64_t per_thread_elem_num = per_unit_elem_num * per_thread_units;
+
+#pragma omp parallel for schedule(static, 1) num_threads(thread_num)
+  for (int i = 0; i < thread_num; ++i) {
+    ThreadSHMContext* thread_ctx = ctx + i;
+    int rank = thread_ctx->rank;
+    scalar_t* chunk_ptr = data + (int64_t)rank * chunk_elem_num;
+
+    int64_t offset = (int64_t)i * per_thread_elem_num;
+    int64_t end = std::min(offset + per_thread_elem_num, chunk_elem_num);
+    int64_t curr_window = std::min(max_per_iter_elem_num, end - offset);
+    bool fast_mode = ((end - offset) <= max_per_iter_elem_num);
+
+    while (curr_window > 0) {
+      int64_t window_bytes = curr_window * (int64_t)sizeof(scalar_t);
+
+      // ── Phase 1: RS scatter (cached writes so contribution lands in L3) ───
+      if (!fast_mode) {
+        thread_ctx->wait_for_all(ThreadSHMContext::check_no_buffer_conflict);
+      }
+      vec_op::unroll_loop<int, RANKS - 1>([&](int idx) {
+        int p = thread_ctx->get_swizzled_rank(idx + 1);
+        scalar_t* src = data + (int64_t)p * chunk_elem_num + offset;
+        scalar_t* dst = thread_ctx->get_thread_shm_ptr<scalar_t>(p) +
+                        (int64_t)rank * max_per_iter_elem_num;
+        shm_cc_ops::memcpy(dst, src, window_bytes);
+      });
+      thread_ctx->commit_ready_stamp();
+      thread_ctx->wait_for_all(ThreadSHMContext::check_stamp_ready);
+
+      // ── Phase 2: RS accumulate ────────────────────────────────────────────
+      scalar_t* own_ptr = data + (int64_t)rank * chunk_elem_num + offset;
+      scalar_t* rs_out_ptr = chunk_ptr + offset;  // == own_ptr
+      int64_t aligned_n = (curr_window / vec_elem_num) * vec_elem_num;
+      int64_t j = 0;
+
+      scalar_t* contrib_ptrs[RANKS - 1];
+      vec_op::unroll_loop<int, RANKS - 1>([&](int idx) {
+        int src_rank = thread_ctx->get_swizzled_rank(idx + 1);
+        contrib_ptrs[idx] = thread_ctx->get_thread_shm_ptr<scalar_t>(rank) +
+                            (int64_t)src_rank * max_per_iter_elem_num;
+      });
+#pragma GCC unroll 4
+      for (; j < aligned_n; j += vec_elem_num) {
+        vec_t local(own_ptr + j);
+        vec_op::FP32Vec16 acc(local);
+        vec_op::unroll_loop<int, RANKS - 1>([&](int idx) {
+          vec_t contrib(true, contrib_ptrs[idx] + j);
+          acc = acc + vec_op::FP32Vec16(contrib);
+        });
+        vec_t result(acc);
+        result.save(rs_out_ptr + j);
+      }
+      if (j < curr_window) {
+        vec_t local(own_ptr + j);
+        vec_op::FP32Vec16 acc(local);
+        vec_op::unroll_loop<int, RANKS - 1>([&](int idx) {
+          vec_t contrib(true, contrib_ptrs[idx] + j);
+          acc = acc + vec_op::FP32Vec16(contrib);
+        });
+        vec_t result(acc);
+        result.save(rs_out_ptr + j, curr_window - aligned_n);
+      }
+      // Flip to AG half-buffer.
+      thread_ctx->next_stamp();
+      thread_ctx->next_buffer();
+
+      // ── Phase 3: AG write (rs_out_ptr still hot in L3) ───────────────────
+      if (!fast_mode) {
+        thread_ctx->wait_for_all(ThreadSHMContext::check_no_buffer_conflict);
+      }
+      shm_cc_ops::memcpy(thread_ctx->get_thread_shm_ptr<scalar_t>(rank),
+                         rs_out_ptr, window_bytes);
+      thread_ctx->commit_ready_stamp();
+      thread_ctx->wait_for_all(ThreadSHMContext::check_stamp_ready);
+
+      // ── Phase 4: AG gather (reads peer reduced chunks from remote L3) ─────
+      vec_op::unroll_loop<int, RANKS - 1>([&](int idx) {
+        int src_rank = thread_ctx->get_swizzled_rank(idx + 1);
+        shm_cc_ops::memcpy(data + (int64_t)src_rank * chunk_elem_num + offset,
+                           thread_ctx->get_thread_shm_ptr<scalar_t>(src_rank),
+                           window_bytes);
+      });
+      // Flip back to RS half-buffer for the next tile.
+      thread_ctx->next_stamp();
+      thread_ctx->next_buffer();
+
+      offset += max_per_iter_elem_num;
+      curr_window = std::min(max_per_iter_elem_num, end - offset);
+    }
+  }
+}
+
+};  // namespace shm_cc_ops
+
 template <typename scalar_t>
 void shm_all_gather_sum(ThreadSHMContext* ctx, scalar_t* data, scalar_t* output,
                         size_t elem_num) {
@@ -776,12 +893,34 @@ void shm_reduce_scatter_sum(ThreadSHMContext* ctx, scalar_t* data,
 }
 
 template <typename scalar_t>
+void shm_pipelined_rsag_sum(ThreadSHMContext* ctx, scalar_t* data,
+                            size_t elem_num) {
+  switch (ctx->group_size) {
+    case 2:
+      shm_cc_ops::pipelined_rsag_impl<scalar_t, 2>(ctx, data, elem_num);
+      break;
+    case 3:
+      shm_cc_ops::pipelined_rsag_impl<scalar_t, 3>(ctx, data, elem_num);
+      break;
+    case 4:
+      shm_cc_ops::pipelined_rsag_impl<scalar_t, 4>(ctx, data, elem_num);
+      break;
+    case 6:
+      shm_cc_ops::pipelined_rsag_impl<scalar_t, 6>(ctx, data, elem_num);
+      break;
+    case 8:
+      shm_cc_ops::pipelined_rsag_impl<scalar_t, 8>(ctx, data, elem_num);
+      break;
+    default:
+      TORCH_CHECK(false,
+                  "Invalid world size: " + std::to_string(ctx->group_size));
+  }
+}
+
+template <typename scalar_t>
 void shm_allreduce_rsag_sum(ThreadSHMContext* ctx, scalar_t* data,
                             size_t elem_num) {
-  const size_t chunk_elem_num = elem_num / ctx->group_size;
-  scalar_t* chunk_ptr = data + ctx->rank * chunk_elem_num;
-  shm_reduce_scatter_sum(ctx, data, chunk_ptr, elem_num);
-  shm_all_gather_sum(ctx, chunk_ptr, data, chunk_elem_num);
+  shm_pipelined_rsag_sum(ctx, data, elem_num);
 }
 
 template <typename scalar_t>
@@ -1065,7 +1204,8 @@ void shm_allreduce_rsag(int64_t handle, torch::Tensor& data) {
         scalar_t* p = data.data_ptr<scalar_t>();
         const int64_t numel = data.numel();
         // Largest prefix where numel is divisible by group_size AND each
-        // per-rank chunk is a multiple of 64 bytes (required by memcpy_to_shm).
+        // per-rank chunk is a multiple of 64 bytes (required for
+        // 64-byte-aligned stream loads in the RS accumulate step).
         const int64_t elems_per_line = 64 / (int64_t)sizeof(scalar_t);
         const int64_t align = (int64_t)ctx->group_size * elems_per_line;
         const int64_t head = (numel / align) * align;
