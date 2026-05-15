@@ -50,6 +50,9 @@ void shm_gather(int64_t handle, torch::Tensor& data,
 void shm_all_gather(int64_t handle, const torch::Tensor& data,
                     torch::Tensor& output);
 
+void shm_reduce_scatter(int64_t handle, const torch::Tensor& data,
+                        torch::Tensor& output);
+
 void shm_send_tensor_list(int64_t handle,
                           const std::vector<torch::Tensor>& tensor_list,
                           int64_t dst);
@@ -400,6 +403,10 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, ops) {
   ops.impl("shm_send_tensor_list", torch::kCPU, &shm_send_tensor_list);
   ops.def("shm_recv_tensor_list(int handle, int src) -> Tensor[](a)",
           &shm_recv_tensor_list);
+  ops.def(
+      "shm_reduce_scatter(int handle, Tensor data, Tensor! output) -> "
+      "()");
+  ops.impl("shm_reduce_scatter", torch::kCPU, &shm_reduce_scatter);
 #endif  // #if defined(__AVX512F__) || defined(__aarch64__)
 
   // sgl-kernels

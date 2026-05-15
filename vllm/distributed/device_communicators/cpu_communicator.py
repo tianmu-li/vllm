@@ -142,6 +142,33 @@ class CpuCommunicator(DeviceCommunicatorBase):
         )
         return output_tensor
 
+    def reduce_scatter(self, input_: torch.Tensor, dim: int = -1) -> torch.Tensor:
+        world_size = self.world_size
+        if world_size == 1:
+            return input_
+        if dim < 0:
+            dim += input_.dim()
+        input_size = input_.size()
+        assert input_size[dim] % world_size == 0
+        chunk = input_size[dim] // world_size
+        # Flatten scatter dim to dim-0 so the 1-D SHM kernel sees contiguous chunks
+        # ranked as [rank0_chunk | rank1_chunk | ...].
+        input_contig = input_.movedim(dim, 0).contiguous()
+        out_contig = torch.empty(
+            (chunk,) + input_size[:dim] + input_size[dim + 1 :],
+            dtype=input_.dtype,
+            device=input_.device,
+        )
+        if isinstance(self.dist_module, _CPUSHMDistributed):
+            self.dist_module.reduce_scatter_into_tensor(
+                out_contig, input_contig, group=self.device_group
+            )
+        else:
+            torch.distributed.reduce_scatter_tensor(
+                out_contig, input_contig, group=self.device_group
+            )
+        return out_contig.movedim(0, dim).contiguous()
+
     def send_tensor_dict(
         self,
         tensor_dict: dict[str, torch.Tensor | Any],
@@ -297,6 +324,14 @@ class _CPUSHMDistributed:
         group: ProcessGroup | None = None,
     ) -> None:
         torch.ops._C.shm_all_gather(self.handle, input, output)
+
+    def reduce_scatter_into_tensor(
+        self,
+        output: torch.Tensor,
+        input: torch.Tensor,
+        group: ProcessGroup | None = None,
+    ) -> None:
+        torch.ops._C.shm_reduce_scatter(self.handle, input, output)
 
     def send_tensor_dict(
         self,
