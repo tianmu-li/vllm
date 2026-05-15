@@ -556,9 +556,13 @@ void reduce_scatter_partial_impl(ThreadSHMContext* ctx, scalar_t* data,
   const int64_t chunk_elem_num = (int64_t)elem_num / RANKS;
   // Sub-divide the active 2 MB half-buffer so each of the RANKS source ranks
   // gets its own disjoint write sub-region inside a peer's slot.
+  // The sub-region size must be a multiple of 64 bytes (required by
+  // memcpy_to_shm which loops in 64-byte strides).
+  const int64_t align_elems = 64 / (int64_t)sizeof(scalar_t);
   const int64_t max_per_iter_elem_num =
-      (int64_t)(PER_THREAD_SHM_BUFFER_OFFSET / RANKS) /
-      (int64_t)sizeof(scalar_t);
+      ((int64_t)(PER_THREAD_SHM_BUFFER_OFFSET / RANKS) /
+       (int64_t)sizeof(scalar_t) / align_elems) *
+      align_elems;
 
   int thread_num = ctx->thread_num;
   int64_t per_unit_elem_num =
@@ -702,6 +706,9 @@ void shm_all_gather_sum(ThreadSHMContext* ctx, scalar_t* data, scalar_t* output,
     case 4:
       shm_cc_ops::all_gather_impl<scalar_t, 4>(ctx, data, output, elem_num);
       break;
+    case 6:
+      shm_cc_ops::all_gather_impl<scalar_t, 6>(ctx, data, output, elem_num);
+      break;
     case 8:
       shm_cc_ops::all_gather_impl<scalar_t, 8>(ctx, data, output, elem_num);
       break;
@@ -726,6 +733,9 @@ void shm_allreduce_sum(ThreadSHMContext* ctx, scalar_t* data, size_t elem_num) {
     case 4:
       shm_cc_ops::all_reduce_sum_impl<scalar_t, 4>(ctx, data, elem_num);
       break;
+    case 6:
+      shm_cc_ops::all_reduce_sum_impl<scalar_t, 6>(ctx, data, elem_num);
+      break;
     case 8:
       shm_cc_ops::all_reduce_sum_impl<scalar_t, 8>(ctx, data, elem_num);
       break;
@@ -749,6 +759,10 @@ void shm_reduce_scatter_sum(ThreadSHMContext* ctx, scalar_t* data,
       break;
     case 4:
       shm_cc_ops::reduce_scatter_partial_impl<scalar_t, 4>(ctx, data, output,
+                                                           elem_num);
+      break;
+    case 6:
+      shm_cc_ops::reduce_scatter_partial_impl<scalar_t, 6>(ctx, data, output,
                                                            elem_num);
       break;
     case 8:
