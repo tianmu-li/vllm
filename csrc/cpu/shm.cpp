@@ -1,5 +1,6 @@
 #include "cpu/cpu_types.hpp"
 
+#include <cstdlib>
 #include <fcntl.h>
 #include <sys/mman.h>
 #include <sys/stat.h>
@@ -454,10 +455,17 @@ void memcpy_from_shm(void* dst, void* src, const int64_t bytes) {
 }
 
 void memcpy_to_shm(void* dst, void* src, const int64_t bytes) {
+  const int64_t aligned_bytes = ((bytes >> 6) << 6);
+  int64_t i = 0;
 #pragma GCC unroll 4
-  for (int64_t i = 0; i < bytes; i += 64) {
+  for (; i < aligned_bytes; i += 64) {
     vec_op::INT8Vec64 data((int8_t*)src + i);
     data.nt_save((int8_t*)dst + i);
+  }
+  if (aligned_bytes < bytes) {
+    vec_op::INT8Vec64 data((int8_t*)src + aligned_bytes);
+    data.save((int8_t*)dst + aligned_bytes,
+              static_cast<int>(bytes - aligned_bytes));
   }
 }
 
@@ -728,10 +736,13 @@ void pipelined_rsag_impl(ThreadSHMContext* ctx, scalar_t* data,
     int64_t curr_window = std::min(max_per_iter_elem_num, end - offset);
     bool fast_mode = ((end - offset) <= max_per_iter_elem_num);
 
+    // Each tile issues exactly 2x next_stamp() + 2x next_buffer(), so
+    // stamp/buffer parity at tile end equals tile start.  The caller's tail
+    // shm_allreduce_sum() therefore enters with a clean buffer state.
     while (curr_window > 0) {
       int64_t window_bytes = curr_window * (int64_t)sizeof(scalar_t);
 
-      // ── Phase 1: RS scatter (cached writes so contribution lands in L3) ───
+      // Phase 1: RS scatter (cached writes so contribution lands in L3)
       if (!fast_mode) {
         thread_ctx->wait_for_all(ThreadSHMContext::check_no_buffer_conflict);
       }
@@ -745,7 +756,7 @@ void pipelined_rsag_impl(ThreadSHMContext* ctx, scalar_t* data,
       thread_ctx->commit_ready_stamp();
       thread_ctx->wait_for_all(ThreadSHMContext::check_stamp_ready);
 
-      // ── Phase 2: RS accumulate ────────────────────────────────────────────
+      // Phase 2: RS accumulate
       scalar_t* own_ptr = data + (int64_t)rank * chunk_elem_num + offset;
       scalar_t* rs_out_ptr = chunk_ptr + offset;  // == own_ptr
       int64_t aligned_n = (curr_window / vec_elem_num) * vec_elem_num;
@@ -782,7 +793,7 @@ void pipelined_rsag_impl(ThreadSHMContext* ctx, scalar_t* data,
       thread_ctx->next_stamp();
       thread_ctx->next_buffer();
 
-      // ── Phase 3: AG write (rs_out_ptr still hot in L3) ───────────────────
+      // Phase 3: AG write (rs_out_ptr still hot in L3)
       if (!fast_mode) {
         thread_ctx->wait_for_all(ThreadSHMContext::check_no_buffer_conflict);
       }
@@ -791,7 +802,7 @@ void pipelined_rsag_impl(ThreadSHMContext* ctx, scalar_t* data,
       thread_ctx->commit_ready_stamp();
       thread_ctx->wait_for_all(ThreadSHMContext::check_stamp_ready);
 
-      // ── Phase 4: AG gather (reads peer reduced chunks from remote L3) ─────
+      // Phase 4: AG gather (reads peer reduced chunks from remote L3)
       vec_op::unroll_loop<int, RANKS - 1>([&](int idx) {
         int src_rank = thread_ctx->get_swizzled_rank(idx + 1);
         shm_cc_ops::memcpy(data + (int64_t)src_rank * chunk_elem_num + offset,
@@ -893,7 +904,7 @@ void shm_reduce_scatter_sum(ThreadSHMContext* ctx, scalar_t* data,
 }
 
 template <typename scalar_t>
-void shm_pipelined_rsag_sum(ThreadSHMContext* ctx, scalar_t* data,
+void shm_allreduce_rsag_sum(ThreadSHMContext* ctx, scalar_t* data,
                             size_t elem_num) {
   switch (ctx->group_size) {
     case 2:
@@ -915,12 +926,6 @@ void shm_pipelined_rsag_sum(ThreadSHMContext* ctx, scalar_t* data,
       TORCH_CHECK(false,
                   "Invalid world size: " + std::to_string(ctx->group_size));
   }
-}
-
-template <typename scalar_t>
-void shm_allreduce_rsag_sum(ThreadSHMContext* ctx, scalar_t* data,
-                            size_t elem_num) {
-  shm_pipelined_rsag_sum(ctx, data, elem_num);
 }
 
 template <typename scalar_t>
@@ -1186,15 +1191,20 @@ void shm_allreduce(int64_t handle, torch::Tensor& data) {
   });
 }
 
-// RS+AG requires 4 rank-synchronisation barriers vs 2 for the flat all-reduce.
-// Each barrier costs ~5 µs on SPR, so RS+AG carries a ~10 µs fixed overhead.
-// The flat all-reduce transmits N× input bytes over cross-NUMA links; RS+AG
-// transmits 2× regardless of N, saving (N-2)/(N-1) × B bytes.  At N=2 the
-// savings are in L3 cache pressure rather than raw traffic, and the crossover
-// with measured ~50 GB/s cross-NUMA BW falls around 16–32 KiB.  Use 32 KiB as
-// a conservative threshold that keeps small-tensor latency at the flat-AR
-// floor.
-static constexpr int64_t RSAG_BYTE_THRESHOLD = 32 * 1024;
+// Below this byte count the flat all-reduce's lower fixed barrier cost wins
+// over RS+AG's halved cross-NUMA traffic.  Override with
+// VLLM_CPU_RSAG_THRESHOLD_BYTES (0 = always RS+AG; useful for tests).
+// Read once via function-local-static — must be set before first call.
+static int64_t rsag_byte_threshold() {
+  static const int64_t v = []() {
+    const char* e = std::getenv("VLLM_CPU_RSAG_THRESHOLD_BYTES");
+    if (!e) return (int64_t)32768;
+    char* end;
+    long parsed = std::strtol(e, &end, 10);
+    return (end != e && parsed >= 0) ? (int64_t)parsed : (int64_t)32768;
+  }();
+  return v;
+}
 
 void shm_allreduce_rsag(int64_t handle, torch::Tensor& data) {
   TORCH_CHECK(data.is_contiguous())
@@ -1212,7 +1222,7 @@ void shm_allreduce_rsag(int64_t handle, torch::Tensor& data) {
         const int64_t tail = numel - head;
         const int64_t head_bytes = head * (int64_t)sizeof(scalar_t);
 
-        if (head_bytes < RSAG_BYTE_THRESHOLD) {
+        if (head_bytes < rsag_byte_threshold()) {
           CPU_KERNEL_GUARD_IN(shm_allreduce_sum)
           shm_allreduce_sum(ctx, p, numel);
           CPU_KERNEL_GUARD_OUT(shm_allreduce_sum)
