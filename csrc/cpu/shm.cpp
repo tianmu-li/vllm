@@ -756,18 +756,33 @@ void pipelined_rsag_impl(ThreadSHMContext* ctx, scalar_t* data,
       thread_ctx->commit_ready_stamp();
       thread_ctx->wait_for_all(ThreadSHMContext::check_stamp_ready);
 
-      // Phase 2: RS accumulate
+      // Capture RS half-buffer base before flipping; after next_buffer() the
+      // same call returns the AG half instead.
+      scalar_t* rs_shm_base = thread_ctx->get_thread_shm_ptr<scalar_t>(rank);
+
+      // Flip to AG half-buffer before the guard so check_no_buffer_conflict
+      // sees stamp N+1 and correctly blocks peers still reading AG data from
+      // tile N-1 in this same half.
+      thread_ctx->next_stamp();
+      thread_ctx->next_buffer();
+
+      // Phase 2+3: RS accumulate + AG write in one pass — eliminates the
+      // separate Phase 3 memcpy(ag_shm, rs_out_ptr, window_bytes).
+      if (!fast_mode) {
+        thread_ctx->wait_for_all(ThreadSHMContext::check_no_buffer_conflict);
+      }
       scalar_t* own_ptr = data + (int64_t)rank * chunk_elem_num + offset;
       scalar_t* rs_out_ptr = chunk_ptr + offset;  // == own_ptr
-      int64_t aligned_n = (curr_window / vec_elem_num) * vec_elem_num;
-      int64_t j = 0;
+      scalar_t* ag_shm_dst = thread_ctx->get_thread_shm_ptr<scalar_t>(rank);
 
       scalar_t* contrib_ptrs[RANKS - 1];
       vec_op::unroll_loop<int, RANKS - 1>([&](int idx) {
         int src_rank = thread_ctx->get_swizzled_rank(idx + 1);
-        contrib_ptrs[idx] = thread_ctx->get_thread_shm_ptr<scalar_t>(rank) +
-                            (int64_t)src_rank * max_per_iter_elem_num;
+        contrib_ptrs[idx] =
+            rs_shm_base + (int64_t)src_rank * max_per_iter_elem_num;
       });
+      int64_t aligned_n = (curr_window / vec_elem_num) * vec_elem_num;
+      int64_t j = 0;
 #pragma GCC unroll 4
       for (; j < aligned_n; j += vec_elem_num) {
         vec_t local(own_ptr + j);
@@ -778,6 +793,7 @@ void pipelined_rsag_impl(ThreadSHMContext* ctx, scalar_t* data,
         });
         vec_t result(acc);
         result.save(rs_out_ptr + j);
+        result.save(ag_shm_dst + j);
       }
       if (j < curr_window) {
         vec_t local(own_ptr + j);
@@ -788,17 +804,8 @@ void pipelined_rsag_impl(ThreadSHMContext* ctx, scalar_t* data,
         });
         vec_t result(acc);
         result.save(rs_out_ptr + j, curr_window - aligned_n);
+        result.save(ag_shm_dst + j, curr_window - aligned_n);
       }
-      // Flip to AG half-buffer.
-      thread_ctx->next_stamp();
-      thread_ctx->next_buffer();
-
-      // Phase 3: AG write (rs_out_ptr still hot in L3)
-      if (!fast_mode) {
-        thread_ctx->wait_for_all(ThreadSHMContext::check_no_buffer_conflict);
-      }
-      shm_cc_ops::memcpy(thread_ctx->get_thread_shm_ptr<scalar_t>(rank),
-                         rs_out_ptr, window_bytes);
       thread_ctx->commit_ready_stamp();
       thread_ctx->wait_for_all(ThreadSHMContext::check_stamp_ready);
 
