@@ -704,8 +704,9 @@ void all_gather_impl(ThreadSHMContext* ctx, scalar_t* data, scalar_t* output,
 namespace shm_cc_ops {
 
 template <typename scalar_t, int RANKS>
-void pipelined_rsag_impl(ThreadSHMContext* ctx, scalar_t* data,
-                         size_t elem_num) {
+void pipelined_rsag_impl(ThreadSHMContext* ctx, scalar_t* data, size_t elem_num,
+                         scalar_t* tail_ptr = nullptr,
+                         int64_t tail_elem_num = 0) {
   CPU_KERNEL_GUARD_IN(pipelined_rsag_impl)
   using vec_t = typename KernelVecType<scalar_t>::scalar_vec_t;
   constexpr int64_t vec_elem_num = vec_t::get_elem_num();
@@ -737,8 +738,8 @@ void pipelined_rsag_impl(ThreadSHMContext* ctx, scalar_t* data,
     bool fast_mode = ((end - offset) <= max_per_iter_elem_num);
 
     // Each tile issues exactly 2x next_stamp() + 2x next_buffer(), so
-    // stamp/buffer parity at tile end equals tile start.  The caller's tail
-    // shm_allreduce_sum() therefore enters with a clean buffer state.
+    // stamp/buffer parity at tile end equals tile start.  The inline tail
+    // flat-AR therefore starts with a clean buffer state.
     while (curr_window > 0) {
       int64_t window_bytes = curr_window * (int64_t)sizeof(scalar_t);
 
@@ -822,6 +823,81 @@ void pipelined_rsag_impl(ThreadSHMContext* ctx, scalar_t* data,
 
       offset += max_per_iter_elem_num;
       curr_window = std::min(max_per_iter_elem_num, end - offset);
+    }
+
+    // Inline flat-AR for tail elements that don't fit an aligned RS+AG chunk.
+    // Mirrors shm_cc_loop / all_reduce_sum_impl but reuses the already-running
+    // omp parallel region, avoiding a second spawn and barrier set.
+    // Stamp/buffer state is clean here: the RS+AG while-loop ends with
+    // next_stamp+next_buffer (the Phase-4 flip), and all ranks reached the
+    // same final stamp via the last wait_for_all(check_stamp_ready).
+    if (tail_elem_num > 0) {
+      int64_t t_per_unit_elem =
+          MIN_THREAD_PROCESS_SIZE / (int64_t)sizeof(scalar_t);
+      int64_t t_total_units =
+          ((int64_t)tail_elem_num * (int64_t)sizeof(scalar_t) +
+           MIN_THREAD_PROCESS_SIZE - 1) /
+          MIN_THREAD_PROCESS_SIZE;
+      int64_t t_per_thread_units =
+          (t_total_units + thread_num - 1) / thread_num;
+      int64_t t_per_thread_elems = t_per_unit_elem * t_per_thread_units;
+      int64_t t_max_iter_elems =
+          (PER_THREAD_SHM_BUFFER_BYTES >> 1) / (int64_t)sizeof(scalar_t);
+
+      int64_t t_off = (int64_t)i * t_per_thread_elems;
+      int64_t t_end =
+          std::min((int64_t)tail_elem_num, t_off + t_per_thread_elems);
+      int64_t t_curr = std::min(t_max_iter_elems, t_end - t_off);
+      bool t_fast = ((t_end - t_off) <= t_max_iter_elems);
+
+      while (t_curr > 0) {
+        // Recompute each iteration: get_thread_shm_ptr flips with next_buffer.
+        scalar_t* t_shm_ptr = thread_ctx->get_thread_shm_ptr<scalar_t>(rank);
+        scalar_t* t_data_ptr = tail_ptr + t_off;
+        int64_t t_bytes = t_curr * (int64_t)sizeof(scalar_t);
+
+        scalar_t* t_remote_ptrs[RANKS - 1];
+        vec_op::unroll_loop<int, RANKS - 1>([&](int idx) {
+          t_remote_ptrs[idx] = thread_ctx->get_thread_shm_ptr<scalar_t>(
+              thread_ctx->get_swizzled_rank(idx + 1));
+        });
+
+        if (!t_fast) {
+          thread_ctx->wait_for_all(ThreadSHMContext::check_no_buffer_conflict);
+        }
+        shm_cc_ops::memcpy_to_shm(t_shm_ptr, t_data_ptr, t_bytes);
+        thread_ctx->commit_ready_stamp();
+        int64_t t_aligned = (t_curr / vec_elem_num) * vec_elem_num;
+        int64_t k = 0;
+        thread_ctx->wait_for_all(ThreadSHMContext::check_stamp_ready);
+
+#pragma GCC unroll 4
+        for (; k < t_aligned; k += vec_elem_num) {
+          vec_t lv(t_data_ptr + k);
+          vec_op::FP32Vec16 acc(lv);
+          vec_op::unroll_loop<int, RANKS - 1>([&](int idx) {
+            vec_t rv(true, t_remote_ptrs[idx] + k);
+            acc = acc + vec_op::FP32Vec16(rv);
+          });
+          vec_t res(acc);
+          res.save(t_data_ptr + k);
+        }
+        if (k < t_curr) {
+          vec_t lv(t_data_ptr + k);
+          vec_op::FP32Vec16 acc(lv);
+          vec_op::unroll_loop<int, RANKS - 1>([&](int idx) {
+            vec_t rv(true, t_remote_ptrs[idx] + k);
+            acc = acc + vec_op::FP32Vec16(rv);
+          });
+          vec_t res(acc);
+          res.save(t_data_ptr + k, t_curr - t_aligned);
+        }
+
+        thread_ctx->next_stamp();
+        thread_ctx->next_buffer();
+        t_off += t_max_iter_elems;
+        t_curr = std::min(t_max_iter_elems, t_end - t_off);
+      }
     }
   }
 }
@@ -912,22 +988,28 @@ void shm_reduce_scatter_sum(ThreadSHMContext* ctx, scalar_t* data,
 
 template <typename scalar_t>
 void shm_allreduce_rsag_sum(ThreadSHMContext* ctx, scalar_t* data,
-                            size_t elem_num) {
+                            size_t elem_num, scalar_t* tail_ptr = nullptr,
+                            int64_t tail_elem_num = 0) {
   switch (ctx->group_size) {
     case 2:
-      shm_cc_ops::pipelined_rsag_impl<scalar_t, 2>(ctx, data, elem_num);
+      shm_cc_ops::pipelined_rsag_impl<scalar_t, 2>(ctx, data, elem_num,
+                                                   tail_ptr, tail_elem_num);
       break;
     case 3:
-      shm_cc_ops::pipelined_rsag_impl<scalar_t, 3>(ctx, data, elem_num);
+      shm_cc_ops::pipelined_rsag_impl<scalar_t, 3>(ctx, data, elem_num,
+                                                   tail_ptr, tail_elem_num);
       break;
     case 4:
-      shm_cc_ops::pipelined_rsag_impl<scalar_t, 4>(ctx, data, elem_num);
+      shm_cc_ops::pipelined_rsag_impl<scalar_t, 4>(ctx, data, elem_num,
+                                                   tail_ptr, tail_elem_num);
       break;
     case 6:
-      shm_cc_ops::pipelined_rsag_impl<scalar_t, 6>(ctx, data, elem_num);
+      shm_cc_ops::pipelined_rsag_impl<scalar_t, 6>(ctx, data, elem_num,
+                                                   tail_ptr, tail_elem_num);
       break;
     case 8:
-      shm_cc_ops::pipelined_rsag_impl<scalar_t, 8>(ctx, data, elem_num);
+      shm_cc_ops::pipelined_rsag_impl<scalar_t, 8>(ctx, data, elem_num,
+                                                   tail_ptr, tail_elem_num);
       break;
     default:
       TORCH_CHECK(false,
@@ -1235,8 +1317,8 @@ void shm_allreduce_rsag(int64_t handle, torch::Tensor& data) {
           CPU_KERNEL_GUARD_OUT(shm_allreduce_sum)
         } else {
           CPU_KERNEL_GUARD_IN(shm_allreduce_rsag_sum)
-          shm_allreduce_rsag_sum(ctx, p, (size_t)head);
-          if (tail > 0) shm_allreduce_sum(ctx, p + head, (size_t)tail);
+          shm_allreduce_rsag_sum(ctx, p, (size_t)head,
+                                 tail > 0 ? p + head : nullptr, tail);
           CPU_KERNEL_GUARD_OUT(shm_allreduce_rsag_sum)
         }
       });
