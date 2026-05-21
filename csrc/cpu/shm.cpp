@@ -394,20 +394,41 @@ class SHMManager {
 
 namespace shm_cc_ops {
 template <typename scalar_t, typename F>
-void shm_cc_loop(ThreadSHMContext* ctx, int64_t elem_num, F&& inner_func) {
-  int thread_num = ctx->thread_num;
+void shm_cc_loop(ThreadSHMContext* ctx, int64_t elem_num, int effective_threads,
+                 F&& inner_func) {
   int64_t total_bytes = elem_num * sizeof(scalar_t);
   int64_t total_units_num =
       (total_bytes + MIN_THREAD_PROCESS_SIZE - 1) / MIN_THREAD_PROCESS_SIZE;
-  int64_t per_thread_units_num =
-      (total_units_num + thread_num - 1) / thread_num;
   int64_t per_unit_elem_num = MIN_THREAD_PROCESS_SIZE / sizeof(scalar_t);
   int64_t max_per_thread_iteration_elem_num =
       (PER_THREAD_SHM_BUFFER_BYTES >> 1) /
       sizeof(scalar_t);  // Note: double buffer
+
+  if (effective_threads == 1) {
+    // Single-threaded path: bypass libgomp entirely.  All work runs on
+    // thread 0 (ctx + 0); remote ranks do the same, so stamp polling is
+    // symmetric.
+    int64_t offset = 0;
+    int64_t end = elem_num;
+    int64_t curr_elem_num = std::min(max_per_thread_iteration_elem_num, end);
+    ThreadSHMContext* thread_ctx = ctx;
+    bool fast_mode = (end <= max_per_thread_iteration_elem_num);
+    while (curr_elem_num > 0) {
+      inner_func(thread_ctx, offset, curr_elem_num, fast_mode);
+      thread_ctx->next_stamp();
+      thread_ctx->next_buffer();
+      offset += max_per_thread_iteration_elem_num;
+      curr_elem_num = std::min(max_per_thread_iteration_elem_num, end - offset);
+    }
+    return;
+  }
+
+  int thread_num = effective_threads;
+  int64_t per_thread_units_num =
+      (total_units_num + thread_num - 1) / thread_num;
   int64_t per_thread_elem_num = per_unit_elem_num * per_thread_units_num;
 
-#pragma omp parallel for schedule(static, 1)
+#pragma omp parallel for schedule(static, 1) num_threads(effective_threads)
   for (int i = 0; i < thread_num; ++i) {
     int64_t offset = i * per_thread_elem_num;
     int64_t end = std::min(elem_num, offset + per_thread_elem_num);
@@ -484,15 +505,15 @@ void memcpy(void* dst, void* src, const int64_t bytes) {
 }
 
 template <typename scalar_t, int RANKS>
-void all_reduce_sum_impl(ThreadSHMContext* ctx, scalar_t* data,
-                         size_t elem_num) {
+void all_reduce_sum_impl(ThreadSHMContext* ctx, scalar_t* data, size_t elem_num,
+                         int effective_threads, bool use_cached_stores) {
   CPU_KERNEL_GUARD_IN(all_reduce_sum_impl)
   using vec_t = typename KernelVecType<scalar_t>::scalar_vec_t;
   constexpr int64_t vec_elem_num = vec_t::get_elem_num();
   const int worldsize = ctx->group_size;
 
   shm_cc_ops::shm_cc_loop<scalar_t>(
-      ctx, elem_num,
+      ctx, elem_num, effective_threads,
       [&](ThreadSHMContext* thread_ctx, int64_t data_offset,
           int64_t data_elem_num, bool fast_mode) {
         int rank = thread_ctx->rank;
@@ -511,8 +532,13 @@ void all_reduce_sum_impl(ThreadSHMContext* ctx, scalar_t* data,
           thread_ctx->wait_for_all(ThreadSHMContext::check_no_buffer_conflict);
         }
 
-        shm_cc_ops::memcpy_to_shm(thread_shm_ptr, thread_data_ptr,
-                                  thread_data_elem_num);
+        if (use_cached_stores) {
+          shm_cc_ops::memcpy(thread_shm_ptr, thread_data_ptr,
+                             thread_data_elem_num);
+        } else {
+          shm_cc_ops::memcpy_to_shm(thread_shm_ptr, thread_data_ptr,
+                                    thread_data_elem_num);
+        }
         thread_ctx->commit_ready_stamp();
         int64_t aligned_data_elem_num =
             (data_elem_num / vec_elem_num) * vec_elem_num;
@@ -665,7 +691,7 @@ void all_gather_impl(ThreadSHMContext* ctx, scalar_t* data, scalar_t* output,
   CPU_KERNEL_GUARD_IN(all_gather_impl)
 
   shm_cc_ops::shm_cc_loop<scalar_t>(
-      ctx, elem_num,
+      ctx, elem_num, ctx->thread_num,
       [&](ThreadSHMContext* thread_ctx, int64_t data_offset,
           int64_t data_elem_num, bool fast_mode) {
         int rank = thread_ctx->rank;
@@ -933,22 +959,28 @@ std::vector<std::unique_ptr<SHMManager>> SHMManager::SingletonInstances = {};
 std::mutex SHMManager::SingletonInstancesLock = {};
 
 template <typename scalar_t>
-void shm_allreduce_sum(ThreadSHMContext* ctx, scalar_t* data, size_t elem_num) {
+void shm_allreduce_sum(ThreadSHMContext* ctx, scalar_t* data, size_t elem_num,
+                       int effective_threads, bool use_cached_stores) {
   switch (ctx->group_size) {
     case 2:
-      shm_cc_ops::all_reduce_sum_impl<scalar_t, 2>(ctx, data, elem_num);
+      shm_cc_ops::all_reduce_sum_impl<scalar_t, 2>(
+          ctx, data, elem_num, effective_threads, use_cached_stores);
       break;
     case 3:
-      shm_cc_ops::all_reduce_sum_impl<scalar_t, 3>(ctx, data, elem_num);
+      shm_cc_ops::all_reduce_sum_impl<scalar_t, 3>(
+          ctx, data, elem_num, effective_threads, use_cached_stores);
       break;
     case 4:
-      shm_cc_ops::all_reduce_sum_impl<scalar_t, 4>(ctx, data, elem_num);
+      shm_cc_ops::all_reduce_sum_impl<scalar_t, 4>(
+          ctx, data, elem_num, effective_threads, use_cached_stores);
       break;
     case 6:
-      shm_cc_ops::all_reduce_sum_impl<scalar_t, 6>(ctx, data, elem_num);
+      shm_cc_ops::all_reduce_sum_impl<scalar_t, 6>(
+          ctx, data, elem_num, effective_threads, use_cached_stores);
       break;
     case 8:
-      shm_cc_ops::all_reduce_sum_impl<scalar_t, 8>(ctx, data, elem_num);
+      shm_cc_ops::all_reduce_sum_impl<scalar_t, 8>(
+          ctx, data, elem_num, effective_threads, use_cached_stores);
       break;
     default:
       TORCH_CHECK(false,
@@ -1024,7 +1056,7 @@ void shm_gather_impl(ThreadSHMContext* ctx, scalar_t* data, size_t elem_num,
   const int worldsize = ctx->group_size;
   TORCH_CHECK_LT(dst, worldsize);
   shm_cc_ops::shm_cc_loop<scalar_t>(
-      ctx, elem_num,
+      ctx, elem_num, ctx->thread_num,
       [&](ThreadSHMContext* thread_ctx, int64_t data_offset,
           int64_t data_elem_num, bool fast_mode) {
         int rank = thread_ctx->rank;
@@ -1157,7 +1189,7 @@ void shm_send_tensor_list_impl(ThreadSHMContext* ctx, int64_t dst,
 
   shm_cc_ops::reset_threads_stamp_buffer_idx(ctx, 0, 1);
   shm_cc_ops::shm_cc_loop<int8_t>(
-      ctx, metadata->total_bytes,
+      ctx, metadata->total_bytes, ctx->thread_num,
       [&](ThreadSHMContext* thread_ctx, int64_t data_offset,
           int64_t data_elem_num, bool fast_mode) {
         int rank = thread_ctx->rank;
@@ -1199,7 +1231,7 @@ std::vector<torch::Tensor> shm_recv_tensor_list_impl(ThreadSHMContext* ctx,
   TORCH_CHECK_EQ(metadata.total_bytes, src_metadata->total_bytes);
 
   shm_cc_ops::shm_cc_loop<int8_t>(
-      ctx, metadata.total_bytes,
+      ctx, metadata.total_bytes, ctx->thread_num,
       [&](ThreadSHMContext* thread_ctx, int64_t data_offset,
           int64_t data_elem_num, bool fast_mode) {
         thread_ctx->wait_for_one(src, ThreadSHMContext::check_stamp_ready);
@@ -1274,8 +1306,9 @@ void shm_allreduce(int64_t handle, torch::Tensor& data) {
   TORCH_CHECK(data.is_contiguous())
   VLLM_DISPATCH_FLOATING_TYPES(data.scalar_type(), "shm_allreduce_sum", [&] {
     CPU_KERNEL_GUARD_IN(shm_allreduce_sum)
-    shm_allreduce_sum(SHMManager::get_singleton_instance(handle)->get_shm_ctx(),
-                      data.data_ptr<scalar_t>(), data.numel());
+    auto* ctx = SHMManager::get_singleton_instance(handle)->get_shm_ctx();
+    shm_allreduce_sum(ctx, data.data_ptr<scalar_t>(), data.numel(),
+                      ctx->thread_num, /*use_cached_stores=*/false);
     CPU_KERNEL_GUARD_OUT(shm_allreduce_sum)
   });
 }
@@ -1310,10 +1343,35 @@ void shm_allreduce_rsag(int64_t handle, torch::Tensor& data) {
         const int64_t head = (numel / align) * align;
         const int64_t tail = numel - head;
         const int64_t head_bytes = head * (int64_t)sizeof(scalar_t);
+        // Total bytes across all elements (used for the flat-AR dispatch
+        // ladder when head_bytes < threshold).
+        const int64_t total_bytes = numel * (int64_t)sizeof(scalar_t);
+
+        // Dispatch ladder for flat-AR: choose effective_threads and store mode
+        // based on message size.  Decision is a pure function of total_bytes
+        // which is identical on every rank, keeping the per-thread stamp
+        // protocol symmetric.  effective_threads is capped at ctx->thread_num
+        // so the ladder acts as a soft upper bound on small-T machines.
+        int flat_threads;
+        bool use_cached_stores;
+        if (total_bytes <= 4 * 1024) {
+          flat_threads = 1;
+          use_cached_stores = true;
+        } else if (total_bytes <= 16 * 1024) {
+          flat_threads = std::min<int>(4, ctx->thread_num);
+          use_cached_stores = true;
+        } else if (total_bytes <= 64 * 1024) {
+          flat_threads = std::min<int>(8, ctx->thread_num);
+          use_cached_stores = true;
+        } else {
+          flat_threads = ctx->thread_num;
+          use_cached_stores = false;
+        }
+        TORCH_CHECK(flat_threads >= 1);
 
         if (head_bytes < rsag_byte_threshold()) {
           CPU_KERNEL_GUARD_IN(shm_allreduce_sum)
-          shm_allreduce_sum(ctx, p, numel);
+          shm_allreduce_sum(ctx, p, numel, flat_threads, use_cached_stores);
           CPU_KERNEL_GUARD_OUT(shm_allreduce_sum)
         } else {
           CPU_KERNEL_GUARD_IN(shm_allreduce_rsag_sum)
