@@ -1,6 +1,5 @@
 #include "cpu/cpu_types.hpp"
 
-#include <cstdlib>
 #include <fcntl.h>
 #include <sys/mman.h>
 #include <sys/stat.h>
@@ -394,8 +393,9 @@ class SHMManager {
 
 namespace shm_cc_ops {
 template <typename scalar_t, typename F>
-void shm_cc_loop(ThreadSHMContext* ctx, int64_t elem_num, int effective_threads,
-                 F&& inner_func) {
+void shm_cc_loop(ThreadSHMContext* ctx, int64_t elem_num, F&& inner_func,
+                 int effective_threads = -1) {
+  if (effective_threads < 0) effective_threads = ctx->thread_num;
   int64_t total_bytes = elem_num * sizeof(scalar_t);
   int64_t total_units_num =
       (total_bytes + MIN_THREAD_PROCESS_SIZE - 1) / MIN_THREAD_PROCESS_SIZE;
@@ -513,7 +513,7 @@ void all_reduce_sum_impl(ThreadSHMContext* ctx, scalar_t* data, size_t elem_num,
   const int worldsize = ctx->group_size;
 
   shm_cc_ops::shm_cc_loop<scalar_t>(
-      ctx, elem_num, effective_threads,
+      ctx, elem_num,
       [&](ThreadSHMContext* thread_ctx, int64_t data_offset,
           int64_t data_elem_num, bool fast_mode) {
         int rank = thread_ctx->rank;
@@ -571,7 +571,8 @@ void all_reduce_sum_impl(ThreadSHMContext* ctx, scalar_t* data, size_t elem_num,
           reduced_data.save(thread_data_ptr + i,
                             data_elem_num - aligned_data_elem_num);
         }
-      });
+      },
+      effective_threads);
 
   return;
 }
@@ -691,7 +692,7 @@ void all_gather_impl(ThreadSHMContext* ctx, scalar_t* data, scalar_t* output,
   CPU_KERNEL_GUARD_IN(all_gather_impl)
 
   shm_cc_ops::shm_cc_loop<scalar_t>(
-      ctx, elem_num, ctx->thread_num,
+      ctx, elem_num,
       [&](ThreadSHMContext* thread_ctx, int64_t data_offset,
           int64_t data_elem_num, bool fast_mode) {
         int rank = thread_ctx->rank;
@@ -752,6 +753,17 @@ void pipelined_rsag_impl(ThreadSHMContext* ctx, scalar_t* data, size_t elem_num,
   int64_t per_thread_units = (total_units + thread_num - 1) / thread_num;
   int64_t per_thread_elem_num = per_unit_elem_num * per_thread_units;
 
+  // Tail flat-AR loop-invariants (depend only on tail_elem_num / thread_num /
+  // sizeof — identical across all threads; hoist to avoid redundant recompute).
+  int64_t t_per_unit_elem = MIN_THREAD_PROCESS_SIZE / (int64_t)sizeof(scalar_t);
+  int64_t t_total_units = ((int64_t)tail_elem_num * (int64_t)sizeof(scalar_t) +
+                           MIN_THREAD_PROCESS_SIZE - 1) /
+                          MIN_THREAD_PROCESS_SIZE;
+  int64_t t_per_thread_units = (t_total_units + thread_num - 1) / thread_num;
+  int64_t t_per_thread_elems = t_per_unit_elem * t_per_thread_units;
+  int64_t t_max_iter_elems =
+      (PER_THREAD_SHM_BUFFER_BYTES >> 1) / (int64_t)sizeof(scalar_t);
+
 #pragma omp parallel for schedule(static, 1) num_threads(thread_num)
   for (int i = 0; i < thread_num; ++i) {
     ThreadSHMContext* thread_ctx = ctx + i;
@@ -783,8 +795,6 @@ void pipelined_rsag_impl(ThreadSHMContext* ctx, scalar_t* data, size_t elem_num,
       thread_ctx->commit_ready_stamp();
       thread_ctx->wait_for_all(ThreadSHMContext::check_stamp_ready);
 
-      // Capture RS half-buffer base before flipping; after next_buffer() the
-      // same call returns the AG half instead.
       scalar_t* rs_shm_base = thread_ctx->get_thread_shm_ptr<scalar_t>(rank);
 
       // Flip to AG half-buffer before the guard so check_no_buffer_conflict
@@ -793,8 +803,6 @@ void pipelined_rsag_impl(ThreadSHMContext* ctx, scalar_t* data, size_t elem_num,
       thread_ctx->next_stamp();
       thread_ctx->next_buffer();
 
-      // Phase 2+3: RS accumulate + AG write in one pass — eliminates the
-      // separate Phase 3 memcpy(ag_shm, rs_out_ptr, window_bytes).
       if (!fast_mode) {
         thread_ctx->wait_for_all(ThreadSHMContext::check_no_buffer_conflict);
       }
@@ -836,14 +844,12 @@ void pipelined_rsag_impl(ThreadSHMContext* ctx, scalar_t* data, size_t elem_num,
       thread_ctx->commit_ready_stamp();
       thread_ctx->wait_for_all(ThreadSHMContext::check_stamp_ready);
 
-      // Phase 4: AG gather (reads peer reduced chunks from remote L3)
       vec_op::unroll_loop<int, RANKS - 1>([&](int idx) {
         int src_rank = thread_ctx->get_swizzled_rank(idx + 1);
         shm_cc_ops::memcpy(data + (int64_t)src_rank * chunk_elem_num + offset,
                            thread_ctx->get_thread_shm_ptr<scalar_t>(src_rank),
                            window_bytes);
       });
-      // Flip back to RS half-buffer for the next tile.
       thread_ctx->next_stamp();
       thread_ctx->next_buffer();
 
@@ -858,18 +864,6 @@ void pipelined_rsag_impl(ThreadSHMContext* ctx, scalar_t* data, size_t elem_num,
     // next_stamp+next_buffer (the Phase-4 flip), and all ranks reached the
     // same final stamp via the last wait_for_all(check_stamp_ready).
     if (tail_elem_num > 0) {
-      int64_t t_per_unit_elem =
-          MIN_THREAD_PROCESS_SIZE / (int64_t)sizeof(scalar_t);
-      int64_t t_total_units =
-          ((int64_t)tail_elem_num * (int64_t)sizeof(scalar_t) +
-           MIN_THREAD_PROCESS_SIZE - 1) /
-          MIN_THREAD_PROCESS_SIZE;
-      int64_t t_per_thread_units =
-          (t_total_units + thread_num - 1) / thread_num;
-      int64_t t_per_thread_elems = t_per_unit_elem * t_per_thread_units;
-      int64_t t_max_iter_elems =
-          (PER_THREAD_SHM_BUFFER_BYTES >> 1) / (int64_t)sizeof(scalar_t);
-
       int64_t t_off = (int64_t)i * t_per_thread_elems;
       int64_t t_end =
           std::min((int64_t)tail_elem_num, t_off + t_per_thread_elems);
@@ -1056,7 +1050,7 @@ void shm_gather_impl(ThreadSHMContext* ctx, scalar_t* data, size_t elem_num,
   const int worldsize = ctx->group_size;
   TORCH_CHECK_LT(dst, worldsize);
   shm_cc_ops::shm_cc_loop<scalar_t>(
-      ctx, elem_num, ctx->thread_num,
+      ctx, elem_num,
       [&](ThreadSHMContext* thread_ctx, int64_t data_offset,
           int64_t data_elem_num, bool fast_mode) {
         int rank = thread_ctx->rank;
@@ -1189,7 +1183,7 @@ void shm_send_tensor_list_impl(ThreadSHMContext* ctx, int64_t dst,
 
   shm_cc_ops::reset_threads_stamp_buffer_idx(ctx, 0, 1);
   shm_cc_ops::shm_cc_loop<int8_t>(
-      ctx, metadata->total_bytes, ctx->thread_num,
+      ctx, metadata->total_bytes,
       [&](ThreadSHMContext* thread_ctx, int64_t data_offset,
           int64_t data_elem_num, bool fast_mode) {
         int rank = thread_ctx->rank;
@@ -1231,7 +1225,7 @@ std::vector<torch::Tensor> shm_recv_tensor_list_impl(ThreadSHMContext* ctx,
   TORCH_CHECK_EQ(metadata.total_bytes, src_metadata->total_bytes);
 
   shm_cc_ops::shm_cc_loop<int8_t>(
-      ctx, metadata.total_bytes, ctx->thread_num,
+      ctx, metadata.total_bytes,
       [&](ThreadSHMContext* thread_ctx, int64_t data_offset,
           int64_t data_elem_num, bool fast_mode) {
         thread_ctx->wait_for_one(src, ThreadSHMContext::check_stamp_ready);
@@ -1302,31 +1296,16 @@ void shm_all_gather(int64_t handle, const torch::Tensor& data,
   });
 }
 
-void shm_allreduce(int64_t handle, torch::Tensor& data) {
-  TORCH_CHECK(data.is_contiguous())
-  VLLM_DISPATCH_FLOATING_TYPES(data.scalar_type(), "shm_allreduce_sum", [&] {
-    CPU_KERNEL_GUARD_IN(shm_allreduce_sum)
-    auto* ctx = SHMManager::get_singleton_instance(handle)->get_shm_ctx();
-    shm_allreduce_sum(ctx, data.data_ptr<scalar_t>(), data.numel(),
-                      ctx->thread_num, /*use_cached_stores=*/false);
-    CPU_KERNEL_GUARD_OUT(shm_allreduce_sum)
-  });
-}
-
-// Below this byte count the flat all-reduce's lower fixed barrier cost wins
-// over RS+AG's halved cross-NUMA traffic.  Override with
-// VLLM_CPU_RSAG_THRESHOLD_BYTES (0 = always RS+AG; useful for tests).
-// Read once via function-local-static — must be set before first call.
-static int64_t rsag_byte_threshold() {
-  static const int64_t v = []() {
-    const char* e = std::getenv("VLLM_CPU_RSAG_THRESHOLD_BYTES");
-    if (!e) return (int64_t)32768;
-    char* end;
-    long parsed = std::strtol(e, &end, 10);
-    return (end != e && parsed >= 0) ? (int64_t)parsed : (int64_t)32768;
-  }();
-  return v;
-}
+// Flat-AR dispatch ladder: named thread/size constants.
+static constexpr int64_t kFlatARTinyBytes = 4 * 1024;
+static constexpr int64_t kFlatARSmallBytes = 16 * 1024;
+static constexpr int64_t kFlatARMediumBytes = 64 * 1024;
+static constexpr int kFlatARSmallThreads = 4;
+static constexpr int kFlatARMediumThreads = 8;
+// Below this byte count (or when group_size==2) flat all-reduce wins over
+// RS+AG.  Empirically derived: TP=4 crossover at 128 KiB; TP=2 flat-AR
+// wins at all measured sizes, so RS+AG is disabled for world_size<=2.
+static constexpr int64_t kRSAGThresholdBytes = 128 * 1024;
 
 void shm_allreduce_rsag(int64_t handle, torch::Tensor& data) {
   TORCH_CHECK(data.is_contiguous())
@@ -1354,14 +1333,14 @@ void shm_allreduce_rsag(int64_t handle, torch::Tensor& data) {
         // so the ladder acts as a soft upper bound on small-T machines.
         int flat_threads;
         bool use_cached_stores;
-        if (total_bytes <= 4 * 1024) {
+        if (total_bytes <= kFlatARTinyBytes) {
           flat_threads = 1;
           use_cached_stores = true;
-        } else if (total_bytes <= 16 * 1024) {
-          flat_threads = std::min<int>(4, ctx->thread_num);
+        } else if (total_bytes <= kFlatARSmallBytes) {
+          flat_threads = std::min<int>(kFlatARSmallThreads, ctx->thread_num);
           use_cached_stores = true;
-        } else if (total_bytes <= 64 * 1024) {
-          flat_threads = std::min<int>(8, ctx->thread_num);
+        } else if (total_bytes <= kFlatARMediumBytes) {
+          flat_threads = std::min<int>(kFlatARMediumThreads, ctx->thread_num);
           use_cached_stores = true;
         } else {
           flat_threads = ctx->thread_num;
@@ -1369,7 +1348,7 @@ void shm_allreduce_rsag(int64_t handle, torch::Tensor& data) {
         }
         TORCH_CHECK(flat_threads >= 1);
 
-        if (head_bytes < rsag_byte_threshold()) {
+        if (ctx->group_size <= 2 || head_bytes < kRSAGThresholdBytes) {
           CPU_KERNEL_GUARD_IN(shm_allreduce_sum)
           shm_allreduce_sum(ctx, p, numel, flat_threads, use_cached_stores);
           CPU_KERNEL_GUARD_OUT(shm_allreduce_sum)

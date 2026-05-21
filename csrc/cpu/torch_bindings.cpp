@@ -41,8 +41,6 @@ int64_t init_shm_manager(const std::string& name, const int64_t group_size,
 
 std::string join_shm_manager(int64_t handle, const std::string& name);
 
-void shm_allreduce(int64_t handle, torch::Tensor& data);
-
 void shm_allreduce_rsag(int64_t handle, torch::Tensor& data);
 
 void shm_gather(int64_t handle, torch::Tensor& data,
@@ -389,8 +387,6 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, ops) {
       "int",
       &init_shm_manager);
   ops.def("join_shm_manager(int handle, str name) -> str", &join_shm_manager);
-  ops.def("shm_allreduce(int handle, Tensor! data) -> ()");
-  ops.impl("shm_allreduce", torch::kCPU, &shm_allreduce);
   ops.def("shm_allreduce_rsag(int handle, Tensor! data) -> ()");
   ops.impl("shm_allreduce_rsag", torch::kCPU, &shm_allreduce_rsag);
   ops.def(

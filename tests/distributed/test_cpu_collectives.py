@@ -3,13 +3,16 @@
 """CPU SHM collective correctness tests for all supported TP sizes."""
 
 import os
-import socket
+import time
 
+import multiprocess as mp
 import pytest
 import torch
 import torch.distributed as dist
 
 from vllm.distributed.device_communicators.cpu_communicator import CpuCommunicator
+from vllm.utils.network_utils import get_open_port
+from vllm.utils.system_utils import update_environment_variables
 
 _DTYPES = [torch.bfloat16, torch.float16, torch.float32]
 _WORLD_SIZES = [2, 3, 4, 6, 8]
@@ -17,14 +20,8 @@ _BUCKETS = ["tiny", "below_thresh", "above_thresh", "head_plus_tail", "multi_til
 
 # Tolerances per dtype for assert_close(actual.float(), expected).
 # Inputs are bounded to magnitude <=2 so these are generous but not vacuous.
-_ATOL = {torch.bfloat16: 2e-2, torch.float16: 2e-3, torch.float32: 1e-5}
-_RTOL = {torch.bfloat16: 2e-2, torch.float16: 2e-3, torch.float32: 1e-5}
-
-
-def _find_free_port() -> int:
-    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
-        s.bind(("", 0))
-        return s.getsockname()[1]
+_ATOL = {torch.bfloat16: 5e-3, torch.float16: 2e-3, torch.float32: 1e-5}
+_RTOL = {torch.bfloat16: 5e-3, torch.float16: 2e-3, torch.float32: 1e-5}
 
 
 def _numel_for_bucket(bucket: str, world_size: int, dtype: torch.dtype) -> int:
@@ -33,18 +30,18 @@ def _numel_for_bucket(bucket: str, world_size: int, dtype: torch.dtype) -> int:
     if bucket == "tiny":
         return 8
     if bucket == "below_thresh":
-        # Largest aligned count whose byte size is just below 32 KiB.
-        below = (32 * 1024 - 256) // dtype.itemsize
+        # Largest aligned count whose byte size is just below 128 KiB.
+        below = (128 * 1024 - 256) // dtype.itemsize
         return (below // align) * align
     if bucket == "above_thresh":
-        above = (32 * 1024 + 256) // dtype.itemsize
+        above = (128 * 1024 + 256) // dtype.itemsize
         n = (above // align) * align
-        if n * dtype.itemsize < 32 * 1024:
+        if n * dtype.itemsize < 128 * 1024:
             n += align
         return n
     if bucket == "head_plus_tail":
-        # ~64 KiB of aligned head + 7 tail elements (exercises tail flat-AR).
-        head_elems = (64 * 1024 // dtype.itemsize // align) * align
+        # ~256 KiB of aligned head + 7 tail elements (exercises tail flat-AR).
+        head_elems = (256 * 1024 // dtype.itemsize // align) * align
         return head_elems + 7
     if bucket == "multi_tile":
         # 8 MiB total so per-thread tiles span >1 half-buffer slot.
@@ -55,10 +52,8 @@ def _numel_for_bucket(bucket: str, world_size: int, dtype: torch.dtype) -> int:
 
 def _make_input(rank: int, numel: int, dtype: torch.dtype) -> torch.Tensor:
     # Values in [0.125, ~2.1]; using (i & 0xFF) bounds multi_tile magnitudes.
-    data = torch.tensor(
-        [(rank + 1) * 0.125 + (i & 0xFF) * 0.0078125 for i in range(numel)],
-        dtype=torch.float32,
-    )
+    i = torch.arange(numel, dtype=torch.float32)
+    data = (rank + 1) * 0.125 + (i.long() & 0xFF).to(torch.float32) * 0.0078125
     return data.to(dtype)
 
 
@@ -71,16 +66,14 @@ def _expected_allreduce(
     return acc
 
 
-def _worker(
-    rank: int,
-    world_size: int,
-    port: int,
-    bucket: str,
-    dtype: torch.dtype,
-    threshold_override: str | None,
-) -> None:
-    if threshold_override is not None:
-        os.environ["VLLM_CPU_RSAG_THRESHOLD_BYTES"] = threshold_override
+def _worker(env: dict) -> None:
+    update_environment_variables(env)
+
+    rank = int(os.environ["RANK"])
+    world_size = int(os.environ["WORLD_SIZE"])
+    port = os.environ["MASTER_PORT"]
+    bucket = os.environ["_BUCKET"]
+    dtype = getattr(torch, os.environ["_DTYPE"])
 
     os.environ["VLLM_DIST_IDENT"] = f"test-tp{world_size}-{port}"
     # 4 threads: enough for multi-threaded SHM path; keeps contention low.
@@ -142,34 +135,57 @@ def _worker(
     dist.destroy_process_group()
 
 
-def _spawn(world_size, port, bucket, dtype, threshold_override=None):
-    torch.multiprocessing.spawn(
-        _worker,
-        args=(world_size, port, bucket, dtype, threshold_override),
-        nprocs=world_size,
-        join=True,
-    )
+def _spawn(
+    world_size: int, bucket: str, dtype: torch.dtype, timeout: int = 120
+) -> None:
+    port = str(get_open_port())
+    dtype_name = str(dtype).replace("torch.", "")
+
+    processes = []
+    for i in range(world_size):
+        env = {
+            "RANK": str(i),
+            "LOCAL_RANK": str(i),
+            "WORLD_SIZE": str(world_size),
+            "LOCAL_WORLD_SIZE": str(world_size),
+            "MASTER_ADDR": "127.0.0.1",
+            "MASTER_PORT": port,
+            "_BUCKET": bucket,
+            "_DTYPE": dtype_name,
+        }
+        p = mp.Process(target=_worker, args=(env,))
+        processes.append(p)
+        p.start()
+
+    start_time = time.time()
+    failed_processes = []
+
+    while time.time() - start_time < timeout:
+        all_done = True
+        for i, p in enumerate(processes):
+            if p.is_alive():
+                all_done = False
+            elif p.exitcode != 0:
+                failed_processes.append((i, p.exitcode))
+                break
+        if failed_processes or all_done:
+            break
+        time.sleep(0.1)
+
+    for p in processes:
+        if p.is_alive():
+            p.kill()
+            p.join()
+
+    if failed_processes:
+        error_msg = "Distributed test failed:\n"
+        for rank, status in failed_processes:
+            error_msg += f"  Rank {rank}: Exit code {status}\n"
+        raise AssertionError(error_msg)
 
 
 @pytest.mark.parametrize("dtype", _DTYPES)
 @pytest.mark.parametrize("world_size", _WORLD_SIZES)
 @pytest.mark.parametrize("bucket", _BUCKETS)
 def test_cpu_shm_collectives(world_size: int, bucket: str, dtype: torch.dtype) -> None:
-    port = _find_free_port()
-    _spawn(world_size, port, bucket, dtype)
-
-
-@pytest.mark.parametrize("dtype", [torch.bfloat16])
-@pytest.mark.parametrize("bucket", ["tiny", "above_thresh"])
-def test_force_rsag_path(bucket: str, dtype: torch.dtype) -> None:
-    """VLLM_CPU_RSAG_THRESHOLD_BYTES=0 forces RS+AG even on tiny inputs."""
-    port = _find_free_port()
-    _spawn(4, port, bucket, dtype, threshold_override="0")
-
-
-@pytest.mark.parametrize("dtype", [torch.bfloat16])
-@pytest.mark.parametrize("bucket", ["tiny", "above_thresh"])
-def test_force_flat_ar_path(bucket: str, dtype: torch.dtype) -> None:
-    """VLLM_CPU_RSAG_THRESHOLD_BYTES=999999999 forces flat AR on all inputs."""
-    port = _find_free_port()
-    _spawn(4, port, bucket, dtype, threshold_override="999999999")
+    _spawn(world_size, bucket, dtype)
