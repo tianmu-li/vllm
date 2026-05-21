@@ -89,6 +89,8 @@ class OMPProcessManager:
             envs_dict["KMP_BLOCKTIME"] = "5"
             # Prevents the CPU to run into low performance state
             envs_dict["KMP_TPAUSE"] = "0"
+            # Reduces all-reduce team wake-up latency for TP>1.
+            envs_dict["KMP_REDUCTION_BARRIER_PATTERN"] = "dist,dist"
         elif self.use_gomp:
             # set GOMP envs
             # likes '0 1 2 ...'
