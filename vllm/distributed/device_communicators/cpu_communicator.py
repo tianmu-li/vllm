@@ -300,7 +300,7 @@ class _CPUSHMDistributed:
     def all_reduce(
         self, input: torch.Tensor, group: ProcessGroup | None = None
     ) -> None:
-        # RS+AG hybrid; tune small-tensor cutoff via VLLM_CPU_RSAG_THRESHOLD_BYTES.
+        # RS+AG hybrid with compile-time threshold (kRSAGThresholdBytes in shm.cpp).
         torch.ops._C.shm_allreduce_rsag(self.handle, input)
 
     def gather(

@@ -1,5 +1,6 @@
 #include "cpu/cpu_types.hpp"
 
+#include <cstring>
 #include <fcntl.h>
 #include <sys/mman.h>
 #include <sys/stat.h>
@@ -470,8 +471,8 @@ void memcpy_from_shm(void* dst, void* src, const int64_t bytes) {
     data.save((int8_t*)dst + i);
   }
   if (aligned_bytes < bytes) {
-    vec_op::INT8Vec64 data(true, (int8_t*)src + aligned_bytes);
-    data.save((int8_t*)dst + aligned_bytes, bytes - aligned_bytes);
+    std::memcpy((int8_t*)dst + aligned_bytes, (int8_t*)src + aligned_bytes,
+                bytes - aligned_bytes);
   }
 }
 
@@ -484,9 +485,10 @@ void memcpy_to_shm(void* dst, void* src, const int64_t bytes) {
     data.nt_save((int8_t*)dst + i);
   }
   if (aligned_bytes < bytes) {
-    vec_op::INT8Vec64 data((int8_t*)src + aligned_bytes);
-    data.save((int8_t*)dst + aligned_bytes,
-              static_cast<int>(bytes - aligned_bytes));
+    // commit_ready_stamp() calls _mm_mfence() which orders both NT and regular
+    // stores, so mixing NT (main loop) and regular (memcpy tail) is safe here.
+    std::memcpy((int8_t*)dst + aligned_bytes, (int8_t*)src + aligned_bytes,
+                bytes - aligned_bytes);
   }
 }
 
@@ -499,8 +501,8 @@ void memcpy(void* dst, void* src, const int64_t bytes) {
     data.save((int8_t*)dst + i);
   }
   if (aligned_bytes < bytes) {
-    vec_op::INT8Vec64 data((int8_t*)src + aligned_bytes);
-    data.save((int8_t*)dst + aligned_bytes, bytes - aligned_bytes);
+    std::memcpy((int8_t*)dst + aligned_bytes, (int8_t*)src + aligned_bytes,
+                bytes - aligned_bytes);
   }
 }
 
@@ -1101,9 +1103,9 @@ struct TensorListMeta {
 
   TensorListMeta() : tensor_num(0), total_bytes(0) {
     static_assert(sizeof(TensorListMeta) % 64 == 0);
-    static_assert(sizeof(TensorListMeta) <
-                  MIN_THREAD_PROCESS_SIZE);  // To ensure the metadata always
-                                             // hold by the thread 0
+    static_assert(
+        sizeof(TensorListMeta) <
+        MIN_THREAD_PROCESS_SIZE);  // ensure metadata fits in thread 0's buffer
     for (int i = 0; i < MAX_P2P_SEND_TENSOR_NUM; ++i) {
       tensor_bytes[i] = 0;
       tensor_ptrs[i] = nullptr;
@@ -1366,13 +1368,15 @@ void shm_reduce_scatter(int64_t handle, const torch::Tensor& data,
   TORCH_CHECK(data.is_contiguous())
   TORCH_CHECK(output.is_contiguous())
   TORCH_CHECK(data.scalar_type() == output.scalar_type())
+  auto* ctx = SHMManager::get_singleton_instance(handle)->get_shm_ctx();
+  TORCH_CHECK(data.numel() % ctx->group_size == 0,
+              "shm_reduce_scatter: data.numel() (", data.numel(),
+              ") must be divisible by group_size (", ctx->group_size, ")");
   VLLM_DISPATCH_FLOATING_TYPES(
       data.scalar_type(), "shm_reduce_scatter_sum", [&] {
         CPU_KERNEL_GUARD_IN(shm_reduce_scatter_sum)
-        shm_reduce_scatter_sum(
-            SHMManager::get_singleton_instance(handle)->get_shm_ctx(),
-            data.data_ptr<scalar_t>(), output.data_ptr<scalar_t>(),
-            data.numel());
+        shm_reduce_scatter_sum(ctx, data.data_ptr<scalar_t>(),
+                               output.data_ptr<scalar_t>(), data.numel());
         CPU_KERNEL_GUARD_OUT(shm_reduce_scatter_sum)
       });
 }

@@ -186,34 +186,20 @@ def _time_collective(
             comm.all_reduce(x)
 
     elif collective == "reduce_scatter":
-        # Pre-allocate and pre-fault output to avoid page-fault overhead inside
-        # the timed loop.
-        out = torch.empty(numel // comm.world_size, dtype=dtype)
-        out.zero_()  # pre-fault all pages
 
         def timed_op() -> None:
-            comm.dist_module.reduce_scatter_into_tensor(out, x, group=comm.device_group)
+            comm.reduce_scatter(x, dim=0)
 
     elif collective == "all_gather":
-        out = torch.empty(numel * comm.world_size, dtype=dtype)
-        out.zero_()  # pre-fault all pages
 
         def timed_op() -> None:
-            comm.dist_module.all_gather_into_tensor(out, x, group=comm.device_group)
+            comm.all_gather(x, dim=0)
 
     else:  # reduce_scatter_all_gather
-        rs_out = torch.empty(numel // comm.world_size, dtype=dtype)
-        rs_out.zero_()
-        ag_out = torch.empty(numel, dtype=dtype)
-        ag_out.zero_()
 
         def timed_op() -> None:
-            comm.dist_module.reduce_scatter_into_tensor(
-                rs_out, x, group=comm.device_group
-            )
-            comm.dist_module.all_gather_into_tensor(
-                ag_out, rs_out, group=comm.device_group
-            )
+            rs_out = comm.reduce_scatter(x, dim=0)
+            comm.all_gather(rs_out, dim=0)
 
     for _ in range(warmup):
         x.fill_(1.0)
