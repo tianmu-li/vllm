@@ -117,6 +117,19 @@ steps:
       bash .buildkite/scripts/hardware_ci/run-cpu-test.sh 10m "
       bash .buildkite/scripts/hardware_ci/run-cpu-distributed-smoke-test.sh dp_tp"
 
+- label: CPU-SHM Collective Unit Tests
+  depends_on: []
+  device: intel_cpu
+  no_plugin: true
+  source_file_dependencies:
+  - csrc/cpu/shm.cpp
+  - vllm/distributed/device_communicators/cpu_communicator.py
+  - tests/distributed/test_cpu_collectives.py
+  commands:
+    - |
+      bash .buildkite/scripts/hardware_ci/run-cpu-test.sh 15m "
+      pytest -x -v -s tests/distributed/test_cpu_collectives.py"
+
 - label: CPU-Multi-Modal Model Tests %N
   depends_on: []
   device: intel_cpu

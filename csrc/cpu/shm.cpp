@@ -409,7 +409,7 @@ void shm_cc_loop(ThreadSHMContext* ctx, int64_t elem_num, F&& inner_func,
       sizeof(scalar_t);  // Note: double buffer
 
   if (effective_threads == 1) {
-    // Single-threaded path: bypass libgomp entirely.  All work runs on
+    // single-threaded path: bypass omp entirely. all work runs on
     // thread 0 (ctx + 0); remote ranks do the same, so stamp polling is
     // symmetric.
     int64_t offset = 0;
@@ -460,9 +460,6 @@ void reset_threads_stamp_buffer_idx(ThreadSHMContext* ctx, int local,
     thread_ctx->set_stamp_buffer_idx(local, remote);
   }
 }
-};  // namespace shm_cc_ops
-
-namespace shm_cc_ops {
 
 void memcpy_from_shm(void* dst, void* src, const int64_t bytes) {
   const int64_t aligned_bytes = ((bytes >> 6) << 6);  // 64 bytes aligned
@@ -581,14 +578,14 @@ void all_reduce_sum_impl(ThreadSHMContext* ctx, scalar_t* data, size_t elem_num,
 
   return;
 }
-};  // namespace shm_cc_ops
-
-namespace shm_cc_ops {
 
 template <typename scalar_t, int RANKS>
 void reduce_scatter_partial_impl(ThreadSHMContext* ctx, scalar_t* data,
                                  scalar_t* output, size_t elem_num) {
   CPU_KERNEL_GUARD_IN(reduce_scatter_partial_impl)
+  // uses NT stores so reduced data does not stay warm in L3 for a follow-up
+  // all_gather. for combined RS+AG prefer pipelined_rsag_impl which uses
+  // cached stores in the scatter phase to keep results in L3.
   using vec_t = typename KernelVecType<scalar_t>::scalar_vec_t;
   constexpr int64_t vec_elem_num = vec_t::get_elem_num();
 
@@ -687,10 +684,6 @@ void reduce_scatter_partial_impl(ThreadSHMContext* ctx, scalar_t* data,
   }
 }
 
-};  // namespace shm_cc_ops
-
-namespace shm_cc_ops {
-
 template <typename scalar_t, int RANKS>
 void all_gather_impl(ThreadSHMContext* ctx, scalar_t* data, scalar_t* output,
                      size_t elem_num) {
@@ -730,10 +723,6 @@ void all_gather_impl(ThreadSHMContext* ctx, scalar_t* data, scalar_t* output,
         });
       });
 }
-
-};  // namespace shm_cc_ops
-
-namespace shm_cc_ops {
 
 template <typename scalar_t, int RANKS>
 void pipelined_rsag_impl(ThreadSHMContext* ctx, scalar_t* data, size_t elem_num,
@@ -780,8 +769,8 @@ void pipelined_rsag_impl(ThreadSHMContext* ctx, scalar_t* data, size_t elem_num,
     int64_t curr_window = std::min(max_per_iter_elem_num, end - offset);
     bool fast_mode = ((end - offset) <= max_per_iter_elem_num);
 
-    // Each tile issues exactly 2x next_stamp() + 2x next_buffer(), so
-    // stamp/buffer parity at tile end equals tile start.  The inline tail
+    // each tile issues exactly 2x next_stamp() + 2x next_buffer(), so
+    // stamp/buffer parity at tile end equals tile start. the inline tail
     // flat-AR therefore starts with a clean buffer state.
     while (curr_window > 0) {
       int64_t window_bytes = curr_window * (int64_t)sizeof(scalar_t);
@@ -1301,15 +1290,14 @@ void shm_all_gather(int64_t handle, const torch::Tensor& data,
   });
 }
 
-// Flat-AR dispatch ladder: named thread/size constants.
+// flat-AR dispatch ladder constants
 static constexpr int64_t kFlatARTinyBytes = 4 * 1024;
 static constexpr int64_t kFlatARSmallBytes = 16 * 1024;
 static constexpr int64_t kFlatARMediumBytes = 64 * 1024;
 static constexpr int kFlatARSmallThreads = 4;
 static constexpr int kFlatARMediumThreads = 8;
-// Below this byte count (or when group_size==2) flat all-reduce wins over
-// RS+AG.  Empirically derived: TP=4 crossover at 128 KiB; TP=2 flat-AR
-// wins at all measured sizes, so RS+AG is disabled for world_size<=2.
+// below this threshold (or when group_size==2) flat all-reduce wins over
+// RS+AG; empirically TP=4 crossover is at 128 KiB, TP=2 flat-AR always wins.
 static constexpr int64_t kRSAGThresholdBytes = 128 * 1024;
 
 void shm_allreduce_rsag(int64_t handle, torch::Tensor& data) {
@@ -1319,41 +1307,36 @@ void shm_allreduce_rsag(int64_t handle, torch::Tensor& data) {
         auto ctx = SHMManager::get_singleton_instance(handle)->get_shm_ctx();
         scalar_t* p = data.data_ptr<scalar_t>();
         const int64_t numel = data.numel();
-        // Largest prefix where numel is divisible by group_size AND each
-        // per-rank chunk is a multiple of 64 bytes (required for
-        // 64-byte-aligned stream loads in the RS accumulate step).
+        // largest aligned prefix where numel is divisible by group_size and
+        // each per-rank chunk is a multiple of 64 bytes (required for
+        // 64-byte-aligned sub-regions in the RS scatter step).
         const int64_t elems_per_line = 64 / (int64_t)sizeof(scalar_t);
         const int64_t align = (int64_t)ctx->group_size * elems_per_line;
         const int64_t head = (numel / align) * align;
         const int64_t tail = numel - head;
         const int64_t head_bytes = head * (int64_t)sizeof(scalar_t);
-        // Total bytes across all elements (used for the flat-AR dispatch
-        // ladder when head_bytes < threshold).
-        const int64_t total_bytes = numel * (int64_t)sizeof(scalar_t);
-
-        // Dispatch ladder for flat-AR: choose effective_threads and store mode
-        // based on message size.  Decision is a pure function of total_bytes
-        // which is identical on every rank, keeping the per-thread stamp
-        // protocol symmetric.  effective_threads is capped at ctx->thread_num
-        // so the ladder acts as a soft upper bound on small-T machines.
-        int flat_threads;
-        bool use_cached_stores;
-        if (total_bytes <= kFlatARTinyBytes) {
-          flat_threads = 1;
-          use_cached_stores = true;
-        } else if (total_bytes <= kFlatARSmallBytes) {
-          flat_threads = std::min<int>(kFlatARSmallThreads, ctx->thread_num);
-          use_cached_stores = true;
-        } else if (total_bytes <= kFlatARMediumBytes) {
-          flat_threads = std::min<int>(kFlatARMediumThreads, ctx->thread_num);
-          use_cached_stores = true;
-        } else {
-          flat_threads = ctx->thread_num;
-          use_cached_stores = false;
-        }
-        TORCH_CHECK(flat_threads >= 1);
 
         if (ctx->group_size <= 2 || head_bytes < kRSAGThresholdBytes) {
+          // choose effective_threads and store mode from message size;
+          // decision is a pure function of total_bytes so it is symmetric
+          // across all ranks. effective_threads is capped at thread_num.
+          const int64_t total_bytes = numel * (int64_t)sizeof(scalar_t);
+          int flat_threads;
+          bool use_cached_stores;
+          if (total_bytes <= kFlatARTinyBytes) {
+            flat_threads = 1;
+            use_cached_stores = true;
+          } else if (total_bytes <= kFlatARSmallBytes) {
+            flat_threads = std::min<int>(kFlatARSmallThreads, ctx->thread_num);
+            use_cached_stores = true;
+          } else if (total_bytes <= kFlatARMediumBytes) {
+            flat_threads = std::min<int>(kFlatARMediumThreads, ctx->thread_num);
+            use_cached_stores = true;
+          } else {
+            flat_threads = ctx->thread_num;
+            use_cached_stores = false;
+          }
+          TORCH_CHECK(flat_threads >= 1);
           CPU_KERNEL_GUARD_IN(shm_allreduce_sum)
           shm_allreduce_sum(ctx, p, numel, flat_threads, use_cached_stores);
           CPU_KERNEL_GUARD_OUT(shm_allreduce_sum)

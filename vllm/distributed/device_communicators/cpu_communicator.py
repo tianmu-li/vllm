@@ -40,11 +40,22 @@ class CpuCommunicator(DeviceCommunicatorBase):
         ):
             self.dist_module = _CPUSHMDistributed(self)
         elif unique_name.startswith("tp") or unique_name.startswith("pp"):
+            if current_platform.get_cpu_architecture() not in (
+                CpuArchEnum.X86,
+                CpuArchEnum.ARM,
+            ):
+                reason = f"unsupported arch ({current_platform.get_cpu_architecture()})"
+            elif not hasattr(torch.ops._C, "init_shm_manager"):
+                reason = "no CPU SHM kernel (rebuild without VLLM_USE_PRECOMPILED)"
+            elif self.world_size not in (2, 3, 4, 6, 8):
+                reason = f"world_size={self.world_size} not in {{2,3,4,6,8}}"
+            else:
+                reason = "ranks disagree on SHM group name"
             logger.info(
-                "CPU SHM communicator disabled for group %s (world_size=%d):"
+                "CPU SHM communicator disabled for group %s (%s),"
                 " falling back to torch.distributed.",
                 unique_name,
-                self.world_size,
+                reason,
             )
 
         # send/recv tensor_dict is only supported through the SHM communicator backend
@@ -161,14 +172,9 @@ class CpuCommunicator(DeviceCommunicatorBase):
             dtype=input_.dtype,
             device=input_.device,
         )
-        if isinstance(self.dist_module, _CPUSHMDistributed):
-            self.dist_module.reduce_scatter_into_tensor(
-                out_contig, input_contig, group=self.device_group
-            )
-        else:
-            torch.distributed.reduce_scatter_tensor(
-                out_contig, input_contig, group=self.device_group
-            )
+        self.dist_module.reduce_scatter_tensor(
+            out_contig, input_contig, group=self.device_group
+        )
         return out_contig.movedim(0, dim).contiguous()
 
     def send_tensor_dict(
@@ -334,6 +340,15 @@ class _CPUSHMDistributed:
         input: torch.Tensor,
         group: ProcessGroup | None = None,
     ) -> None:
+        torch.ops._C.shm_reduce_scatter(self.handle, input, output)
+
+    def reduce_scatter_tensor(
+        self,
+        output: torch.Tensor,
+        input: torch.Tensor,
+        group: ProcessGroup | None = None,
+    ) -> None:
+        # matches torch.distributed.reduce_scatter_tensor for polymorphic dispatch
         torch.ops._C.shm_reduce_scatter(self.handle, input, output)
 
     def send_tensor_dict(
