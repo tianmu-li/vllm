@@ -2,8 +2,9 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 #
-# Launch benchmark_cpu_collectives.py with one rank per NUMA/SNC node, each
-# pinned via numactl --cpunodebind + --membind for memory-local SHM writes.
+# Launch benchmarks/kernels/cpu/benchmark_cpu_collectives.py with one rank per
+# NUMA/SNC node, each pinned via numactl --cpunodebind + --membind for
+# memory-local SHM writes.
 #
 # Usage:
 #   bash benchmarks/kernels/run_cpu_collectives_bench.sh [script args...]
@@ -13,7 +14,7 @@
 #   bash benchmarks/kernels/run_cpu_collectives_bench.sh --backend shm \
 #       --collective reduce_scatter
 #   bash benchmarks/kernels/run_cpu_collectives_bench.sh --backend gloo \
-#       --output bench_gloo.json
+#       --output-json bench_gloo.json
 #
 # Environment overrides:
 #   NODES       Space-separated NUMA node IDs to use (default: all from numactl)
@@ -28,7 +29,7 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "${SCRIPT_DIR}/../.." && pwd)"
-BENCH="${SCRIPT_DIR}/benchmark_cpu_collectives.py"
+BENCH="${SCRIPT_DIR}/cpu/benchmark_cpu_collectives.py"
 PYTHON="${REPO_ROOT}/.venv/bin/python"
 
 if [[ ! -x "${PYTHON}" ]]; then

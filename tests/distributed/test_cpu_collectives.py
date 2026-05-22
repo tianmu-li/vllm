@@ -3,17 +3,15 @@
 """CPU SHM collective correctness tests for all supported TP sizes."""
 
 import os
-import time
 
-import multiprocess as mp
 import pytest
 import torch
 import torch.distributed as dist
+import torch.multiprocessing as mp
 
 from vllm.distributed.device_communicators.cpu_communicator import CpuCommunicator
 from vllm.platforms.cpu import CpuPlatform
 from vllm.utils.network_utils import get_open_port
-from vllm.utils.system_utils import update_environment_variables
 
 # load ops once at import time so hasattr checks below are accurate
 CpuPlatform.import_kernels()
@@ -95,63 +93,14 @@ def _init_comm(rank: int, world_size: int, port: str) -> CpuCommunicator:
     )
 
 
-def _spawn(target, world_size: int, env_extra: dict, timeout: int = 120) -> None:
-    port = str(get_open_port())
-    processes = []
-    for i in range(world_size):
-        env = {
-            "RANK": str(i),
-            "LOCAL_RANK": str(i),
-            "WORLD_SIZE": str(world_size),
-            "LOCAL_WORLD_SIZE": str(world_size),
-            "MASTER_ADDR": "127.0.0.1",
-            "MASTER_PORT": port,
-            **env_extra,
-        }
-        p = mp.Process(target=target, args=(env,))
-        processes.append(p)
-        p.start()
-
-    start_time = time.time()
-    failed_processes: list[tuple[int, int]] = []
-    timed_out = False
-
-    while time.time() - start_time < timeout:
-        all_done = True
-        for i, p in enumerate(processes):
-            if p.is_alive():
-                all_done = False
-            elif p.exitcode != 0:
-                failed_processes.append((i, p.exitcode))
-        if failed_processes or all_done:
-            break
-        time.sleep(0.1)
-    else:
-        timed_out = True
-
-    for p in processes:
-        if p.is_alive():
-            p.kill()
-            p.join()
-
-    if timed_out:
-        raise AssertionError(f"Distributed test timed out after {timeout}s")
-    if failed_processes:
-        error_msg = "Distributed test failed:\n"
-        for rank, status in failed_processes:
-            error_msg += f"  Rank {rank}: Exit code {status}\n"
-        raise AssertionError(error_msg)
-
-
-def _worker(env: dict) -> None:
-    update_environment_variables(env)
-
-    rank = int(os.environ["RANK"])
-    world_size = int(os.environ["WORLD_SIZE"])
-    port = os.environ["MASTER_PORT"]
-    bucket = os.environ["_BUCKET"]
-    dtype = getattr(torch, os.environ["_DTYPE"])
-
+def _worker(
+    rank: int,
+    world_size: int,
+    port: str,
+    bucket: str,
+    dtype_name: str,
+) -> None:
+    dtype = getattr(torch, dtype_name)
     comm = _init_comm(rank, world_size, port)
     atol, rtol = _ATOL[dtype], _RTOL[dtype]
     numel = _numel_for_bucket(bucket, world_size, dtype)
@@ -227,17 +176,18 @@ def _worker(env: dict) -> None:
 @pytest.mark.parametrize("world_size", _WORLD_SIZES)
 @pytest.mark.parametrize("bucket", _BUCKETS)
 def test_cpu_shm_collectives(world_size: int, bucket: str, dtype: torch.dtype) -> None:
+    port = str(get_open_port())
     dtype_name = str(dtype).replace("torch.", "")
-    _spawn(_worker, world_size, {"_BUCKET": bucket, "_DTYPE": dtype_name})
+    mp.spawn(
+        _worker,
+        args=(world_size, port, bucket, dtype_name),
+        nprocs=world_size,
+        join=True,
+        start_method="spawn",
+    )
 
 
-def _worker_unsupported_ws(env: dict) -> None:
-    update_environment_variables(env)
-
-    rank = int(os.environ["RANK"])
-    world_size = int(os.environ["WORLD_SIZE"])
-    port = os.environ["MASTER_PORT"]
-
+def _worker_unsupported_ws(rank: int, world_size: int, port: str) -> None:
     comm = _init_comm(rank, world_size, port)
 
     # SHM must be disabled for unsupported world_size; Gloo fallback active
@@ -259,4 +209,12 @@ def _worker_unsupported_ws(env: dict) -> None:
 @requires_cpu_shm
 def test_cpu_shm_unsupported_world_size() -> None:
     """SHM must be silently disabled for world_size not in {2,3,4,6,8}."""
-    _spawn(_worker_unsupported_ws, 5, {})
+    world_size = 5
+    port = str(get_open_port())
+    mp.spawn(
+        _worker_unsupported_ws,
+        args=(world_size, port),
+        nprocs=world_size,
+        join=True,
+        start_method="spawn",
+    )
