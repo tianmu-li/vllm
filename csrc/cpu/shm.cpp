@@ -685,46 +685,6 @@ void reduce_scatter_partial_impl(ThreadSHMContext* ctx, scalar_t* data,
 }
 
 template <typename scalar_t, int RANKS>
-void all_gather_impl(ThreadSHMContext* ctx, scalar_t* data, scalar_t* output,
-                     size_t elem_num) {
-  CPU_KERNEL_GUARD_IN(all_gather_impl)
-
-  shm_cc_ops::shm_cc_loop<scalar_t>(
-      ctx, elem_num,
-      [&](ThreadSHMContext* thread_ctx, int64_t data_offset,
-          int64_t data_elem_num, bool fast_mode) {
-        int rank = thread_ctx->rank;
-        scalar_t* thread_shm_ptr =
-            thread_ctx->get_thread_shm_ptr<scalar_t>(rank);
-        scalar_t* thread_data_ptr = data + data_offset;
-        int64_t thread_data_bytes = data_elem_num * sizeof(scalar_t);
-
-        if (!fast_mode) {
-          thread_ctx->wait_for_all(ThreadSHMContext::check_no_buffer_conflict);
-        }
-
-        // Regular (cached) write so data stays in local L3 for peers to read.
-        shm_cc_ops::memcpy(thread_shm_ptr, thread_data_ptr, thread_data_bytes);
-        thread_ctx->commit_ready_stamp();
-        thread_ctx->wait_for_all(ThreadSHMContext::check_stamp_ready);
-
-        // Copy own slice directly from input (still hot in cache).
-        shm_cc_ops::memcpy(output + (int64_t)rank * elem_num + data_offset,
-                           thread_data_ptr, thread_data_bytes);
-
-        // Read each peer's SHM slot (regular cached reads, served from remote
-        // L3).
-        vec_op::unroll_loop<int, RANKS - 1>([&](int idx) {
-          int src_rank = thread_ctx->get_swizzled_rank(idx + 1);
-          shm_cc_ops::memcpy(
-              output + (int64_t)src_rank * elem_num + data_offset,
-              thread_ctx->get_thread_shm_ptr<scalar_t>(src_rank),
-              thread_data_bytes);
-        });
-      });
-}
-
-template <typename scalar_t, int RANKS>
 void pipelined_rsag_impl(ThreadSHMContext* ctx, scalar_t* data, size_t elem_num,
                          scalar_t* tail_ptr = nullptr,
                          int64_t tail_elem_num = 0) {
@@ -917,31 +877,6 @@ void pipelined_rsag_impl(ThreadSHMContext* ctx, scalar_t* data, size_t elem_num,
 }
 
 };  // namespace shm_cc_ops
-
-template <typename scalar_t>
-void shm_all_gather_sum(ThreadSHMContext* ctx, scalar_t* data, scalar_t* output,
-                        size_t elem_num) {
-  switch (ctx->group_size) {
-    case 2:
-      shm_cc_ops::all_gather_impl<scalar_t, 2>(ctx, data, output, elem_num);
-      break;
-    case 3:
-      shm_cc_ops::all_gather_impl<scalar_t, 3>(ctx, data, output, elem_num);
-      break;
-    case 4:
-      shm_cc_ops::all_gather_impl<scalar_t, 4>(ctx, data, output, elem_num);
-      break;
-    case 6:
-      shm_cc_ops::all_gather_impl<scalar_t, 6>(ctx, data, output, elem_num);
-      break;
-    case 8:
-      shm_cc_ops::all_gather_impl<scalar_t, 8>(ctx, data, output, elem_num);
-      break;
-    default:
-      TORCH_CHECK(false,
-                  "Invalid world size: " + std::to_string(ctx->group_size));
-  }
-}
 
 std::vector<std::unique_ptr<SHMManager>> SHMManager::SingletonInstances = {};
 std::mutex SHMManager::SingletonInstancesLock = {};
@@ -1280,13 +1215,18 @@ void shm_all_gather(int64_t handle, const torch::Tensor& data,
   TORCH_CHECK_EQ(output_elem_num % input_elem_num, 0);
   const int world_size = output_elem_num / input_elem_num;
 
-  VLLM_DISPATCH_FLOATING_TYPES(data.scalar_type(), "shm_all_gather_sum", [&] {
-    CPU_KERNEL_GUARD_IN(shm_all_gather_sum)
+  VLLM_DISPATCH_FLOATING_TYPES(data.scalar_type(), "shm_all_gather_impl", [&] {
+    CPU_KERNEL_GUARD_IN(shm_all_gather_impl)
     auto ctx = SHMManager::get_singleton_instance(handle)->get_shm_ctx();
     TORCH_CHECK_EQ(ctx->group_size, world_size);
-    shm_all_gather_sum(ctx, data.data_ptr<scalar_t>(),
-                       output.data_ptr<scalar_t>(), (size_t)input_elem_num);
-    CPU_KERNEL_GUARD_OUT(shm_all_gather_sum)
+
+    scalar_t* output_ptrs[MAX_SHM_RANK_NUM] = {nullptr};
+    for (int i = 0; i < world_size; ++i) {
+      output_ptrs[i] = output.data_ptr<scalar_t>() + i * input_elem_num;
+    }
+    shm_gather_impl(ctx, data.data_ptr<scalar_t>(), data.numel(), output_ptrs,
+                    ctx->rank);
+    CPU_KERNEL_GUARD_OUT(shm_all_gather_impl)
   });
 }
 
