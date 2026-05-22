@@ -73,7 +73,10 @@ struct ThreadSHMContext {
         group_size(group_size),
         _spinning_count(0) {
     static_assert(sizeof(ThreadSHMContext) % 64 == 0);
-    TORCH_CHECK(group_size <= MAX_SHM_RANK_NUM);
+    TORCH_CHECK(group_size >= 2 && group_size <= MAX_SHM_RANK_NUM &&
+                    (group_size <= 4 || group_size == 6 || group_size == 8),
+                "SHM collectives only support group_size in {2,3,4,6,8}, got ",
+                group_size);
     TORCH_CHECK((size_t)this % 64 == 0);
     TORCH_CHECK((size_t)thread_shm_ptr % 64 == 0);
 #ifdef __aarch64__
@@ -1372,6 +1375,10 @@ void shm_reduce_scatter(int64_t handle, const torch::Tensor& data,
   TORCH_CHECK(data.numel() % ctx->group_size == 0,
               "shm_reduce_scatter: data.numel() (", data.numel(),
               ") must be divisible by group_size (", ctx->group_size, ")");
+  TORCH_CHECK(output.numel() == data.numel() / ctx->group_size,
+              "shm_reduce_scatter: output.numel() (", output.numel(),
+              ") must equal data.numel()/group_size (",
+              data.numel() / ctx->group_size, ")");
   VLLM_DISPATCH_FLOATING_TYPES(
       data.scalar_type(), "shm_reduce_scatter_sum", [&] {
         CPU_KERNEL_GUARD_IN(shm_reduce_scatter_sum)

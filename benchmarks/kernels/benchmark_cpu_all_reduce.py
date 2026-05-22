@@ -155,7 +155,7 @@ def _time_all_reduce(
     mean_us = statistics.mean(samples_us)
     p50_us = statistics.median(samples_us)
     sorted_samples = sorted(samples_us)
-    p99_us = sorted_samples[int(len(sorted_samples) * 0.99)]
+    p99_us = sorted_samples[int(len(sorted_samples) * 0.99) - 1]
     stdev_us = statistics.stdev(samples_us) if len(samples_us) > 1 else 0.0
 
     byte_count = numel * dtype.itemsize

@@ -138,7 +138,7 @@ def _worker(
         samples.sort()
         median_ns = samples[len(samples) // 2]
         p50_ns = median_ns
-        p99_ns = samples[int(len(samples) * 0.99)]
+        p99_ns = samples[int(len(samples) * 0.99) - 1]
         results.append((size_bytes, median_ns, p50_ns, p99_ns))
 
     if rank == 0:

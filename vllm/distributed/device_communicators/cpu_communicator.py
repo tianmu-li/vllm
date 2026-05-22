@@ -35,14 +35,16 @@ class CpuCommunicator(DeviceCommunicatorBase):
             )
             and hasattr(torch.ops._C, "init_shm_manager")
             and (unique_name.startswith("tp") or unique_name.startswith("pp"))
+            and self.world_size in (2, 3, 4, 6, 8)
             and self._all_group_ranks_share_shm_group_name()
         ):
             self.dist_module = _CPUSHMDistributed(self)
         elif unique_name.startswith("tp") or unique_name.startswith("pp"):
             logger.info(
-                "CPU SHM communicator disabled for group %s: ranks do not share "
-                "the same SHM group name, falling back to torch.distributed.",
+                "CPU SHM communicator disabled for group %s (world_size=%d):"
+                " falling back to torch.distributed.",
                 unique_name,
+                self.world_size,
             )
 
         # send/recv tensor_dict is only supported through the SHM communicator backend

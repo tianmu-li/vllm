@@ -159,6 +159,7 @@ def _spawn(
 
     start_time = time.time()
     failed_processes = []
+    timed_out = False
 
     while time.time() - start_time < timeout:
         all_done = True
@@ -167,16 +168,21 @@ def _spawn(
                 all_done = False
             elif p.exitcode != 0:
                 failed_processes.append((i, p.exitcode))
-                break
         if failed_processes or all_done:
             break
         time.sleep(0.1)
+    else:
+        timed_out = True
 
     for p in processes:
         if p.is_alive():
             p.kill()
             p.join()
 
+    if timed_out:
+        raise AssertionError(
+            f"Distributed test timed out after {timeout}s (processes were still alive)"
+        )
     if failed_processes:
         error_msg = "Distributed test failed:\n"
         for rank, status in failed_processes:
