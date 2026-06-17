@@ -50,6 +50,11 @@ void shm_gather(int64_t handle, torch::Tensor& data,
 void shm_all_gather(int64_t handle, const torch::Tensor& data,
                     torch::Tensor& output);
 
+void shm_allreduce_rsag(int64_t handle, torch::Tensor& data);
+
+void shm_reduce_scatter(int64_t handle, const torch::Tensor& data,
+                        torch::Tensor& output);
+
 void shm_send_tensor_list(int64_t handle,
                           const std::vector<torch::Tensor>& tensor_list,
                           int64_t dst);
@@ -413,6 +418,12 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, ops) {
       "shm_all_gather(int handle, Tensor data, Tensor! output) -> "
       "()");
   ops.impl("shm_all_gather", torch::kCPU, &shm_all_gather);
+  ops.def("shm_allreduce_rsag(int handle, Tensor! data) -> ()");
+  ops.impl("shm_allreduce_rsag", torch::kCPU, &shm_allreduce_rsag);
+  ops.def(
+      "shm_reduce_scatter(int handle, Tensor data, Tensor! output) -> "
+      "()");
+  ops.impl("shm_reduce_scatter", torch::kCPU, &shm_reduce_scatter);
   ops.def(
       "shm_send_tensor_list(int handle, Tensor[](a) tensor_list, int dst) -> "
       "()");

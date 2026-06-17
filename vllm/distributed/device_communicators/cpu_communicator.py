@@ -178,9 +178,26 @@ class CpuCommunicator(DeviceCommunicatorBase):
         dim: int = -1,
         sizes: list[int] | None = None,
     ) -> torch.Tensor:
-        """Reduce-scatter with variable output sizes via all_reduce + local slice."""
+        """Reduce-scatter with variable output sizes.
+
+        Uses SHM kernel (equal-sized chunks, dim 0) when possible; falls back
+        to all_reduce + local slice for variable-size or non-dim-0 cases.
+        """
         if dim < 0:
             dim += input_.dim()
+
+        uniform = sizes is None or len(set(sizes)) == 1
+        if (
+            isinstance(self.dist_module, _CPUSHMDistributed)
+            and dim == 0
+            and uniform
+            and input_.shape[0] % self.world_size == 0
+        ):
+            chunk = input_.shape[0] // self.world_size
+            out_shape = (chunk,) + input_.shape[1:]
+            output = torch.empty(out_shape, dtype=input_.dtype, device=input_.device)
+            self.dist_module.reduce_scatter_into_tensor(output, input_.contiguous())
+            return output
 
         out = input_.contiguous().clone()
         self.dist_module.all_reduce(out, group=self.device_group)
@@ -326,7 +343,15 @@ class _CPUSHMDistributed:
     def all_reduce(
         self, input: torch.Tensor, group: ProcessGroup | None = None
     ) -> None:
-        torch.ops._C.shm_allreduce(self.handle, input)
+        torch.ops._C.shm_allreduce_rsag(self.handle, input)
+
+    def reduce_scatter_into_tensor(
+        self,
+        output: torch.Tensor,
+        input: torch.Tensor,
+        group: ProcessGroup | None = None,
+    ) -> None:
+        torch.ops._C.shm_reduce_scatter(self.handle, input, output)
 
     def gather(
         self,
