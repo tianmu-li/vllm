@@ -219,6 +219,88 @@ def test_w8a16_block_fp8_cpu_fused_moe(M, N, K, E, topk, seed):
     torch.testing.assert_close(out_inplace, out, atol=0, rtol=0)
 
 
+def _build_expert_map(global_num_experts: int, num_ranks: int, rank: int):
+    """Build a global->local expert_map for one EP rank.
+
+    Mirrors ``determine_expert_map``: contiguous experts are assigned to each
+    rank; entries for experts owned by other ranks are -1.
+    """
+    local_num_experts = global_num_experts // num_ranks
+    expert_map = torch.full((global_num_experts,), -1, dtype=torch.int32)
+    start = rank * local_num_experts
+    end = start + local_num_experts
+    expert_map[start:end] = torch.arange(local_num_experts, dtype=torch.int32)
+    return expert_map, local_num_experts
+
+
+@pytest.mark.parametrize("M", [1, 64, 121])
+@pytest.mark.parametrize("N,K,E,topk", [(256, 512, 8, 2), (512, 512, 8, 4)])
+@pytest.mark.parametrize("num_ranks", [2, 4])
+@pytest.mark.parametrize("seed", [0])
+def test_w8a16_block_fp8_cpu_fused_moe_expert_parallel(
+    M, N, K, E, topk, num_ranks, seed
+):
+    """Expert parallelism: summed per-rank outputs match the single-rank ref.
+
+    Each rank owns ``E // num_ranks`` experts. The router still produces global
+    expert ids, so each rank remaps them to local ids and zeroes the weights of
+    non-local experts (the masking path in ``CPUExpertsFp8.apply``). Because the
+    kernel applies ``topk_weights`` internally and combine is a SUM, the sum of
+    per-rank outputs must equal the full single-rank mixture.
+    """
+    set_random_seed(seed)
+
+    a = torch.randn(M, K, dtype=torch.bfloat16) / math.sqrt(K)
+    w1, w2, w1_s, w2_s = _make_fp8_moe_weights(E, N, K, BLOCK_SIZE)
+
+    score = torch.randn(M, E, dtype=torch.bfloat16)
+    score = torch.softmax(score, dim=-1, dtype=torch.float32)
+    topk_weight, topk_ids = torch.topk(score, topk)
+    topk_ids = topk_ids.to(torch.int32)
+
+    ref_out = ref_w8a16_block_fp8_moe(
+        a, w1, w2, w1_s, w2_s, topk_weight, topk_ids, BLOCK_SIZE
+    )
+
+    local_num_experts = E // num_ranks
+    summed = torch.zeros(M, K, dtype=torch.bfloat16)
+    for rank in range(num_ranks):
+        expert_map, _ = _build_expert_map(E, num_ranks, rank)
+
+        # Slice this rank's local experts and scales.
+        lo = rank * local_num_experts
+        hi = lo + local_num_experts
+        w1_local = w1[lo:hi].contiguous()
+        w2_local = w2[lo:hi].contiguous()
+        w1_s_local = w1_s[lo:hi].contiguous()
+        w2_s_local = w2_s[lo:hi].contiguous()
+
+        # Remap + mask (mirrors CPUExpertsFp8.apply).
+        local_ids = expert_map[topk_ids.long()]
+        topk_weight_masked = topk_weight * (local_ids != -1)
+        topk_ids_local = local_ids.clamp_min(0).to(torch.int32)
+
+        pw1, pw2 = _prepack_experts(w1_local), _prepack_experts(w2_local)
+        out = ops.fused_experts_cpu(
+            a.clone(),
+            pw1,
+            pw2,
+            topk_weight_masked,
+            topk_ids_local,
+            False,
+            ops.CPUQuantMethod.FP8_W8A16,
+            w1_s_local,
+            w2_s_local,
+            None,
+            None,
+            BLOCK_SIZE,
+            is_vnni=True,
+        )
+        summed += out
+
+    torch.testing.assert_close(ref_out.bfloat16(), summed, atol=1e-2, rtol=1e-2)
+
+
 # ===========================================================================
 # MXFP4 W4A16 MoE
 # ===========================================================================

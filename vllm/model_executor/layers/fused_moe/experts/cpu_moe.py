@@ -112,6 +112,9 @@ class CPUExpertsFp8(mk.FusedMoEExpertsMonolithic):
     ) -> bool:
         return True
 
+    def supports_expert_map(self) -> bool:
+        return True
+
     def apply(
         self,
         hidden_states: torch.Tensor,
@@ -151,6 +154,17 @@ class CPUExpertsFp8(mk.FusedMoEExpertsMonolithic):
             ),
             e_score_correction_bias=e_score_correction_bias,
         )
+
+        if expert_map is not None:
+            # Expert parallelism: select_experts returns global expert ids, but
+            # w1/w2 only hold this rank's local experts. Remap to local ids and
+            # zero the weights of non-local experts so they contribute nothing
+            # after the reduce-scatter combine. Masked entries are clamped to a
+            # valid local index (their weight is 0, so the wasted compute on
+            # local-expert-0 is harmless).
+            local_ids = expert_map[topk_ids.long()]
+            topk_weights = topk_weights * (local_ids != -1)
+            topk_ids = local_ids.clamp_min(0).to(torch.int32)
 
         block_shape = (
             list(self.quant_config.block_shape)
