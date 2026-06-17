@@ -143,6 +143,58 @@ class CpuCommunicator(DeviceCommunicatorBase):
         )
         return output_tensor
 
+    def all_gatherv(
+        self,
+        input_: torch.Tensor | list[torch.Tensor],
+        dim: int = 0,
+        sizes: list[int] | None = None,
+    ) -> torch.Tensor | list[torch.Tensor]:
+        """Variable-length all-gather over dim 0 using gloo all_gather."""
+        if dim != 0:
+            raise NotImplementedError("CpuCommunicator.all_gatherv only supports dim=0")
+
+        def _gather_single(t: torch.Tensor) -> torch.Tensor:
+            if sizes is not None:
+                recv_list = [
+                    torch.empty(
+                        (sizes[r],) + t.shape[1:], dtype=t.dtype, device=t.device
+                    )
+                    for r in range(self.world_size)
+                ]
+            else:
+                recv_list = [torch.empty_like(t) for _ in range(self.world_size)]
+            self.dist_module.all_gather(
+                recv_list, t.contiguous(), group=self.device_group
+            )
+            return torch.cat(recv_list, dim=0)
+
+        if isinstance(input_, torch.Tensor):
+            return _gather_single(input_)
+        return [_gather_single(t) for t in input_]
+
+    def reduce_scatterv(
+        self,
+        input_: torch.Tensor,
+        dim: int = -1,
+        sizes: list[int] | None = None,
+    ) -> torch.Tensor:
+        """Reduce-scatter with variable output sizes via all_reduce + local slice."""
+        if dim < 0:
+            dim += input_.dim()
+
+        out = input_.contiguous().clone()
+        self.dist_module.all_reduce(out, group=self.device_group)
+
+        if sizes is not None:
+            start = sum(sizes[: self.rank_in_group])
+            end = start + sizes[self.rank_in_group]
+        else:
+            chunk = out.shape[dim] // self.world_size
+            start = self.rank_in_group * chunk
+            end = start + chunk
+
+        return out.narrow(dim, start, end - start).contiguous()
+
     def send_tensor_dict(
         self,
         tensor_dict: dict[str, torch.Tensor | Any],
