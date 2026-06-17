@@ -9,6 +9,9 @@ import pytest
 import torch
 import torch.nn.functional as F
 
+from vllm.model_executor.layers.fused_moe.expert_map_manager import (
+    determine_expert_map,
+)
 from vllm.platforms import current_platform
 from vllm.utils.torch_utils import set_random_seed
 
@@ -219,35 +222,49 @@ def test_w8a16_block_fp8_cpu_fused_moe(M, N, K, E, topk, seed):
     torch.testing.assert_close(out_inplace, out, atol=0, rtol=0)
 
 
-def _build_expert_map(global_num_experts: int, num_ranks: int, rank: int):
-    """Build a global->local expert_map for one EP rank.
-
-    Mirrors ``determine_expert_map``: contiguous experts are assigned to each
-    rank; entries for experts owned by other ranks are -1.
-    """
-    local_num_experts = global_num_experts // num_ranks
-    expert_map = torch.full((global_num_experts,), -1, dtype=torch.int32)
-    start = rank * local_num_experts
-    end = start + local_num_experts
-    expert_map[start:end] = torch.arange(local_num_experts, dtype=torch.int32)
-    return expert_map, local_num_experts
-
-
+# Non-divisible (E, num_ranks) pairs are intentional: they exercise the
+# remainder-distribution path in determine_expert_map (e.g. 10÷4 → 3/3/2/2).
 @pytest.mark.parametrize("M", [1, 64, 121])
-@pytest.mark.parametrize("N,K,E,topk", [(256, 512, 8, 2), (512, 512, 8, 4)])
-@pytest.mark.parametrize("num_ranks", [2, 4])
+@pytest.mark.parametrize(
+    "N,K,E,topk",
+    [
+        (256, 512, 8, 2),
+        (512, 512, 8, 4),
+        # Non-divisible expert counts: E÷num_ranks has a remainder.
+        # E=10÷4 → ranks 0-1 hold 3, ranks 2-3 hold 2.
+        (256, 512, 10, 2),
+        # E=12÷6 → each rank holds 2 (shape mirrors 256÷6 at small scale).
+        (256, 512, 12, 2),
+    ],
+)
+@pytest.mark.parametrize(
+    "num_ranks",
+    [
+        2,
+        4,
+        3,  # E=8 ÷ 3 → 3/3/2 (non-divisible)
+        6,  # E=8 ÷ 6 → 2/2/1/1/1/1; E=12 ÷ 6 → 2 each (mirrors 256÷6 shape)
+    ],
+)
 @pytest.mark.parametrize("seed", [0])
 def test_w8a16_block_fp8_cpu_fused_moe_expert_parallel(
     M, N, K, E, topk, num_ranks, seed
 ):
     """Expert parallelism: summed per-rank outputs match the single-rank ref.
 
-    Each rank owns ``E // num_ranks`` experts. The router still produces global
-    expert ids, so each rank remaps them to local ids and zeroes the weights of
-    non-local experts (the masking path in ``CPUExpertsFp8.apply``). Because the
-    kernel applies ``topk_weights`` internally and combine is a SUM, the sum of
-    per-rank outputs must equal the full single-rank mixture.
+    Uses ``determine_expert_map`` (the production placement function) so the
+    test mirrors real EP placement, including the remainder-to-first-ranks
+    distribution for non-divisible expert counts (e.g. 256÷6 → ranks 0-3
+    hold 43 experts, ranks 4-5 hold 42; modelled here at small scale).
+
+    The router produces global expert ids; each rank remaps them to local ids
+    and zeroes non-local weights (the masking path in ``CPUExpertsFp8.apply``).
+    Because the kernel applies topk_weights internally and combine is SUM, the
+    sum of per-rank outputs must equal the full single-rank mixture.
     """
+    if num_ranks > E:
+        pytest.skip(f"E={E} < num_ranks={num_ranks}, skipping degenerate case")
+
     set_random_seed(seed)
 
     a = torch.randn(M, K, dtype=torch.bfloat16) / math.sqrt(K)
@@ -262,14 +279,21 @@ def test_w8a16_block_fp8_cpu_fused_moe_expert_parallel(
         a, w1, w2, w1_s, w2_s, topk_weight, topk_ids, BLOCK_SIZE
     )
 
-    local_num_experts = E // num_ranks
     summed = torch.zeros(M, K, dtype=torch.bfloat16)
     for rank in range(num_ranks):
-        expert_map, _ = _build_expert_map(E, num_ranks, rank)
+        local_num_experts, expert_map, _ = determine_expert_map(
+            ep_size=num_ranks,
+            ep_rank=rank,
+            global_num_experts=E,
+        )
+        assert expert_map is not None
 
-        # Slice this rank's local experts and scales.
-        lo = rank * local_num_experts
+        # Derive the contiguous start index for this rank's global experts
+        # by finding the first non-(-1) entry in expert_map.
+        owned = (expert_map != -1).nonzero(as_tuple=False)
+        lo = int(owned[0].item())
         hi = lo + local_num_experts
+
         w1_local = w1[lo:hi].contiguous()
         w2_local = w2[lo:hi].contiguous()
         w1_s_local = w1_s[lo:hi].contiguous()
