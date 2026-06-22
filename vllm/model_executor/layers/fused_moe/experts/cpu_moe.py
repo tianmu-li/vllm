@@ -44,6 +44,94 @@ def prepare_fp8_moe_layer_for_cpu(
     return packed_w13, packed_w2
 
 
+def fused_experts_cpu_local_skip(
+    hidden_states: torch.Tensor,
+    w1: torch.Tensor,
+    w2: torch.Tensor,
+    topk_weights: torch.Tensor,
+    topk_ids: torch.Tensor,
+    expert_map: torch.Tensor,
+    moe_comp_method,
+    w1_scale: torch.Tensor | None,
+    w2_scale: torch.Tensor | None,
+    w1_zero: torch.Tensor | None,
+    w2_zero: torch.Tensor | None,
+    block_shape: list[int] | None,
+    w1_bias: torch.Tensor | None,
+    w2_bias: torch.Tensor | None,
+    alpha: float | None,
+    limit: float | None,
+    is_vnni: bool = True,
+) -> torch.Tensor:
+    """Run only this rank's local (token, expert) selections; scatter-add back.
+
+    Under expert parallelism each rank holds only a slice of the experts, so
+    most ``(token, expert)`` selections target experts that live elsewhere.
+    Rather than masking those selections to weight 0 and still paying for their
+    GEMM, drop them entirely, run the surviving local selections through the
+    kernel as ``topk=1`` rows, and scatter-add the weighted outputs back to the
+    original token rows. The result is numerically equivalent to weight-masking
+    the non-local experts (they contributed 0 anyway).
+
+    Args:
+        hidden_states: ``[M, H]`` unquantized activations.
+        w1: First (gate/up) expert weights for this rank's local experts.
+        w2: Second (down) expert weights for this rank's local experts.
+        topk_weights: ``[M, topk]`` routing weights.
+        topk_ids: ``[M, topk]`` global expert ids.
+        expert_map: ``[global_num_experts]`` mapping global id to local id, or
+            -1 for experts not owned by this rank.
+        moe_comp_method: CPU MoE compute method passed to ``fused_experts_cpu``.
+        w1_scale: Quantization scale for ``w1`` (or None).
+        w2_scale: Quantization scale for ``w2`` (or None).
+        w1_zero: Zero point for ``w1`` (or None).
+        w2_zero: Zero point for ``w2`` (or None).
+        block_shape: Block-quantization shape (or None).
+        w1_bias: Bias for ``w1`` (or None).
+        w2_bias: Bias for ``w2`` (or None).
+        alpha: Optional gemm1 alpha for SwiGLU variants.
+        limit: Optional gemm1 clamp limit for SwiGLU variants.
+        is_vnni: Whether weights are VNNI-prepacked.
+
+    Returns:
+        ``[M, H]`` expert output for this rank's local experts only.
+    """
+    M, H = hidden_states.shape
+    local_ids = expert_map[topk_ids.long()]  # [M, topk], -1 where non-local
+    sel = local_ids != -1
+    if not bool(sel.any()):
+        return hidden_states.new_zeros((M, H))
+
+    token_idx, slot_idx = sel.nonzero(as_tuple=True)  # [S], [S]
+    sel_hidden = hidden_states.index_select(0, token_idx).contiguous()
+    sel_weights = topk_weights[token_idx, slot_idx].unsqueeze(1).contiguous()
+    sel_ids = local_ids[token_idx, slot_idx].unsqueeze(1).to(torch.int32).contiguous()
+
+    sel_out = fused_experts_cpu(
+        sel_hidden,
+        w1,
+        w2,
+        sel_weights,
+        sel_ids,
+        False,  # inplace
+        moe_comp_method,
+        w1_scale,
+        w2_scale,
+        w1_zero,
+        w2_zero,
+        block_shape,
+        w1_bias,
+        w2_bias,
+        alpha,
+        limit,
+        is_vnni,
+    )  # [S, H], already weighted
+
+    out = hidden_states.new_zeros((M, sel_out.shape[1]))
+    out.index_add_(0, token_idx, sel_out)
+    return out
+
+
 class CPUExpertsFp8(mk.FusedMoEExpertsMonolithic):
     """CPU FP8 W8A16 block-quantized monolithic MoE experts."""
 
@@ -155,17 +243,6 @@ class CPUExpertsFp8(mk.FusedMoEExpertsMonolithic):
             e_score_correction_bias=e_score_correction_bias,
         )
 
-        if expert_map is not None:
-            # Expert parallelism: select_experts returns global expert ids, but
-            # w1/w2 only hold this rank's local experts. Remap to local ids and
-            # zero the weights of non-local experts so they contribute nothing
-            # after the reduce-scatter combine. Masked entries are clamped to a
-            # valid local index (their weight is 0, so the wasted compute on
-            # local-expert-0 is harmless).
-            local_ids = expert_map[topk_ids.long()]
-            topk_weights = topk_weights * (local_ids != -1)
-            topk_ids = local_ids.clamp_min(0).to(torch.int32)
-
         block_shape = (
             list(self.quant_config.block_shape)
             if self.quant_config.block_shape
@@ -175,6 +252,32 @@ class CPUExpertsFp8(mk.FusedMoEExpertsMonolithic):
                 else None
             )
         )
+
+        if expert_map is not None:
+            # Expert parallelism: select_experts returns global expert ids, but
+            # w1/w2 only hold this rank's local experts. Skip the non-local
+            # selections entirely (instead of masking them to weight 0 and
+            # still running their GEMMs), saving ~world_size x of expert
+            # compute per rank.
+            return fused_experts_cpu_local_skip(
+                hidden_states,
+                w1,
+                w2,
+                topk_weights,
+                topk_ids,
+                expert_map,
+                CPUQuantMethod.FP8_W8A16,  # moe_comp_method
+                self.w1_scale,  # w1_scale
+                self.w2_scale,  # w2_scale
+                None,  # w1_zero
+                None,  # w2_zero
+                block_shape,  # block_size
+                None,  # w1_bias
+                None,  # w2_bias
+                None,  # alpha
+                None,  # limit
+                True,  # is_vnni
+            )
 
         return fused_experts_cpu(
             hidden_states,

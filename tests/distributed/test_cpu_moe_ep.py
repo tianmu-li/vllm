@@ -31,6 +31,9 @@ if not current_platform.is_cpu():
     pytest.skip("CPU-only test", allow_module_level=True)
 
 import vllm._custom_ops as ops  # noqa: E402
+from vllm.model_executor.layers.fused_moe.experts.cpu_moe import (  # noqa: E402
+    fused_experts_cpu_local_skip,
+)
 
 if not hasattr(torch.ops._C, "fused_experts_cpu"):
     pytest.skip("fused_experts_cpu op not available", allow_module_level=True)
@@ -240,26 +243,26 @@ def _moe_ep_worker(rank, world_size, tp_size, dp_size, port, dp_port, params, er
                     topk_ids_local_global.clone().long(),
                 )
 
-            # Expert compute with EP masking
-            local_ids = expert_map[tid_gathered.long()]
-            tw_masked = tw_gathered * (local_ids != -1).to(tw_gathered.dtype)
-            tid_ep = local_ids.clamp_min(0).to(torch.int32)
-
+            # Expert compute: skip non-local selections (the shipped path).
             pw1, pw2 = _prepack_experts(w1_local), _prepack_experts(w2_local)
-            expert_out = ops.fused_experts_cpu(
+            expert_out = fused_experts_cpu_local_skip(
                 a_gathered.clone(),
                 pw1,
                 pw2,
-                tw_masked,
-                tid_ep,
-                False,
+                tw_gathered,
+                tid_gathered,
+                expert_map,
                 ops.CPUQuantMethod.FP8_W8A16,
                 w1_s_local,
                 w2_s_local,
-                None,
-                None,
+                None,  # w1_zero
+                None,  # w2_zero
                 BLOCK_SIZE,
-                is_vnni=True,
+                None,  # w1_bias
+                None,  # w2_bias
+                None,  # alpha
+                None,  # limit
+                True,  # is_vnni
             )
 
             with dp_metadata.sp_local_sizes(sequence_parallel_size=1):
