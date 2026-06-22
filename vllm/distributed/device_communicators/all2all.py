@@ -47,6 +47,22 @@ class AgRsAll2AllManager(All2AllManagerBase):
 
     def __init__(self, cpu_group, tcp_store_group=None):
         super().__init__(cpu_group, tcp_store_group)
+        # Sizes (per-rank token counts in process-group rank order) cached from
+        # the most recent dispatch call and reused by the matching combine call.
+        self._last_sizes: list[int] | None = None
+
+    def _exchange_sizes(self, hidden_states: torch.Tensor, dist_group) -> list[int]:
+        """All-gather the per-rank token count from hidden_states.shape[0].
+
+        Using live values instead of dp_metadata avoids size mismatches when
+        the dp_rank ordering differs from the gloo process-group rank ordering.
+        """
+        local_size = torch.tensor([hidden_states.shape[0]], dtype=torch.int64)
+        size_list = [
+            torch.zeros(1, dtype=torch.int64) for _ in range(dist_group.world_size)
+        ]
+        dist.all_gather(size_list, local_size, group=dist_group.device_group)
+        return [int(s.item()) for s in size_list]
 
     def dispatch_router_logits(
         self,
@@ -61,12 +77,9 @@ class AgRsAll2AllManager(All2AllManagerBase):
         """
         Gather hidden_states and router_logits from all dp ranks.
         """
-        dp_metadata = get_forward_context().dp_metadata
-        assert dp_metadata is not None
-        sizes = dp_metadata.get_chunk_sizes_across_dp_rank()
-        assert sizes is not None
         dist_group = get_ep_group() if is_sequence_parallel else get_dp_group()
-        assert sizes[dist_group.rank_in_group] == hidden_states.shape[0]
+        sizes = self._exchange_sizes(hidden_states, dist_group)
+        self._last_sizes = sizes
 
         tensors_to_gather = [hidden_states, router_logits]
         if extra_tensors is not None:
@@ -94,14 +107,11 @@ class AgRsAll2AllManager(All2AllManagerBase):
         | tuple[torch.Tensor, torch.Tensor, torch.Tensor, list[torch.Tensor]]
     ):
         """
-        Gather hidden_states and router_logits from all dp ranks.
+        Gather hidden_states and topk weights/ids from all dp ranks.
         """
-        dp_metadata = get_forward_context().dp_metadata
-        assert dp_metadata is not None
-        sizes = dp_metadata.get_chunk_sizes_across_dp_rank()
-        assert sizes is not None
         dist_group = get_ep_group() if is_sequence_parallel else get_dp_group()
-        assert sizes[dist_group.rank_in_group] == hidden_states.shape[0]
+        sizes = self._exchange_sizes(hidden_states, dist_group)
+        self._last_sizes = sizes
 
         tensors_to_gather = [hidden_states, topk_weights, topk_ids]
         if extra_tensors is not None:
@@ -128,12 +138,15 @@ class AgRsAll2AllManager(All2AllManagerBase):
         """
         Reduce-scatter hidden_states across all dp ranks.
         """
-        dp_metadata = get_forward_context().dp_metadata
-        assert dp_metadata is not None
-        sizes = dp_metadata.get_chunk_sizes_across_dp_rank()
-        assert sizes is not None
-
         dist_group = get_ep_group() if is_sequence_parallel else get_dp_group()
+        if self._last_sizes is not None:
+            sizes: list[int] = self._last_sizes
+        else:
+            dp_metadata = get_forward_context().dp_metadata
+            assert dp_metadata is not None
+            fallback = dp_metadata.get_chunk_sizes_across_dp_rank()
+            assert fallback is not None
+            sizes = fallback
         hidden_states = dist_group.reduce_scatterv(hidden_states, dim=0, sizes=sizes)
         return hidden_states
 

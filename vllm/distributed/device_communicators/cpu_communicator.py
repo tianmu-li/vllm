@@ -159,19 +159,37 @@ class CpuCommunicator(DeviceCommunicatorBase):
         )
 
         def _gather_single(t: torch.Tensor) -> torch.Tensor:
-            if sizes is not None:
+            if sizes is not None and len(set(sizes)) > 1:
+                # Gloo all_gather requires all recv buffers to match the local
+                # tensor's size.  Pad each rank's data to max_size, gather
+                # uniform buffers, then trim to actual sizes.
+                max_size = max(sizes)
+                pad_rows = max_size - t.shape[0]
+                if pad_rows > 0:
+                    padding = torch.zeros(
+                        (pad_rows,) + t.shape[1:], dtype=t.dtype, device=t.device
+                    )
+                    t_padded = torch.cat([t.contiguous(), padding], dim=0)
+                else:
+                    t_padded = t.contiguous()
                 recv_list = [
                     torch.empty(
-                        (sizes[r],) + t.shape[1:], dtype=t.dtype, device=t.device
+                        (max_size,) + t.shape[1:], dtype=t.dtype, device=t.device
                     )
-                    for r in range(self.world_size)
+                    for _ in range(self.world_size)
                 ]
+                self.dist_module.all_gather(
+                    recv_list, t_padded, group=self.device_group
+                )
+                return torch.cat(
+                    [recv_list[r][: sizes[r]] for r in range(self.world_size)], dim=0
+                )
             else:
                 recv_list = [torch.empty_like(t) for _ in range(self.world_size)]
-            self.dist_module.all_gather(
-                recv_list, t.contiguous(), group=self.device_group
-            )
-            return torch.cat(recv_list, dim=0)
+                self.dist_module.all_gather(
+                    recv_list, t.contiguous(), group=self.device_group
+                )
+                return torch.cat(recv_list, dim=0)
 
         if isinstance(input_, torch.Tensor):
             return _gather_single(input_)
