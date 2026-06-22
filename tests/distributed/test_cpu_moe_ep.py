@@ -11,7 +11,7 @@ Covers two topologies, both yielding EP=6:
   - TP=2, DP=3 — hybrid TP+EP (TP-partner ranks own disjoint DP groups,
     TP all-reduce at the end sums their partial contributions)
 
-Run: numactl -m 5 -N 5 .venv/bin/python -m pytest \
+Run: numactl -m 4 -N 4 .venv/bin/python -m pytest \
          tests/distributed/test_cpu_moe_ep.py -v
 """
 
@@ -218,12 +218,12 @@ def _moe_ep_worker(rank, world_size, tp_size, dp_size, port, dp_port, params, er
         assert expert_map is not None
 
         owned = (expert_map != -1).nonzero(as_tuple=False)
-        lo = int(owned[0].item())
-        hi = lo + local_num_experts
-        w1_local = w1[lo:hi].contiguous()
-        w2_local = w2[lo:hi].contiguous()
-        w1_s_local = w1_s[lo:hi].contiguous()
-        w2_s_local = w2_s[lo:hi].contiguous()
+        expert_lo = int(owned[0].item())
+        expert_hi = expert_lo + local_num_experts
+        w1_local = w1[expert_lo:expert_hi].contiguous()
+        w2_local = w2[expert_lo:expert_hi].contiguous()
+        w1_s_local = w1_s[expert_lo:expert_hi].contiguous()
+        w2_s_local = w2_s[expert_lo:expert_hi].contiguous()
 
         dp_cpu_group = get_dp_group().cpu_group
 
@@ -274,13 +274,14 @@ def _moe_ep_worker(rank, world_size, tp_size, dp_size, port, dp_port, params, er
         # We need to reconstruct the full [total_M, K] and compare to ref.
         # Use TP group rank 0 per DP replica to avoid double-counting:
         # TP partners now hold identical combined tensors post-all-reduce.
+        # new_group is a collective — all ranks must call it.
+        tp0_ranks = [r for r in range(world_size) if r % tp_size == 0]
+        tp0_group = dist.new_group(ranks=tp0_ranks, backend="gloo")
+
         result_full = None
         if tp_rank == 0:
             # Only TP-rank-0 workers participate in gathering
             all_slices = [torch.zeros_like(combined) for _ in range(dp_size)]
-            # Create a separate gloo group for TP-rank-0 workers across DP replicas
-            tp0_ranks = [r for r in range(world_size) if r % tp_size == 0]
-            tp0_group = dist.new_group(ranks=tp0_ranks, backend="gloo")
             dist.all_gather(all_slices, combined, group=tp0_group)
             result_full = torch.cat(all_slices, dim=0)
 

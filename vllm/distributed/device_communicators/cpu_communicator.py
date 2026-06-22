@@ -153,6 +153,11 @@ class CpuCommunicator(DeviceCommunicatorBase):
         if dim != 0:
             raise NotImplementedError("CpuCommunicator.all_gatherv only supports dim=0")
 
+        assert not isinstance(self.dist_module, _CPUSHMDistributed), (
+            "all_gatherv requires torch.distributed; "
+            "SHM communicators do not implement all_gather"
+        )
+
         def _gather_single(t: torch.Tensor) -> torch.Tensor:
             if sizes is not None:
                 recv_list = [
@@ -175,7 +180,7 @@ class CpuCommunicator(DeviceCommunicatorBase):
     def reduce_scatterv(
         self,
         input_: torch.Tensor,
-        dim: int = -1,
+        dim: int = 0,
         sizes: list[int] | None = None,
     ) -> torch.Tensor:
         """Reduce-scatter with variable output sizes.
@@ -343,7 +348,7 @@ class _CPUSHMDistributed:
     def all_reduce(
         self, input: torch.Tensor, group: ProcessGroup | None = None
     ) -> None:
-        torch.ops._C.shm_allreduce_rsag(self.handle, input)
+        torch.ops._C.shm_allreduce(self.handle, input)
 
     def reduce_scatter_into_tensor(
         self,
