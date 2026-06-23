@@ -35,11 +35,19 @@ class CpuCommunicator(DeviceCommunicatorBase):
                 or current_platform.get_cpu_architecture() == CpuArchEnum.POWERPC
             )
             and hasattr(torch.ops._C, "init_shm_manager")
-            and (unique_name.startswith("tp") or unique_name.startswith("pp"))
+            and (
+                unique_name.startswith("tp")
+                or unique_name.startswith("pp")
+                or unique_name.startswith("dp")
+            )
             and self._all_group_ranks_share_shm_group_name()
         ):
             self.dist_module = _CPUSHMDistributed(self)
-        elif unique_name.startswith("tp") or unique_name.startswith("pp"):
+        elif (
+            unique_name.startswith("tp")
+            or unique_name.startswith("pp")
+            or unique_name.startswith("dp")
+        ):
             logger.info(
                 "CPU SHM communicator disabled for group %s: ranks do not share "
                 "the same SHM group name, falling back to torch.distributed.",
@@ -149,47 +157,78 @@ class CpuCommunicator(DeviceCommunicatorBase):
         dim: int = 0,
         sizes: list[int] | None = None,
     ) -> torch.Tensor | list[torch.Tensor]:
-        """Variable-length all-gather over dim 0 using gloo all_gather."""
+        """Variable-length all-gather over dim 0."""
         if dim != 0:
             raise NotImplementedError("CpuCommunicator.all_gatherv only supports dim=0")
 
-        assert not isinstance(self.dist_module, _CPUSHMDistributed), (
-            "all_gatherv requires torch.distributed; "
-            "SHM communicators do not implement all_gather"
-        )
-
         def _gather_single(t: torch.Tensor) -> torch.Tensor:
-            if sizes is not None and len(set(sizes)) > 1:
-                # Gloo all_gather requires all recv buffers to match the local
-                # tensor's size.  Pad each rank's data to max_size, gather
-                # uniform buffers, then trim to actual sizes.
-                max_size = max(sizes)
+            if (
+                isinstance(self.dist_module, _CPUSHMDistributed)
+                and t.is_floating_point()
+            ):
+                # shm_all_gather requires uniform input sizes; pad to max then trim.
+                max_size = max(sizes) if sizes is not None else t.shape[0]
                 pad_rows = max_size - t.shape[0]
                 if pad_rows > 0:
-                    padding = torch.zeros(
-                        (pad_rows,) + t.shape[1:], dtype=t.dtype, device=t.device
+                    t_padded = torch.cat(
+                        [
+                            t.contiguous(),
+                            torch.zeros(
+                                (pad_rows,) + t.shape[1:],
+                                dtype=t.dtype,
+                                device=t.device,
+                            ),
+                        ],
+                        dim=0,
                     )
-                    t_padded = torch.cat([t.contiguous(), padding], dim=0)
                 else:
                     t_padded = t.contiguous()
-                recv_list = [
-                    torch.empty(
-                        (max_size,) + t.shape[1:], dtype=t.dtype, device=t.device
+                output = torch.empty(
+                    (self.world_size * max_size,) + t.shape[1:],
+                    dtype=t.dtype,
+                    device=t.device,
+                )
+                self.dist_module.all_gather_into_tensor(
+                    output, t_padded, group=self.device_group
+                )
+                if sizes is not None and len(set(sizes)) > 1:
+                    chunks = output.reshape(self.world_size, max_size, *t.shape[1:])
+                    return torch.cat(
+                        [chunks[r, : sizes[r]] for r in range(self.world_size)], dim=0
                     )
-                    for _ in range(self.world_size)
-                ]
-                self.dist_module.all_gather(
-                    recv_list, t_padded, group=self.device_group
-                )
-                return torch.cat(
-                    [recv_list[r][: sizes[r]] for r in range(self.world_size)], dim=0
-                )
+                return output
             else:
-                recv_list = [torch.empty_like(t) for _ in range(self.world_size)]
-                self.dist_module.all_gather(
-                    recv_list, t.contiguous(), group=self.device_group
-                )
-                return torch.cat(recv_list, dim=0)
+                # gloo path: use torch.distributed directly since
+                # _CPUSHMDistributed does not implement all_gather.
+                if sizes is not None and len(set(sizes)) > 1:
+                    max_size = max(sizes)
+                    pad_rows = max_size - t.shape[0]
+                    if pad_rows > 0:
+                        padding = torch.zeros(
+                            (pad_rows,) + t.shape[1:], dtype=t.dtype, device=t.device
+                        )
+                        t_padded = torch.cat([t.contiguous(), padding], dim=0)
+                    else:
+                        t_padded = t.contiguous()
+                    recv_list = [
+                        torch.empty(
+                            (max_size,) + t.shape[1:], dtype=t.dtype, device=t.device
+                        )
+                        for _ in range(self.world_size)
+                    ]
+                    torch.distributed.all_gather(
+                        recv_list, t_padded, group=self.device_group
+                    )
+                    return torch.cat(
+                        [recv_list[r][: sizes[r]] for r in range(self.world_size)],
+                        dim=0,
+                    )
+                else:
+                    recv_list = [torch.empty_like(t) for _ in range(self.world_size)]
+                    torch.distributed.all_gather(
+                        recv_list, t.contiguous(), group=self.device_group
+                    )
+                    return torch.cat(recv_list, dim=0)
 
         if isinstance(input_, torch.Tensor):
             return _gather_single(input_)
