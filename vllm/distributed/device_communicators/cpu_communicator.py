@@ -71,6 +71,7 @@ class CpuCommunicator(DeviceCommunicatorBase):
 
             self.all2all_manager = AgRsAll2AllManager(self.cpu_group)
             logger.info("Using allgather_reducescatter all2all manager.")
+            self._register_ep_custom_ops()
 
     def _all_group_ranks_share_shm_group_name(self) -> bool:
         """
@@ -162,10 +163,7 @@ class CpuCommunicator(DeviceCommunicatorBase):
             raise NotImplementedError("CpuCommunicator.all_gatherv only supports dim=0")
 
         def _gather_single(t: torch.Tensor) -> torch.Tensor:
-            if (
-                isinstance(self.dist_module, _CPUSHMDistributed)
-                and t.is_floating_point()
-            ):
+            if isinstance(self.dist_module, _CPUSHMDistributed):
                 # shm_all_gather requires uniform input sizes; pad to max then trim.
                 max_size = max(sizes) if sizes is not None else t.shape[0]
                 pad_rows = max_size - t.shape[0]
@@ -191,16 +189,15 @@ class CpuCommunicator(DeviceCommunicatorBase):
                 self.dist_module.all_gather_into_tensor(
                     output, t_padded, group=self.device_group
                 )
-                if sizes is not None and len(set(sizes)) > 1:
+                if sizes is not None:
                     chunks = output.reshape(self.world_size, max_size, *t.shape[1:])
                     return torch.cat(
                         [chunks[r, : sizes[r]] for r in range(self.world_size)], dim=0
                     )
                 return output
             else:
-                # gloo path: use torch.distributed directly since
-                # _CPUSHMDistributed does not implement all_gather.
-                if sizes is not None and len(set(sizes)) > 1:
+                # gloo path (multi-node or non-SHM groups).
+                if sizes is not None:
                     max_size = max(sizes)
                     pad_rows = max_size - t.shape[0]
                     if pad_rows > 0:
@@ -280,6 +277,69 @@ class CpuCommunicator(DeviceCommunicatorBase):
             )
         return self.dist_module.recv_tensor_dict(src)
 
+    def _register_ep_custom_ops(self) -> None:
+        """Register dispatch/combine as custom ops opaque to torch.compile."""
+        assert self.all2all_manager is not None
+        mgr = self.all2all_manager
+        safe_name = (
+            self.unique_name.replace("-", "_").replace("/", "_").replace(":", "_")
+        )
+
+        @torch.library.custom_op(
+            f"vllm::cpu_ep_dispatch_rl_{safe_name}", mutates_args=()
+        )
+        def _dispatch_rl(
+            hidden_states: torch.Tensor,
+            router_logits: torch.Tensor,
+        ) -> tuple[torch.Tensor, torch.Tensor]:
+            result = mgr.dispatch_router_logits(hidden_states, router_logits)
+            return result[0], result[1]
+
+        @_dispatch_rl.register_fake
+        def _(
+            hidden_states: torch.Tensor, router_logits: torch.Tensor
+        ) -> tuple[torch.Tensor, torch.Tensor]:
+            n = hidden_states.shape[0] * self.world_size
+            return (
+                hidden_states.new_empty((n,) + hidden_states.shape[1:]),
+                router_logits.new_empty((n,) + router_logits.shape[1:]),
+            )
+
+        @torch.library.custom_op(f"vllm::cpu_ep_dispatch_{safe_name}", mutates_args=())
+        def _dispatch(
+            hidden_states: torch.Tensor,
+            topk_weights: torch.Tensor,
+            topk_ids: torch.Tensor,
+        ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+            result = mgr.dispatch(hidden_states, topk_weights, topk_ids)
+            return result[0], result[1], result[2]
+
+        @_dispatch.register_fake
+        def _(
+            hidden_states: torch.Tensor,
+            topk_weights: torch.Tensor,
+            topk_ids: torch.Tensor,
+        ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+            n = hidden_states.shape[0] * self.world_size
+            return (
+                hidden_states.new_empty((n,) + hidden_states.shape[1:]),
+                topk_weights.new_empty((n,) + topk_weights.shape[1:]),
+                topk_ids.new_empty((n,) + topk_ids.shape[1:]),
+            )
+
+        @torch.library.custom_op(f"vllm::cpu_ep_combine_{safe_name}", mutates_args=())
+        def _combine(hidden_states: torch.Tensor) -> torch.Tensor:
+            return mgr.combine(hidden_states)
+
+        @_combine.register_fake
+        def _(hidden_states: torch.Tensor) -> torch.Tensor:
+            local_n = hidden_states.shape[0] // self.world_size
+            return hidden_states.new_empty((local_n,) + hidden_states.shape[1:])
+
+        self._ep_dispatch_rl_op = _dispatch_rl
+        self._ep_dispatch_op = _dispatch
+        self._ep_combine_op = _combine
+
     def dispatch_router_logits(
         self,
         hidden_states: torch.Tensor,
@@ -290,17 +350,11 @@ class CpuCommunicator(DeviceCommunicatorBase):
         tuple[torch.Tensor, torch.Tensor]
         | tuple[torch.Tensor, torch.Tensor, list[torch.Tensor]]
     ):
-        """
-        Dispatch the hidden states and router logits to the appropriate device.
-        This is a no-op in the base class.
-        """
-
         assert self.all2all_manager is not None
+        if extra_tensors is None and hasattr(self, "_ep_dispatch_rl_op"):
+            return self._ep_dispatch_rl_op(hidden_states, router_logits)
         return self.all2all_manager.dispatch_router_logits(
-            hidden_states,
-            router_logits,
-            is_sequence_parallel,
-            extra_tensors,
+            hidden_states, router_logits, is_sequence_parallel, extra_tensors
         )
 
     def dispatch(
@@ -314,11 +368,9 @@ class CpuCommunicator(DeviceCommunicatorBase):
         tuple[torch.Tensor, torch.Tensor, torch.Tensor]
         | tuple[torch.Tensor, torch.Tensor, torch.Tensor, list[torch.Tensor]]
     ):
-        """
-        Dispatch the hidden states and topk weights/ids to the appropriate device.
-        This is a no-op in the base class.
-        """
         assert self.all2all_manager is not None
+        if extra_tensors is None and hasattr(self, "_ep_dispatch_op"):
+            return self._ep_dispatch_op(hidden_states, topk_weights, topk_ids)
         return self.all2all_manager.dispatch(
             hidden_states,
             topk_weights,
@@ -330,15 +382,10 @@ class CpuCommunicator(DeviceCommunicatorBase):
     def combine(
         self, hidden_states: torch.Tensor, is_sequence_parallel: bool = False
     ) -> torch.Tensor:
-        """
-        Combine the hidden states and router logits from the appropriate device.
-        This is a no-op in the base class.
-        """
         assert self.all2all_manager is not None
-        return self.all2all_manager.combine(
-            hidden_states,
-            is_sequence_parallel,
-        )
+        if not is_sequence_parallel and hasattr(self, "_ep_combine_op"):
+            return self._ep_combine_op(hidden_states)
+        return self.all2all_manager.combine(hidden_states, is_sequence_parallel)
 
 
 class _CPUSHMDistributed:
