@@ -85,7 +85,14 @@ class CpuCommunicator(DeviceCommunicatorBase):
             local_name,
             group=self.device_group,
         )
-        return len(set(names)) == 1
+        shared_name = len(set(names)) == 1
+        if not shared_name:
+            logger.debug(
+                "CPU SHM group-name mismatch for group %s: %s",
+                self.unique_name,
+                names,
+            )
+        return shared_name
 
     def all_reduce(self, input_):
         self.dist_module.all_reduce(input_, group=self.device_group)
