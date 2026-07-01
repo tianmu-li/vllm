@@ -56,6 +56,15 @@ class CpuCommunicator(DeviceCommunicatorBase):
 
         # send/recv tensor_dict is only supported through the SHM communicator backend
         self.supports_tensor_dict = isinstance(self.dist_module, _CPUSHMDistributed)
+        # Ragged SHM all_gatherv needs temporary padded input and a uniform
+        # receive buffer; cache them by tensor signature to avoid steady-state
+        # reallocations.
+        self._ragged_pad_buffers: dict[
+            tuple[torch.dtype, torch.device, tuple[int, ...]], torch.Tensor
+        ] = {}
+        self._ragged_shm_gather_buffers: dict[
+            tuple[torch.dtype, torch.device, tuple[int, ...]], torch.Tensor
+        ] = {}
 
         if self.use_all2all:
             if self.all2all_backend not in (
@@ -159,6 +168,96 @@ class CpuCommunicator(DeviceCommunicatorBase):
         )
         return output_tensor
 
+    @staticmethod
+    def _ragged_buffer_key(
+        tensor: torch.Tensor,
+    ) -> tuple[torch.dtype, torch.device, tuple[int, ...]]:
+        return (tensor.dtype, tensor.device, tuple(tensor.shape[1:]))
+
+    @staticmethod
+    def _sizes_are_uniform(sizes: list[int]) -> bool:
+        return all(size == sizes[0] for size in sizes[1:])
+
+    def _get_ragged_pad_capacity(self, tensor: torch.Tensor) -> int:
+        buffer = self._ragged_pad_buffers.get(self._ragged_buffer_key(tensor))
+        return 0 if buffer is None else buffer.shape[0]
+
+    def _get_ragged_shm_gather_capacity(self, tensor: torch.Tensor) -> int:
+        buffer = self._ragged_shm_gather_buffers.get(self._ragged_buffer_key(tensor))
+        return 0 if buffer is None else buffer.shape[0] // self.world_size
+
+    def _get_ragged_pad_buffer(
+        self,
+        tensor: torch.Tensor,
+        padded_rows: int,
+    ) -> torch.Tensor:
+        key = self._ragged_buffer_key(tensor)
+        buffer = self._ragged_pad_buffers.get(key)
+        if buffer is None or buffer.shape[0] < padded_rows:
+            buffer = torch.empty(
+                (padded_rows,) + tensor.shape[1:],
+                dtype=tensor.dtype,
+                device=tensor.device,
+            )
+            self._ragged_pad_buffers[key] = buffer
+        return buffer[:padded_rows]
+
+    def _get_ragged_shm_gather_buffer(
+        self,
+        tensor: torch.Tensor,
+        padded_rows: int,
+    ) -> torch.Tensor:
+        key = self._ragged_buffer_key(tensor)
+        needed_rows = self.world_size * padded_rows
+        buffer = self._ragged_shm_gather_buffers.get(key)
+        if buffer is None or buffer.shape[0] < needed_rows:
+            buffer = torch.empty(
+                (needed_rows,) + tensor.shape[1:],
+                dtype=tensor.dtype,
+                device=tensor.device,
+            )
+            self._ragged_shm_gather_buffers[key] = buffer
+        return buffer[:needed_rows]
+
+    def _all_gatherv_shm_uniform(
+        self,
+        tensor: torch.Tensor,
+        rows_per_rank: int,
+    ) -> torch.Tensor:
+        output = torch.empty(
+            (self.world_size * rows_per_rank,) + tensor.shape[1:],
+            dtype=tensor.dtype,
+            device=tensor.device,
+        )
+        self.dist_module.all_gather_into_tensor(
+            output,
+            tensor.contiguous(),
+            group=self.device_group,
+        )
+        return output
+
+    def _all_gatherv_shm_ragged(
+        self,
+        tensor: torch.Tensor,
+        sizes: list[int],
+    ) -> torch.Tensor:
+        padded_rows = max(sizes)
+        padded_input = self._get_ragged_pad_buffer(tensor, padded_rows)
+        padded_input[: tensor.shape[0]].copy_(tensor.contiguous())
+
+        gathered = self._get_ragged_shm_gather_buffer(tensor, padded_rows)
+        self.dist_module.all_gather_into_tensor(
+            gathered,
+            padded_input,
+            group=self.device_group,
+        )
+
+        chunks = gathered.reshape(self.world_size, padded_rows, *tensor.shape[1:])
+        return torch.cat(
+            [chunks[rank, : sizes[rank]] for rank in range(self.world_size)],
+            dim=0,
+        )
+
     def all_gatherv(
         self,
         input_: torch.Tensor | list[torch.Tensor],
@@ -207,18 +306,11 @@ class CpuCommunicator(DeviceCommunicatorBase):
                 )
 
             if isinstance(self.dist_module, _CPUSHMDistributed):
-                # shm_all_gather requires uniform input sizes; pad to max then trim.
-                max_size = max(sizes) if sizes is not None else t.shape[0]
-                t_padded = _pad_rows(t, max_size)
-                output = torch.empty(
-                    (self.world_size * max_size,) + t.shape[1:],
-                    dtype=t.dtype,
-                    device=t.device,
-                )
-                self.dist_module.all_gather_into_tensor(
-                    output, t_padded, group=self.device_group
-                )
-                return _trim_gathered(output, max_size, t)
+                if sizes is None:
+                    return self._all_gatherv_shm_uniform(t, t.shape[0])
+                if self._sizes_are_uniform(sizes):
+                    return self._all_gatherv_shm_uniform(t, sizes[0])
+                return self._all_gatherv_shm_ragged(t, sizes)
             else:
                 # gloo path (multi-node or non-SHM groups).
                 if sizes is not None:
