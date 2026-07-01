@@ -7,6 +7,7 @@ import torch.distributed as dist
 from vllm.config import ParallelConfig
 from vllm.distributed.parallel_state import get_dp_group
 from vllm.logger import init_logger
+from vllm.platforms import current_platform
 from vllm.v1.worker.ubatch_utils import (
     check_ubatch_thresholds,
     is_last_ubatch_empty,
@@ -98,6 +99,20 @@ def _post_process_cudagraph_mode(tensor: torch.Tensor) -> int:
     return int(tensor[3, :].min().item())
 
 
+def _force_cpu_ep_dp_padding(parallel_config: ParallelConfig) -> bool:
+    """CPU expert-parallel MoE registers dispatch/combine as torch.compile
+    custom ops whose register_fake assumes uniform per-rank token counts
+    (shape[0] * world_size). Ragged DP sizes break that baked assumption and
+    corrupt the compiled MoE buffers, so force uniform DP padding for this
+    path. See vllm/distributed/device_communicators/cpu_communicator.py."""
+    return (
+        parallel_config.data_parallel_size > 1
+        and current_platform.is_cpu()
+        and parallel_config.enable_expert_parallel
+        and bool(parallel_config.is_moe_model)
+    )
+
+
 def _synchronize_dp_ranks(
     num_tokens_unpadded: int,
     num_tokens_padded: int,
@@ -149,7 +164,13 @@ def _synchronize_dp_ranks(
     # sizes across DP ranks currently).
     # Use the synced runtime cudagraph mode rather than the compilation config
     # so we can avoid padding when cudagraph is not enabled for this step.
-    should_dp_pad = synced_cudagraph_mode != 0 or should_ubatch
+    # CPU expert-parallel MoE additionally requires uniform per-rank token
+    # counts because its compiled dispatch/combine ops bake in that assumption.
+    should_dp_pad = (
+        synced_cudagraph_mode != 0
+        or should_ubatch
+        or _force_cpu_ep_dp_padding(parallel_config)
+    )
 
     # Pad all DP ranks up to the maximum token count across ranks if
     # should_dp_pad is True

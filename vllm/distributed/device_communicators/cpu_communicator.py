@@ -169,25 +169,47 @@ class CpuCommunicator(DeviceCommunicatorBase):
         if dim != 0:
             raise NotImplementedError("CpuCommunicator.all_gatherv only supports dim=0")
 
+        if sizes is not None:
+            assert len(sizes) == self.world_size, f"{len(sizes)} != {self.world_size}"
+
+        def _pad_rows(
+            tensor: torch.Tensor,
+            padded_rows: int,
+        ) -> torch.Tensor:
+            pad_rows = padded_rows - tensor.shape[0]
+            assert pad_rows >= 0, f"{pad_rows} < 0"
+            if pad_rows == 0:
+                return tensor.contiguous()
+            padding = torch.zeros(
+                (pad_rows,) + tensor.shape[1:],
+                dtype=tensor.dtype,
+                device=tensor.device,
+            )
+            return torch.cat([tensor.contiguous(), padding], dim=0)
+
+        def _trim_gathered(
+            gathered: torch.Tensor,
+            padded_rows: int,
+            tensor: torch.Tensor,
+        ) -> torch.Tensor:
+            if sizes is None:
+                return gathered
+            chunks = gathered.reshape(self.world_size, padded_rows, *tensor.shape[1:])
+            return torch.cat(
+                [chunks[r, : sizes[r]] for r in range(self.world_size)],
+                dim=0,
+            )
+
         def _gather_single(t: torch.Tensor) -> torch.Tensor:
+            if sizes is not None:
+                assert t.shape[0] == sizes[self.rank_in_group], (
+                    f"{t.shape[0]} != {sizes[self.rank_in_group]}"
+                )
+
             if isinstance(self.dist_module, _CPUSHMDistributed):
                 # shm_all_gather requires uniform input sizes; pad to max then trim.
                 max_size = max(sizes) if sizes is not None else t.shape[0]
-                pad_rows = max_size - t.shape[0]
-                if pad_rows > 0:
-                    t_padded = torch.cat(
-                        [
-                            t.contiguous(),
-                            torch.zeros(
-                                (pad_rows,) + t.shape[1:],
-                                dtype=t.dtype,
-                                device=t.device,
-                            ),
-                        ],
-                        dim=0,
-                    )
-                else:
-                    t_padded = t.contiguous()
+                t_padded = _pad_rows(t, max_size)
                 output = torch.empty(
                     (self.world_size * max_size,) + t.shape[1:],
                     dtype=t.dtype,
@@ -196,24 +218,12 @@ class CpuCommunicator(DeviceCommunicatorBase):
                 self.dist_module.all_gather_into_tensor(
                     output, t_padded, group=self.device_group
                 )
-                if sizes is not None:
-                    chunks = output.reshape(self.world_size, max_size, *t.shape[1:])
-                    return torch.cat(
-                        [chunks[r, : sizes[r]] for r in range(self.world_size)], dim=0
-                    )
-                return output
+                return _trim_gathered(output, max_size, t)
             else:
                 # gloo path (multi-node or non-SHM groups).
                 if sizes is not None:
                     max_size = max(sizes)
-                    pad_rows = max_size - t.shape[0]
-                    if pad_rows > 0:
-                        padding = torch.zeros(
-                            (pad_rows,) + t.shape[1:], dtype=t.dtype, device=t.device
-                        )
-                        t_padded = torch.cat([t.contiguous(), padding], dim=0)
-                    else:
-                        t_padded = t.contiguous()
+                    t_padded = _pad_rows(t, max_size)
                     recv_list = [
                         torch.empty(
                             (max_size,) + t.shape[1:], dtype=t.dtype, device=t.device
@@ -223,10 +233,8 @@ class CpuCommunicator(DeviceCommunicatorBase):
                     torch.distributed.all_gather(
                         recv_list, t_padded, group=self.device_group
                     )
-                    return torch.cat(
-                        [recv_list[r][: sizes[r]] for r in range(self.world_size)],
-                        dim=0,
-                    )
+                    gathered = torch.cat(recv_list, dim=0)
+                    return _trim_gathered(gathered, max_size, t)
                 else:
                     recv_list = [torch.empty_like(t) for _ in range(self.world_size)]
                     torch.distributed.all_gather(
@@ -249,6 +257,11 @@ class CpuCommunicator(DeviceCommunicatorBase):
             dim += input_.dim()
 
         out = input_.contiguous().clone()
+
+        if sizes is not None:
+            assert len(sizes) == self.world_size, f"{len(sizes)} != {self.world_size}"
+            assert out.shape[dim] == sum(sizes), f"{out.shape[dim]} != {sum(sizes)}"
+
         self.dist_module.all_reduce(out, group=self.device_group)
 
         if sizes is not None:
@@ -306,7 +319,12 @@ class CpuCommunicator(DeviceCommunicatorBase):
         def _(
             hidden_states: torch.Tensor, router_logits: torch.Tensor
         ) -> tuple[torch.Tensor, torch.Tensor]:
-            n = hidden_states.shape[0] * self.world_size
+            # Ragged dispatch: the real op all-gathers each rank's actual row
+            # count and returns sum(per_rank_sizes) rows. That total is
+            # data-dependent and unknown at trace time, so emit an unbacked
+            # symint instead of the uniform shape[0] * world_size (GPU parity).
+            ctx = torch.library.get_ctx()
+            n = ctx.new_dynamic_size()
             return (
                 hidden_states.new_empty((n,) + hidden_states.shape[1:]),
                 router_logits.new_empty((n,) + router_logits.shape[1:]),
@@ -327,7 +345,13 @@ class CpuCommunicator(DeviceCommunicatorBase):
             topk_weights: torch.Tensor,
             topk_ids: torch.Tensor,
         ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-            n = hidden_states.shape[0] * self.world_size
+            # Ragged dispatch: the real op all-gathers each rank's actual row
+            # count and returns sum(per_rank_sizes) rows. That total is
+            # data-dependent and unknown at trace time, so emit an unbacked
+            # symint instead of the uniform shape[0] * world_size (GPU parity).
+            # All three outputs share the same n so downstream sees one row dim.
+            ctx = torch.library.get_ctx()
+            n = ctx.new_dynamic_size()
             return (
                 hidden_states.new_empty((n,) + hidden_states.shape[1:]),
                 topk_weights.new_empty((n,) + topk_weights.shape[1:]),
@@ -340,7 +364,8 @@ class CpuCommunicator(DeviceCommunicatorBase):
 
         @_combine.register_fake
         def _(hidden_states: torch.Tensor) -> torch.Tensor:
-            local_n = hidden_states.shape[0] // self.world_size
+            ctx = torch.library.get_ctx()
+            local_n = ctx.new_dynamic_size()
             return hidden_states.new_empty((local_n,) + hidden_states.shape[1:])
 
         self._ep_dispatch_rl_op = _dispatch_rl
@@ -358,7 +383,11 @@ class CpuCommunicator(DeviceCommunicatorBase):
         | tuple[torch.Tensor, torch.Tensor, list[torch.Tensor]]
     ):
         assert self.all2all_manager is not None
-        if extra_tensors is None and hasattr(self, "_ep_dispatch_rl_op"):
+        if (
+            extra_tensors is None
+            and not is_sequence_parallel
+            and hasattr(self, "_ep_dispatch_rl_op")
+        ):
             return self._ep_dispatch_rl_op(hidden_states, router_logits)
         return self.all2all_manager.dispatch_router_logits(
             hidden_states, router_logits, is_sequence_parallel, extra_tensors
@@ -376,7 +405,11 @@ class CpuCommunicator(DeviceCommunicatorBase):
         | tuple[torch.Tensor, torch.Tensor, torch.Tensor, list[torch.Tensor]]
     ):
         assert self.all2all_manager is not None
-        if extra_tensors is None and hasattr(self, "_ep_dispatch_op"):
+        if (
+            extra_tensors is None
+            and not is_sequence_parallel
+            and hasattr(self, "_ep_dispatch_op")
+        ):
             return self._ep_dispatch_op(hidden_states, topk_weights, topk_ids)
         return self.all2all_manager.dispatch(
             hidden_states,
