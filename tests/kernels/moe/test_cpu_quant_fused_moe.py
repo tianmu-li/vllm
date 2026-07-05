@@ -325,6 +325,29 @@ def test_w8a16_block_fp8_cpu_fused_moe(M, N, K, E, topk, seed):
     torch.testing.assert_close(out_inplace, out, atol=0, rtol=0)
 
 
+@pytest.mark.parametrize("N,K,E,topk", [(128, 256, 8, 2), (384, 512, 8, 2)])
+@pytest.mark.parametrize("seed", [0])
+def test_w8a16_block_fp8_cpu_fused_moe_decode_shapes(N, K, E, topk, seed):
+    """Cover M=1 FP8 decode shapes without path-specific shortcuts."""
+    set_random_seed(seed)
+    M = 1
+
+    a = torch.randn(M, K, dtype=torch.bfloat16) / math.sqrt(K)
+    w1, w2, w1_s, w2_s = _make_fp8_moe_weights(E, N, K, BLOCK_SIZE)
+    pw1, pw2 = _prepack_experts(w1), _prepack_experts(w2)
+
+    score = torch.randn(M, E, dtype=torch.bfloat16)
+    score = torch.softmax(score, dim=-1, dtype=torch.float32)
+    topk_weight, topk_ids = torch.topk(score, topk)
+    topk_ids = topk_ids.to(torch.int32)
+
+    ref_out = ref_w8a16_block_fp8_moe(
+        a, w1, w2, w1_s, w2_s, topk_weight, topk_ids, BLOCK_SIZE
+    )
+    out = _run_fp8_cpu_fused_moe(a, pw1, pw2, topk_weight, topk_ids, w1_s, w2_s)
+    torch.testing.assert_close(ref_out.bfloat16(), out, atol=1e-2, rtol=1e-2)
+
+
 @pytest.mark.parametrize("invalid_expert_id", [-2, 8])
 @pytest.mark.parametrize("seed", [0])
 def test_w8a16_block_fp8_cpu_fused_moe_invalid_expert_id_raises(

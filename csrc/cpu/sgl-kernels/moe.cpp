@@ -31,6 +31,25 @@ namespace {
 //     3. abstract at::native::cpublas::brgemm with WoQ gemm (M = 1 & M != 1)
 //
 
+inline int64_t row_parallel_grain(int64_t rows, int64_t row_size) {
+  if (rows <= block_size_m()) {
+    return std::max<int64_t>(rows, 1);
+  }
+  return std::max<int64_t>(1, GRAIN_SIZE / std::max<int64_t>(row_size, 1));
+}
+
+inline bool is_small_work_moe_method(CPUQuantMethod quant_method) {
+  switch (quant_method) {
+    case CPUQuantMethod::FP8_W8A16:
+    case CPUQuantMethod::MXFP4:
+    case CPUQuantMethod::INT8_W8A8:
+    case CPUQuantMethod::INT4_W4A8:
+      return true;
+    default:
+      return false;
+  }
+}
+
 template <int BLOCK_M>
 int moe_align_block_size(
     int32_t* __restrict__ sorted_ids,
@@ -41,14 +60,15 @@ int moe_align_block_size(
     int32_t* __restrict__ offsets,
     int num_experts,
     int numel,
-    int num_threads) {
+    int num_threads,
+    bool use_serial_count_scatter) {
 #define T_INDEX(tt) total_cnts + (tt) * num_experts
 
-  // accumulate count of expert ids locally
-  at::parallel_for(0, numel, 0, [&](int begin, int end) {
-    int tid = at::get_thread_num();
-    int32_t* __restrict__ local_cnts = T_INDEX(tid + 1);
+  const int count_threads = use_serial_count_scatter ? 1 : num_threads;
 
+  // Accumulate and validate expert ids locally.
+  auto count_range = [&](int begin, int end, int tid) {
+    int32_t* __restrict__ local_cnts = T_INDEX(tid + 1);
     for (int i = begin; i < end; ++i) {
       int32_t e = topk_ids[i];
       if (e == -1) {
@@ -58,16 +78,23 @@ int moe_align_block_size(
           0 <= e && e < num_experts, "Invalid expert id ", e, " for ", num_experts, " experts.");
       local_cnts[e]++;
     }
-  });
+  };
+  if (count_threads == 1) {
+    count_range(0, numel, 0);
+  } else {
+    at::parallel_for(0, numel, GRAIN_SIZE, [&](int begin, int end) {
+      count_range(begin, end, at::get_thread_num());
+    });
+  }
 
   using iVec = at::vec::Vectorized<int32_t>;
-  for (int t = 0; t < num_threads; ++t) {
+  for (int t = 0; t < count_threads; ++t) {
     at::vec::map2<int32_t>(
         [](iVec x, iVec y) { return x + y; }, T_INDEX(t + 1), T_INDEX(t + 1), T_INDEX(t), num_experts);
   }
 
   // the last row holds sums of each experts
-  int32_t* total_cnts_t_1 = T_INDEX(num_threads);
+  int32_t* total_cnts_t_1 = T_INDEX(count_threads);
 
   int num_valid = 0;
   cumsums[0] = 0;
@@ -82,8 +109,7 @@ int moe_align_block_size(
   }
   int num_tokens_post_pad = cumsums[num_experts];
 
-  at::parallel_for(0, numel, 0, [&](int begin, int end) {
-    int tid = at::get_thread_num();
+  auto scatter_range = [&](int begin, int end, int tid) {
     // thread tid offsets in `total_cnts`
     int32_t* __restrict__ offsets = T_INDEX(tid);
 
@@ -97,10 +123,17 @@ int moe_align_block_size(
       sorted_ids[b_offset + t_offset] = i;
       offsets[expert_id]++;
     }
-  });
+  };
+  if (count_threads == 1) {
+    scatter_range(0, numel, 0);
+  } else {
+    at::parallel_for(0, numel, GRAIN_SIZE, [&](int begin, int end) {
+      scatter_range(begin, end, at::get_thread_num());
+    });
+  }
 
   // debug: the offset for thread t_1 should be identical to t_2
-  int32_t* total_cnts_t_2 = T_INDEX(num_threads - 1);
+  int32_t* total_cnts_t_2 = T_INDEX(count_threads - 1);
   for (int e = 0; e < num_experts; ++e) {
     TORCH_CHECK(total_cnts_t_1[e] == total_cnts_t_2[e]);
   }
@@ -985,6 +1018,8 @@ at::Tensor fused_experts_cpu(
   int num_threads = at::get_num_threads();
   int64_t max_num_tokens_padded = M * topk + E * (BLOCK_M - 1);
   int64_t max_num_blocks = div_up(max_num_tokens_padded, BLOCK_M);
+  const bool use_small_work_grains =
+      is_small_work_moe_method(static_cast<CPUQuantMethod>(moe_comp_method));
   auto buffer = at::empty(
       {max_num_tokens_padded + max_num_blocks + (num_threads + 1) * E + (E + 1) + (max_num_blocks + 1)},
       topk_ids.options());
@@ -998,20 +1033,33 @@ at::Tensor fused_experts_cpu(
   // init sorted_ids with `numel` as the padding number
   // init expert_ids with `num_experts`
   int64_t numel = M * topk;
-  at::parallel_for(0, max_num_blocks, GRAIN_SIZE / BLOCK_M, [&](int64_t begin, int64_t end) {
+  const int64_t block_init_grain = use_small_work_grains ? GRAIN_SIZE : 0;
+  const int64_t count_init_grain = use_small_work_grains ? 8 * GRAIN_SIZE : 0;
+  const bool use_serial_count_scatter =
+      use_small_work_grains && numel <= GRAIN_SIZE;
+  at::parallel_for(0, max_num_blocks, block_init_grain, [&](int64_t begin, int64_t end) {
     int64_t m_start = begin * BLOCK_M;
     int64_t m_size = std::min((end - begin) * BLOCK_M, max_num_tokens_padded - m_start);
     fill_stub(sorted_ids + m_start, (int32_t)numel, m_size);
     fill_stub(expert_ids + begin, (int32_t)E, end - begin);
   });
   // zero total_cnts and cumsums
-  at::parallel_for(0, (num_threads + 1) * E + (E + 1), GRAIN_SIZE, [&](int64_t begin, int64_t end) {
+  at::parallel_for(0, (num_threads + 1) * E + (E + 1), count_init_grain, [&](int64_t begin, int64_t end) {
     fill_stub(total_cnts + begin, 0, end - begin);
   });
 
   // align experts index
   int64_t num_tokens_post_pad = moe_align_block_size<BLOCK_M>(
-      sorted_ids, expert_ids, topk_ids.data_ptr<int32_t>(), total_cnts, cumsums, offsets, E, numel, num_threads);
+      sorted_ids,
+      expert_ids,
+      topk_ids.data_ptr<int32_t>(),
+      total_cnts,
+      cumsums,
+      offsets,
+      E,
+      numel,
+      num_threads,
+      use_serial_count_scatter);
 
   bool has_skip = offsets[num_tokens_post_pad / BLOCK_M] != numel;
 
@@ -1037,7 +1085,7 @@ at::Tensor fused_experts_cpu(
   int64_t buffer_size_nbytes =
       M * topk * N * 2 + M * topk * K * 2 +
       num_threads * BLOCK_M * K *
-          (moe_comp_method == CPUQuantMethod::INT8_W8A8 | moe_comp_method == CPUQuantMethod::INT4_W4A8 ? 1 : 2) +
+          (moe_comp_method == CPUQuantMethod::INT8_W8A8 || moe_comp_method == CPUQuantMethod::INT4_W4A8 ? 1 : 2) +
       num_threads * 2 * BLOCK_M * BLOCK_N * sizeof(float);
 
   if (moe_comp_method == CPUQuantMethod::INT8_W8A8) {
@@ -1057,7 +1105,9 @@ at::Tensor fused_experts_cpu(
     scalar_t* __restrict__ intermediate_cache2 = intermediate_cache1 + M * topk * N;
 
     if (has_skip) {
-      at::parallel_for(0, M * topk, 0, [&](int64_t begin, int64_t end) {
+      const int64_t skip_zero_grain =
+          use_small_work_grains ? row_parallel_grain(M * topk, K) : 0;
+      at::parallel_for(0, M * topk, skip_zero_grain, [&](int64_t begin, int64_t end) {
         fill_stub(intermediate_cache2 + begin * K, (scalar_t)0, (end - begin) * K);
       });
     }

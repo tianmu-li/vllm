@@ -65,11 +65,11 @@ void fused_experts_fp_kernel_impl(
 
   int64_t B_tmp_size_per_thread = MAX_CACHE_BLOCK_SIZE * BLOCK_N * std::max(K, N);
 
-  // here we only parallel on half of 2N to fuse silu_and_mul with gemm
+  // Stage 1 computes the packed gate/up projection.
   parallel_2d(MB, NB, [&](int64_t mb0, int64_t mb1, int64_t nb0, int64_t nb1) {
     // get local pointers
     int tid = get_thread_num();
-    scalar_t* __restrict__ A = A_tmp + tid * BLOCK_M * K;
+    scalar_t* __restrict__ A_buffer = A_tmp + tid * BLOCK_M * K;
 
     loop_2d<packed_t>(mb0, mb1, nb0, nb1, BLOCK_N * K, [&](int64_t mb, int64_t nb, int64_t nb_offset) {
       int64_t n_size = std::min(2 * N - nb * BLOCK_N, BLOCK_N);
@@ -86,13 +86,16 @@ void fused_experts_fp_kernel_impl(
       bool do_unpack = (mb == mb0) || (expert_id != pre_expert_id);
 
       int64_t m_size = offsets[mb + 1] - offsets[mb];
-
-      if (nb_offset == 0) {
+      const int32_t* A_ids = sorted_ids + mb * BLOCK_M;
+      const scalar_t* __restrict__ A = A_buffer;
+      if (m_size == 1) {
+        int32_t index = A_ids[0] / topk;
+        A = input + index * K;
+      } else if (nb_offset == 0) {
         // 1.a load A
-        const int32_t* A_ids = sorted_ids + mb * BLOCK_M;
         for (int64_t m = 0; m < m_size; ++m) {
           int32_t index = A_ids[m] / topk;
-          copy_stub(A + m * K, input + index * K, K);
+          copy_stub(A_buffer + m * K, input + index * K, K);
         }
       }
 
@@ -120,7 +123,6 @@ void fused_experts_fp_kernel_impl(
       at::native::cpublas::brgemm_release();
     }
   });
-
   // stage 1.5: intermediate_cache1 = silu(intermediate_cache0)
   if (act_func == CPUAcTMethod::silu_and_mul) {
     at::parallel_for(0, M * topk, 0, [&](int64_t begin, int64_t end) {
