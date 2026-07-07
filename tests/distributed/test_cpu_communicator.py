@@ -645,6 +645,72 @@ def _uniform_sizes_shm_worker(
         _report_worker_failure(rank, err_q, err)
 
 
+def _batched_all_gatherv_worker(
+    rank,
+    world_size,
+    tp_size,
+    dp_size,
+    port,
+    dp_port,
+    size_patterns,
+    err_q,
+):
+    try:
+        os.environ.setdefault("VLLM_DIST_IDENT", f"test_cpu_dp_batched_gatherv_{port}")
+        _init_tp_dp_environment(rank, tp_size, dp_size, port, dp_port)
+
+        dp_group, communicator = _get_dp_shm_communicator()
+
+        def _unexpected_all_gather_into_tensor(*args, **kwargs):
+            raise AssertionError("batched list all_gatherv used per-tensor gather")
+
+        communicator.dist_module.all_gather_into_tensor = (  # type: ignore[method-assign]
+            _unexpected_all_gather_into_tensor
+        )
+
+        for sizes in size_patterns:
+            rows = sizes[rank]
+            hidden = (
+                torch.arange(rows * HIDDEN_SIZE, dtype=torch.float32)
+                .reshape(rows, HIDDEN_SIZE)
+                .to(torch.bfloat16)
+                + rank * 100
+            )
+            router = _filled(rows, NUM_EXPERTS, float((rank + 1) * 10))
+            ids = torch.full((rows, TOPK), rank, dtype=torch.long)
+
+            result = dp_group.all_gatherv([hidden, router, ids], sizes=sizes)
+            repeated = dp_group.all_gatherv([hidden, router, ids], sizes=sizes)
+
+            hidden_chunks = [
+                (
+                    torch.arange(size * HIDDEN_SIZE, dtype=torch.float32)
+                    .reshape(size, HIDDEN_SIZE)
+                    .to(torch.bfloat16)
+                    + src_rank * 100
+                )
+                for src_rank, size in enumerate(sizes)
+            ]
+            expected_hidden = torch.cat(hidden_chunks, dim=0)
+            expected_router = torch.cat(
+                [
+                    _filled(size, NUM_EXPERTS, float((src_rank + 1) * 10))
+                    for src_rank, size in enumerate(sizes)
+                ],
+                dim=0,
+            )
+            expected_ids = _concat_rank_ids(sizes)
+
+            for gathered in (result, repeated):
+                torch.testing.assert_close(gathered[0], expected_hidden)
+                torch.testing.assert_close(gathered[1], expected_router)
+                torch.testing.assert_close(gathered[2], expected_ids)
+
+        dist.barrier()
+    except Exception as err:
+        _report_worker_failure(rank, err_q, err)
+
+
 def _all_zero_gatherv_worker(
     rank,
     world_size,
@@ -1052,6 +1118,26 @@ def test_cpu_dp_all_gatherv_uniform_sizes_matches_direct_shm_gather():
         tp_size=1,
         dp_size=2,
         params=[2, 2],
+    )
+
+
+@pytest.mark.distributed
+@pytest.mark.skipif(not HAS_CPU_SHM, reason="CPU SHM communicator required")
+@pytest.mark.parametrize(
+    ("dp_size", "size_patterns"),
+    [
+        (2, [[2, 1], [2, 0], [0, 0]]),
+        (3, [[1, 0, 2], [0, 1, 0], [0, 0, 0]]),
+    ],
+    ids=["dp2", "dp3"],
+)
+def test_cpu_dp_all_gatherv_batched_list_fastpath(dp_size, size_patterns):
+    _spawn_workers(
+        _batched_all_gatherv_worker,
+        world_size=dp_size,
+        tp_size=1,
+        dp_size=dp_size,
+        params=size_patterns,
     )
 
 

@@ -843,6 +843,170 @@ struct TensorListMeta {
   int8_t _padding[40];
 };
 
+struct AllGathervTensorListMeta {
+  int64_t tensor_num;
+  int64_t rank_size;
+  int64_t total_rows;
+  int64_t max_rows;
+  int64_t padded_bytes_per_rank;
+  int64_t row_bytes[MAX_P2P_SEND_TENSOR_NUM];
+  int64_t padded_offsets[MAX_P2P_SEND_TENSOR_NUM];
+  void* input_ptrs[MAX_P2P_SEND_TENSOR_NUM];
+  void* output_ptrs[MAX_P2P_SEND_TENSOR_NUM];
+
+  AllGathervTensorListMeta(const std::vector<torch::Tensor>& inputs,
+                           const std::vector<torch::Tensor>& outputs,
+                           const std::vector<int64_t>& sizes, int rank)
+      : tensor_num(inputs.size()),
+        rank_size(sizes[rank]),
+        total_rows(0),
+        max_rows(0),
+        padded_bytes_per_rank(0) {
+    TORCH_CHECK_GT(tensor_num, 0);
+    TORCH_CHECK_LE(tensor_num, MAX_P2P_SEND_TENSOR_NUM);
+    TORCH_CHECK_EQ(outputs.size(), tensor_num);
+
+    for (int64_t size : sizes) {
+      TORCH_CHECK_GE(size, 0);
+      total_rows += size;
+      max_rows = std::max(max_rows, size);
+    }
+
+    for (int i = 0; i < tensor_num; ++i) {
+      const torch::Tensor& input = inputs[i];
+      const torch::Tensor& output = outputs[i];
+      TORCH_CHECK(input.device().is_cpu());
+      TORCH_CHECK(output.device().is_cpu());
+      TORCH_CHECK(input.is_contiguous());
+      TORCH_CHECK(output.is_contiguous());
+      TORCH_CHECK_EQ(input.scalar_type(), output.scalar_type());
+      TORCH_CHECK_GE(input.dim(), 1);
+      TORCH_CHECK_GE(output.dim(), 1);
+      TORCH_CHECK_EQ(input.size(0), rank_size);
+      TORCH_CHECK_EQ(output.size(0), total_rows);
+      TORCH_CHECK_EQ(input.dim(), output.dim());
+
+      int64_t trailing_elems = 1;
+      for (int dim = 1; dim < input.dim(); ++dim) {
+        TORCH_CHECK_EQ(input.size(dim), output.size(dim));
+        trailing_elems *= input.size(dim);
+      }
+
+      row_bytes[i] = trailing_elems * torch::elementSize(input.scalar_type());
+      padded_offsets[i] = padded_bytes_per_rank;
+      padded_bytes_per_rank += max_rows * row_bytes[i];
+      input_ptrs[i] = input.data_ptr();
+      output_ptrs[i] = output.data_ptr();
+    }
+  }
+
+  MemPiece get_input_data(int64_t offset) const {
+    return get_data(input_ptrs, rank_size, 0, offset);
+  }
+
+  MemPiece get_output_data(int64_t src_rank_size, int64_t src_row_start,
+                           int64_t offset) const {
+    return get_data(output_ptrs, src_rank_size, src_row_start, offset);
+  }
+
+ private:
+  MemPiece get_data(void* const* ptrs, int64_t live_rows, int64_t row_start,
+                    int64_t offset) const {
+    for (int i = 0; i < tensor_num; ++i) {
+      const int64_t tensor_offset = padded_offsets[i];
+      const int64_t live_bytes = live_rows * row_bytes[i];
+      const int64_t padded_bytes = max_rows * row_bytes[i];
+      if (offset < tensor_offset) {
+        return {nullptr, tensor_offset - offset};
+      }
+      if (offset < tensor_offset + live_bytes) {
+        const int64_t row_offset = offset - tensor_offset;
+        return {reinterpret_cast<int8_t*>(ptrs[i]) + row_start * row_bytes[i] +
+                    row_offset,
+                live_bytes - row_offset};
+      }
+      if (offset < tensor_offset + padded_bytes) {
+        return {nullptr, tensor_offset + padded_bytes - offset};
+      }
+    }
+    return {nullptr, padded_bytes_per_rank - offset};
+  }
+};
+
+void shm_all_gatherv_impl(ThreadSHMContext* ctx,
+                          const std::vector<torch::Tensor>& inputs,
+                          const std::vector<torch::Tensor>& outputs,
+                          const std::vector<int64_t>& sizes) {
+  CPU_KERNEL_GUARD_IN(shm_all_gatherv_impl)
+  const int worldsize = ctx->group_size;
+  TORCH_CHECK_EQ(sizes.size(), worldsize);
+
+  AllGathervTensorListMeta metadata(inputs, outputs, sizes, ctx->rank);
+  if (metadata.padded_bytes_per_rank == 0) {
+    return;
+  }
+
+  int64_t row_starts[MAX_SHM_RANK_NUM] = {0};
+  for (int rank = 1; rank < worldsize; ++rank) {
+    row_starts[rank] = row_starts[rank - 1] + sizes[rank - 1];
+  }
+
+  shm_cc_ops::shm_cc_loop<int8_t>(
+      ctx, metadata.padded_bytes_per_rank,
+      [&](ThreadSHMContext* thread_ctx, int64_t data_offset,
+          int64_t data_elem_num, bool fast_mode) {
+        int rank = thread_ctx->rank;
+        int8_t* thread_shm_ptr = thread_ctx->get_thread_shm_ptr<int8_t>(rank);
+
+        if (!fast_mode) {
+          thread_ctx->wait_for_all(ThreadSHMContext::check_no_buffer_conflict);
+        }
+
+        int64_t curr_offset = 0;
+        while (curr_offset < data_elem_num) {
+          MemPiece frag = metadata.get_input_data(data_offset + curr_offset);
+          frag.size = std::min(frag.size, data_elem_num - curr_offset);
+          if (frag.ptr != nullptr) {
+            shm_cc_ops::memcpy(thread_shm_ptr + curr_offset, frag.ptr,
+                               frag.size);
+          }
+          curr_offset += frag.size;
+        }
+        thread_ctx->commit_ready_stamp();
+
+        for (int i = 0; i < worldsize; ++i) {
+          int src_rank = thread_ctx->get_swizzled_rank(i);
+          const bool local_src = src_rank == rank;
+          if (!local_src) {
+            thread_ctx->wait_for_one(src_rank,
+                                     ThreadSHMContext::check_stamp_ready);
+          }
+
+          curr_offset = 0;
+          while (curr_offset < data_elem_num) {
+            const int64_t global_offset = data_offset + curr_offset;
+            MemPiece dst = metadata.get_output_data(
+                sizes[src_rank], row_starts[src_rank], global_offset);
+            dst.size = std::min(dst.size, data_elem_num - curr_offset);
+            if (dst.ptr != nullptr) {
+              if (local_src) {
+                MemPiece src = metadata.get_input_data(global_offset);
+                TORCH_CHECK(src.ptr != nullptr);
+                shm_cc_ops::memcpy(dst.ptr, src.ptr, dst.size);
+              } else {
+                shm_cc_ops::memcpy(
+                    dst.ptr,
+                    thread_ctx->get_thread_shm_ptr<int8_t>(src_rank) +
+                        curr_offset,
+                    dst.size);
+              }
+            }
+            curr_offset += dst.size;
+          }
+        }
+      });
+}
+
 void shm_send_tensor_list_impl(ThreadSHMContext* ctx, int64_t dst,
                                const std::vector<torch::Tensor>& tensor_list) {
   CPU_KERNEL_GUARD_IN(shm_send_tensor_list_impl)
@@ -983,6 +1147,16 @@ void shm_all_gather(int64_t handle, const torch::Tensor& data,
                         output_ptrs, ctx->rank);
         CPU_KERNEL_GUARD_OUT(shm_all_gather_impl)
       });
+}
+
+void shm_all_gatherv(int64_t handle, const std::vector<torch::Tensor>& inputs,
+                     const std::vector<torch::Tensor>& outputs,
+                     const std::vector<int64_t>& sizes) {
+  CPU_KERNEL_GUARD_IN(shm_all_gatherv)
+  shm_all_gatherv_impl(
+      SHMManager::get_singleton_instance(handle)->get_shm_ctx(), inputs,
+      outputs, sizes);
+  CPU_KERNEL_GUARD_OUT(shm_all_gatherv)
 }
 
 void shm_allreduce(int64_t handle, torch::Tensor& data) {

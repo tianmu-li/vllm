@@ -332,6 +332,35 @@ class CpuCommunicator(DeviceCommunicatorBase):
                 )
                 return torch.cat(recv_list, dim=0)
 
+    def _gather_list_shm_gatherv(
+        self,
+        tensors: list[torch.Tensor],
+        sizes: list[int],
+    ) -> list[torch.Tensor]:
+        total_rows = sum(sizes)
+        if not any(sizes):
+            return [t.new_empty((0,) + t.shape[1:]) for t in tensors]
+
+        for tensor in tensors:
+            assert tensor.shape[0] == sizes[self.rank_in_group], (
+                f"{tensor.shape[0]} != {sizes[self.rank_in_group]}"
+            )
+
+        outputs = [
+            torch.empty(
+                (total_rows,) + tensor.shape[1:],
+                dtype=tensor.dtype,
+                device=tensor.device,
+            )
+            for tensor in tensors
+        ]
+        self.dist_module.all_gatherv(
+            [tensor.contiguous() for tensor in tensors],
+            outputs,
+            sizes,
+        )
+        return outputs
+
     def all_gatherv(
         self,
         input_: torch.Tensor | list[torch.Tensor],
@@ -347,6 +376,12 @@ class CpuCommunicator(DeviceCommunicatorBase):
 
         if isinstance(input_, torch.Tensor):
             return self._gather_single_gatherv(input_, sizes)
+        if (
+            sizes is not None
+            and len(input_) > 0
+            and isinstance(self.dist_module, _CPUSHMDistributed)
+        ):
+            return self._gather_list_shm_gatherv(input_, sizes)
         return [self._gather_single_gatherv(t, sizes) for t in input_]
 
     def reduce_scatterv(
@@ -751,6 +786,14 @@ class _CPUSHMDistributed:
         group: ProcessGroup | None = None,
     ) -> None:
         torch.ops._C.shm_all_gather(self.handle, input, output)
+
+    def all_gatherv(
+        self,
+        inputs: list[torch.Tensor],
+        outputs: list[torch.Tensor],
+        sizes: list[int],
+    ) -> None:
+        torch.ops._C.shm_all_gatherv(self.handle, inputs, outputs, sizes)
 
     def reduce_scatterv(
         self,
