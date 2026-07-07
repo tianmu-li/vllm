@@ -911,6 +911,59 @@ def _dp_shm_all_reduce_worker(
         _report_worker_failure(rank, err_q, err)
 
 
+def _dp_shm_reduce_scatterv_worker(
+    rank,
+    world_size,
+    tp_size,
+    dp_size,
+    port,
+    dp_port,
+    cases,
+    err_q,
+):
+    """Confirm DP SHM reduce_scatterv matches all-reduce plus local slice."""
+    try:
+        os.environ.setdefault(
+            "VLLM_DIST_IDENT", f"test_cpu_dp_shm_reduce_scatterv_{port}"
+        )
+        _init_tp_dp_environment(rank, tp_size, dp_size, port, dp_port)
+
+        dp_group, _ = _get_dp_shm_communicator()
+
+        for sizes, explicit_sizes, dim in cases:
+            total_rows = sum(sizes)
+            if dim == 0:
+                tensor = torch.arange(
+                    total_rows * HIDDEN_SIZE,
+                    dtype=torch.float32,
+                ).reshape(total_rows, HIDDEN_SIZE)
+            else:
+                tensor = torch.arange(
+                    HIDDEN_SIZE * total_rows,
+                    dtype=torch.float32,
+                ).reshape(HIDDEN_SIZE, total_rows)
+            tensor = tensor + float((rank + 1) * 1000)
+
+            ref = tensor.clone()
+            if ref.numel():
+                dist.all_reduce(ref, group=dp_group.cpu_group)
+
+            start = sum(sizes[:rank])
+            expected = ref.narrow(dim, start, sizes[rank]).contiguous()
+            scatter_sizes = sizes if explicit_sizes else None
+            result = dp_group.reduce_scatterv(
+                tensor.clone(),
+                dim=dim,
+                sizes=scatter_sizes,
+            )
+
+            torch.testing.assert_close(result, expected)
+
+        dist.barrier()
+    except Exception as err:
+        _report_worker_failure(rank, err_q, err)
+
+
 @pytest.mark.distributed
 @pytest.mark.parametrize("sizes", [[2, 1], [0, 3]], ids=["ragged", "zero-rank"])
 def test_cpu_ep_dispatch_combine_ragged(sizes):
@@ -1045,4 +1098,21 @@ def test_cpu_tp_shm_all_reduce_matches_gloo_without_fallback():
         tp_size=2,
         dp_size=3,
         params=None,
+    )
+
+
+@pytest.mark.distributed
+@pytest.mark.skipif(not HAS_CPU_SHM, reason="CPU SHM communicator required")
+def test_cpu_dp_shm_reduce_scatterv_matches_all_reduce_slice():
+    _spawn_workers(
+        _dp_shm_reduce_scatterv_worker,
+        world_size=6,
+        tp_size=1,
+        dp_size=6,
+        params=[
+            ([2, 0, 3, 1, 4, 0], True, 0),
+            ([2, 2, 2, 2, 2, 2], False, 0),
+            ([0, 0, 0, 0, 0, 0], True, 0),
+            ([1, 0, 2, 1, 0, 3], True, 1),
+        ],
     )

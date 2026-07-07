@@ -543,6 +543,85 @@ void all_reduce_sum_impl(ThreadSHMContext* ctx, scalar_t* data,
 
   return;
 }
+
+template <typename scalar_t>
+void reduce_scatterv_sum_impl(ThreadSHMContext* ctx, scalar_t* input,
+                              scalar_t* output,
+                              const std::vector<int64_t>& sizes,
+                              int64_t row_elem_num) {
+  CPU_KERNEL_GUARD_IN(reduce_scatterv_sum_impl)
+  using vec_t = typename KernelVecType<scalar_t>::scalar_vec_t;
+  constexpr int64_t vec_elem_num = vec_t::get_elem_num();
+  const int worldsize = ctx->group_size;
+
+  int64_t row_start = 0;
+  for (int dst = 0; dst < worldsize; ++dst) {
+    const int64_t dst_rows = sizes[dst];
+    const int64_t dst_start_elem = row_start * row_elem_num;
+    const int64_t dst_elem_num = dst_rows * row_elem_num;
+    row_start += dst_rows;
+    if (dst_elem_num == 0) {
+      continue;
+    }
+
+    shm_cc_ops::shm_cc_loop<scalar_t>(
+        ctx, dst_elem_num,
+        [&](ThreadSHMContext* thread_ctx, int64_t data_offset,
+            int64_t data_elem_num, bool) {
+          int rank = thread_ctx->rank;
+          scalar_t* thread_shm_ptr =
+              thread_ctx->get_thread_shm_ptr<scalar_t>(rank);
+          scalar_t* thread_input_ptr = input + dst_start_elem + data_offset;
+          int64_t thread_data_bytes = data_elem_num * sizeof(scalar_t);
+
+          // This collective runs one destination slice per phase. Even when a
+          // single phase fits in the fast buffer, later phases can reuse the
+          // same half-buffer before the destination rank has consumed it.
+          thread_ctx->wait_for_all(ThreadSHMContext::check_no_buffer_conflict);
+
+          shm_cc_ops::memcpy_to_shm(thread_shm_ptr, thread_input_ptr,
+                                    thread_data_bytes);
+          thread_ctx->commit_ready_stamp();
+
+          if (rank != dst) {
+            return;
+          }
+
+          scalar_t* thread_output_ptr = output + data_offset;
+          thread_ctx->wait_for_all(ThreadSHMContext::check_stamp_ready);
+
+          int64_t aligned_data_elem_num =
+              (data_elem_num / vec_elem_num) * vec_elem_num;
+          int64_t i = 0;
+#pragma GCC unroll 4
+          for (; i < aligned_data_elem_num; i += vec_elem_num) {
+            vec_t local_data(thread_input_ptr + i);
+            vec_op::FP32Vec16 reduced_data(local_data);
+            for (int idx = 1; idx < worldsize; ++idx) {
+              int src_rank = thread_ctx->get_swizzled_rank(idx);
+              vec_t remote_data(
+                  true, thread_ctx->get_thread_shm_ptr<scalar_t>(src_rank) + i);
+              vec_op::FP32Vec16 remote_data_fp32(remote_data);
+              reduced_data = reduced_data + remote_data_fp32;
+            }
+            vec_t reduced_vec(reduced_data);
+            reduced_vec.save(thread_output_ptr + i);
+          }
+
+          for (; i < data_elem_num; ++i) {
+            float reduced_data = static_cast<float>(thread_input_ptr[i]);
+            for (int idx = 1; idx < worldsize; ++idx) {
+              int src_rank = thread_ctx->get_swizzled_rank(idx);
+              reduced_data += static_cast<float>(
+                  thread_ctx->get_thread_shm_ptr<scalar_t>(src_rank)[i]);
+            }
+            thread_output_ptr[i] = static_cast<scalar_t>(reduced_data);
+          }
+        });
+  }
+
+  return;
+}
 };  // namespace shm_cc_ops
 
 std::vector<std::unique_ptr<SHMManager>> SHMManager::SingletonInstances = {};
@@ -570,6 +649,17 @@ void shm_allreduce_sum(ThreadSHMContext* ctx, scalar_t* data, size_t elem_num) {
       TORCH_CHECK(false,
                   "Invalid world size: " + std::to_string(ctx->group_size));
   }
+}
+
+template <typename scalar_t>
+void shm_reduce_scatterv_sum(ThreadSHMContext* ctx, scalar_t* input,
+                             scalar_t* output,
+                             const std::vector<int64_t>& sizes,
+                             int64_t row_elem_num) {
+  TORCH_CHECK_LE(ctx->group_size, MAX_SHM_RANK_NUM);
+  TORCH_CHECK_EQ(sizes.size(), ctx->group_size);
+  shm_cc_ops::reduce_scatterv_sum_impl<scalar_t>(ctx, input, output, sizes,
+                                                 row_elem_num);
 }
 
 template <typename scalar_t>
@@ -842,6 +932,47 @@ void shm_allreduce(int64_t handle, torch::Tensor& data) {
                       data.data_ptr<scalar_t>(), data.numel());
     CPU_KERNEL_GUARD_OUT(shm_allreduce_sum)
   });
+}
+
+void shm_reduce_scatterv(int64_t handle, const torch::Tensor& input,
+                         torch::Tensor& output,
+                         const std::vector<int64_t>& sizes) {
+  TORCH_CHECK(input.is_contiguous());
+  TORCH_CHECK(output.is_contiguous());
+  TORCH_CHECK_EQ(input.scalar_type(), output.scalar_type());
+
+  auto ctx = SHMManager::get_singleton_instance(handle)->get_shm_ctx();
+  TORCH_CHECK_EQ(sizes.size(), ctx->group_size);
+  TORCH_CHECK_LT(ctx->rank, sizes.size());
+
+  int64_t total_rows = 0;
+  for (int64_t size : sizes) {
+    TORCH_CHECK_GE(size, 0);
+    total_rows += size;
+  }
+
+  TORCH_CHECK(input.dim() >= 1);
+  TORCH_CHECK(output.dim() >= 1);
+  TORCH_CHECK_EQ(input.size(0), total_rows);
+
+  if (total_rows == 0) {
+    TORCH_CHECK_EQ(input.numel(), 0);
+    TORCH_CHECK_EQ(output.numel(), 0);
+    return;
+  }
+
+  TORCH_CHECK_EQ(input.numel() % total_rows, 0);
+  int64_t row_elem_num = input.numel() / total_rows;
+  TORCH_CHECK_EQ(output.numel(), sizes[ctx->rank] * row_elem_num);
+
+  VLLM_DISPATCH_FLOATING_TYPES(
+      input.scalar_type(), "shm_reduce_scatterv_sum", [&] {
+        CPU_KERNEL_GUARD_IN(shm_reduce_scatterv_sum)
+        shm_reduce_scatterv_sum(ctx, input.data_ptr<scalar_t>(),
+                                output.data_ptr<scalar_t>(), sizes,
+                                row_elem_num);
+        CPU_KERNEL_GUARD_OUT(shm_reduce_scatterv_sum)
+      });
 }
 
 void shm_send_tensor_list(int64_t handle,

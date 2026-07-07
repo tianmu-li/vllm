@@ -355,7 +355,10 @@ class CpuCommunicator(DeviceCommunicatorBase):
         dim: int = 0,
         sizes: list[int] | None = None,
     ) -> torch.Tensor:
-        """Reduce-scatter with variable output sizes via all_reduce + local slice."""
+        """Reduce-scatter with variable output sizes."""
+        assert -input_.dim() <= dim < input_.dim(), (
+            f"Invalid dim ({dim}) for input tensor with shape {input_.size()}"
+        )
         if dim < 0:
             dim += input_.dim()
 
@@ -371,19 +374,29 @@ class CpuCommunicator(DeviceCommunicatorBase):
                 f"{self.world_size}."
             )
 
-        out = input_.contiguous().clone()
-
-        self.dist_module.all_reduce(out, group=self.device_group)
+        input_tensor = input_.movedim(dim, 0).contiguous()
 
         if sizes is not None:
+            chunk = sizes[self.rank_in_group]
             start = sum(sizes[: self.rank_in_group])
-            end = start + sizes[self.rank_in_group]
         else:
-            chunk = out.shape[dim] // self.world_size
+            chunk = input_tensor.shape[0] // self.world_size
+            sizes = [chunk] * self.world_size
             start = self.rank_in_group * chunk
-            end = start + chunk
 
-        return out.narrow(dim, start, end - start).contiguous()
+        if isinstance(self.dist_module, _CPUSHMDistributed):
+            output = torch.empty(
+                (chunk,) + input_tensor.shape[1:],
+                dtype=input_tensor.dtype,
+                device=input_tensor.device,
+            )
+            self.dist_module.reduce_scatterv(input_tensor, output, sizes)
+        else:
+            output = input_tensor.clone()
+            self.dist_module.all_reduce(output, group=self.device_group)
+            output = output.narrow(0, start, chunk).contiguous()
+
+        return output.movedim(0, dim).contiguous()
 
     def send_tensor_dict(
         self,
@@ -738,6 +751,14 @@ class _CPUSHMDistributed:
         group: ProcessGroup | None = None,
     ) -> None:
         torch.ops._C.shm_all_gather(self.handle, input, output)
+
+    def reduce_scatterv(
+        self,
+        input: torch.Tensor,
+        output: torch.Tensor,
+        sizes: list[int],
+    ) -> None:
+        torch.ops._C.shm_reduce_scatterv(self.handle, input, output, sizes)
 
     def send_tensor_dict(
         self,
