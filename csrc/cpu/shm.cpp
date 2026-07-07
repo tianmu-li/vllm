@@ -5,6 +5,8 @@
 #include <sys/stat.h>
 #include <unistd.h>
 
+#include <cstdint>
+
 #if defined(__aarch64__) || defined(__powerpc64__)
   #include <atomic>
 #endif
@@ -456,10 +458,14 @@ void memcpy_from_shm(void* dst, void* src, const int64_t bytes) {
 }
 
 void memcpy_to_shm(void* dst, void* src, const int64_t bytes) {
+  const int64_t aligned_bytes = ((bytes >> 6) << 6);  // 64 bytes aligned
 #pragma GCC unroll 4
-  for (int64_t i = 0; i < bytes; i += 64) {
+  for (int64_t i = 0; i < aligned_bytes; i += 64) {
     vec_op::INT8Vec64 data((int8_t*)src + i);
     data.nt_save((int8_t*)dst + i);
+  }
+  for (int64_t i = aligned_bytes; i < bytes; ++i) {
+    reinterpret_cast<int8_t*>(dst)[i] = reinterpret_cast<int8_t*>(src)[i];
   }
 }
 
@@ -544,7 +550,7 @@ void all_reduce_sum_impl(ThreadSHMContext* ctx, scalar_t* data,
   return;
 }
 
-template <typename scalar_t>
+template <typename scalar_t, int RANKS>
 void reduce_scatterv_sum_impl(ThreadSHMContext* ctx, scalar_t* input,
                               scalar_t* output,
                               const std::vector<int64_t>& sizes,
@@ -553,72 +559,104 @@ void reduce_scatterv_sum_impl(ThreadSHMContext* ctx, scalar_t* input,
   using vec_t = typename KernelVecType<scalar_t>::scalar_vec_t;
   constexpr int64_t vec_elem_num = vec_t::get_elem_num();
   const int worldsize = ctx->group_size;
+  TORCH_CHECK_EQ(worldsize, RANKS);
 
-  int64_t row_start = 0;
+  int64_t total_rows = 0;
+  int64_t rank_row_start = 0;
   for (int dst = 0; dst < worldsize; ++dst) {
-    const int64_t dst_rows = sizes[dst];
-    const int64_t dst_start_elem = row_start * row_elem_num;
-    const int64_t dst_elem_num = dst_rows * row_elem_num;
-    row_start += dst_rows;
-    if (dst_elem_num == 0) {
-      continue;
+    if (dst < ctx->rank) {
+      rank_row_start += sizes[dst];
     }
+    total_rows += sizes[dst];
+  }
 
-    shm_cc_ops::shm_cc_loop<scalar_t>(
-        ctx, dst_elem_num,
-        [&](ThreadSHMContext* thread_ctx, int64_t data_offset,
-            int64_t data_elem_num, bool) {
-          int rank = thread_ctx->rank;
-          scalar_t* thread_shm_ptr =
-              thread_ctx->get_thread_shm_ptr<scalar_t>(rank);
-          scalar_t* thread_input_ptr = input + dst_start_elem + data_offset;
-          int64_t thread_data_bytes = data_elem_num * sizeof(scalar_t);
+  const int64_t total_elem_num = total_rows * row_elem_num;
+  const int64_t rank_start_elem = rank_row_start * row_elem_num;
+  const int64_t rank_elem_num = sizes[ctx->rank] * row_elem_num;
+  const int64_t rank_end_elem = rank_start_elem + rank_elem_num;
 
-          // This collective runs one destination slice per phase. Even when a
-          // single phase fits in the fast buffer, later phases can reuse the
-          // same half-buffer before the destination rank has consumed it.
-          thread_ctx->wait_for_all(ThreadSHMContext::check_no_buffer_conflict);
+  shm_cc_ops::shm_cc_loop<scalar_t>(
+      ctx, total_elem_num,
+      [&](ThreadSHMContext* thread_ctx, int64_t data_offset,
+          int64_t data_elem_num, bool) {
+        int rank = thread_ctx->rank;
+        scalar_t* thread_shm_ptr =
+            thread_ctx->get_thread_shm_ptr<scalar_t>(rank);
 
-          shm_cc_ops::memcpy_to_shm(thread_shm_ptr, thread_input_ptr,
-                                    thread_data_bytes);
-          thread_ctx->commit_ready_stamp();
+        thread_ctx->wait_for_all(ThreadSHMContext::check_no_buffer_conflict);
 
-          if (rank != dst) {
+        const int64_t data_end = data_offset + data_elem_num;
+        const int64_t local_overlap_start =
+            std::max(data_offset, rank_start_elem);
+        const int64_t local_overlap_end = std::min(data_end, rank_end_elem);
+        auto publish_range = [&](int64_t begin, int64_t end) {
+          if (begin >= end) {
             return;
           }
-
-          scalar_t* thread_output_ptr = output + data_offset;
-          thread_ctx->wait_for_all(ThreadSHMContext::check_stamp_ready);
-
-          int64_t aligned_data_elem_num =
-              (data_elem_num / vec_elem_num) * vec_elem_num;
-          int64_t i = 0;
-#pragma GCC unroll 4
-          for (; i < aligned_data_elem_num; i += vec_elem_num) {
-            vec_t local_data(thread_input_ptr + i);
-            vec_op::FP32Vec16 reduced_data(local_data);
-            for (int idx = 1; idx < worldsize; ++idx) {
-              int src_rank = thread_ctx->get_swizzled_rank(idx);
-              vec_t remote_data(
-                  true, thread_ctx->get_thread_shm_ptr<scalar_t>(src_rank) + i);
-              vec_op::FP32Vec16 remote_data_fp32(remote_data);
-              reduced_data = reduced_data + remote_data_fp32;
-            }
-            vec_t reduced_vec(reduced_data);
-            reduced_vec.save(thread_output_ptr + i);
+          scalar_t* dst = thread_shm_ptr + (begin - data_offset);
+          scalar_t* src = input + begin;
+          const int64_t bytes = (end - begin) * sizeof(scalar_t);
+          if (RANKS >= 4 && (reinterpret_cast<uintptr_t>(dst) & 63) == 0 &&
+              (reinterpret_cast<uintptr_t>(src) & 63) == 0) {
+            shm_cc_ops::memcpy_to_shm(dst, src, bytes);
+          } else {
+            shm_cc_ops::memcpy(dst, src, bytes);
           }
+        };
 
-          for (; i < data_elem_num; ++i) {
-            float reduced_data = static_cast<float>(thread_input_ptr[i]);
-            for (int idx = 1; idx < worldsize; ++idx) {
-              int src_rank = thread_ctx->get_swizzled_rank(idx);
-              reduced_data += static_cast<float>(
-                  thread_ctx->get_thread_shm_ptr<scalar_t>(src_rank)[i]);
-            }
-            thread_output_ptr[i] = static_cast<scalar_t>(reduced_data);
-          }
+        if (local_overlap_start < local_overlap_end) {
+          publish_range(data_offset, local_overlap_start);
+          publish_range(local_overlap_end, data_end);
+        } else {
+          publish_range(data_offset, data_end);
+        }
+        thread_ctx->commit_ready_stamp();
+
+        const int64_t overlap_start = std::max(data_offset, rank_start_elem);
+        const int64_t overlap_end = std::min(data_end, rank_end_elem);
+        if (overlap_start >= overlap_end) {
+          return;
+        }
+
+        thread_ctx->wait_for_all(ThreadSHMContext::check_stamp_ready);
+
+        const int64_t overlap_offset = overlap_start - data_offset;
+        const int64_t overlap_elem_num = overlap_end - overlap_start;
+        scalar_t* local_input_ptr = input + overlap_start;
+        scalar_t* thread_output_ptr =
+            output + (overlap_start - rank_start_elem);
+
+        scalar_t* remote_data_ptrs[RANKS - 1];
+        vec_op::unroll_loop<int, RANKS - 1>([&](int idx) {
+          remote_data_ptrs[idx] = thread_ctx->get_thread_shm_ptr<scalar_t>(
+                                      thread_ctx->get_swizzled_rank(idx + 1)) +
+                                  overlap_offset;
         });
-  }
+
+        int64_t aligned_data_elem_num =
+            (overlap_elem_num / vec_elem_num) * vec_elem_num;
+        int64_t i = 0;
+#pragma GCC unroll 4
+        for (; i < aligned_data_elem_num; i += vec_elem_num) {
+          vec_t local_data(local_input_ptr + i);
+          vec_op::FP32Vec16 reduced_data(local_data);
+          vec_op::unroll_loop<int, RANKS - 1>([&](int idx) {
+            vec_t remote_data(remote_data_ptrs[idx] + i);
+            vec_op::FP32Vec16 remote_data_fp32(remote_data);
+            reduced_data = reduced_data + remote_data_fp32;
+          });
+          vec_t reduced_vec(reduced_data);
+          reduced_vec.save(thread_output_ptr + i);
+        }
+
+        for (; i < overlap_elem_num; ++i) {
+          float reduced_data = static_cast<float>(local_input_ptr[i]);
+          vec_op::unroll_loop<int, RANKS - 1>([&](int idx) {
+            reduced_data += static_cast<float>(remote_data_ptrs[idx][i]);
+          });
+          thread_output_ptr[i] = static_cast<scalar_t>(reduced_data);
+        }
+      });
 
   return;
 }
@@ -658,8 +696,31 @@ void shm_reduce_scatterv_sum(ThreadSHMContext* ctx, scalar_t* input,
                              int64_t row_elem_num) {
   TORCH_CHECK_LE(ctx->group_size, MAX_SHM_RANK_NUM);
   TORCH_CHECK_EQ(sizes.size(), ctx->group_size);
-  shm_cc_ops::reduce_scatterv_sum_impl<scalar_t>(ctx, input, output, sizes,
-                                                 row_elem_num);
+  switch (ctx->group_size) {
+    case 2:
+      shm_cc_ops::reduce_scatterv_sum_impl<scalar_t, 2>(ctx, input, output,
+                                                        sizes, row_elem_num);
+      break;
+    case 3:
+      shm_cc_ops::reduce_scatterv_sum_impl<scalar_t, 3>(ctx, input, output,
+                                                        sizes, row_elem_num);
+      break;
+    case 4:
+      shm_cc_ops::reduce_scatterv_sum_impl<scalar_t, 4>(ctx, input, output,
+                                                        sizes, row_elem_num);
+      break;
+    case 6:
+      shm_cc_ops::reduce_scatterv_sum_impl<scalar_t, 6>(ctx, input, output,
+                                                        sizes, row_elem_num);
+      break;
+    case 8:
+      shm_cc_ops::reduce_scatterv_sum_impl<scalar_t, 8>(ctx, input, output,
+                                                        sizes, row_elem_num);
+      break;
+    default:
+      TORCH_CHECK(false,
+                  "Invalid world size: " + std::to_string(ctx->group_size));
+  }
 }
 
 template <typename scalar_t>

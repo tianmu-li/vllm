@@ -951,13 +951,13 @@ def _dp_shm_reduce_scatterv_worker(
             start = sum(sizes[:rank])
             expected = ref.narrow(dim, start, sizes[rank]).contiguous()
             scatter_sizes = sizes if explicit_sizes else None
-            result = dp_group.reduce_scatterv(
-                tensor.clone(),
-                dim=dim,
-                sizes=scatter_sizes,
-            )
-
-            torch.testing.assert_close(result, expected)
+            for _ in range(2):
+                result = dp_group.reduce_scatterv(
+                    tensor.clone(),
+                    dim=dim,
+                    sizes=scatter_sizes,
+                )
+                torch.testing.assert_close(result, expected)
 
         dist.barrier()
     except Exception as err:
@@ -1110,6 +1110,7 @@ def test_cpu_dp_shm_reduce_scatterv_matches_all_reduce_slice():
         tp_size=1,
         dp_size=6,
         params=[
+            ([2, 2, 2, 2, 2, 2], True, 0),
             ([2, 0, 3, 1, 4, 0], True, 0),
             ([2, 2, 2, 2, 2, 2], False, 0),
             ([0, 0, 0, 0, 0, 0], True, 0),
