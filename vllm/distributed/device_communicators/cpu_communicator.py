@@ -65,6 +65,8 @@ class CpuCommunicator(DeviceCommunicatorBase):
         self._ragged_shm_gather_buffers: dict[
             tuple[torch.dtype, torch.device, tuple[int, ...]], torch.Tensor
         ] = {}
+        self._cached_non_sp_dp_metadata: object | None = None
+        self._cached_non_sp_dp_sizes: list[int] | None = None
 
         if self.use_all2all:
             if self.all2all_backend not in (
@@ -409,7 +411,10 @@ class CpuCommunicator(DeviceCommunicatorBase):
                 f"{self.world_size}."
             )
 
-        input_tensor = input_.movedim(dim, 0).contiguous()
+        if dim == 0:
+            input_tensor = input_.contiguous()
+        else:
+            input_tensor = input_.movedim(dim, 0).contiguous()
 
         if sizes is not None:
             chunk = sizes[self.rank_in_group]
@@ -431,6 +436,8 @@ class CpuCommunicator(DeviceCommunicatorBase):
             self.dist_module.all_reduce(output, group=self.device_group)
             output = output.narrow(0, start, chunk).contiguous()
 
+        if dim == 0:
+            return output
         return output.movedim(0, dim).contiguous()
 
     def send_tensor_dict(
@@ -469,8 +476,19 @@ class CpuCommunicator(DeviceCommunicatorBase):
             assert dp_metadata is not None
             if dp_metadata.local_sizes is not None:
                 return fn()
-            with dp_metadata.sp_local_sizes(sequence_parallel_size=1):
+
+            if self._cached_non_sp_dp_metadata is not dp_metadata:
+                self._cached_non_sp_dp_metadata = dp_metadata
+                self._cached_non_sp_dp_sizes = [
+                    int(size) for size in dp_metadata.num_tokens_across_dp_cpu.tolist()
+                ]
+
+            assert self._cached_non_sp_dp_sizes is not None
+            dp_metadata.local_sizes = self._cached_non_sp_dp_sizes
+            try:
                 return fn()
+            finally:
+                dp_metadata.local_sizes = None
 
         def _with_sp_sizes(fn):
             dp_metadata = get_forward_context().dp_metadata

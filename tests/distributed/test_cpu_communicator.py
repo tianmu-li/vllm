@@ -496,6 +496,90 @@ def _compile_fastpath_worker(
         _report_worker_failure(rank, err_q, err)
 
 
+def _cached_non_sp_sizes_worker(
+    rank,
+    world_size,
+    tp_size,
+    dp_size,
+    port,
+    dp_port,
+    size_patterns,
+    err_q,
+):
+    try:
+        os.environ.setdefault("VLLM_DIST_IDENT", f"test_cpu_ep_cached_sizes_{port}")
+        _init_tp_dp_environment(rank, tp_size, dp_size, port, dp_port)
+
+        from vllm.distributed.parallel_state import get_ep_group
+        from vllm.forward_context import get_forward_context
+
+        ep_group = get_ep_group()
+        communicator = ep_group.device_communicator
+        assert communicator is not None
+
+        for sizes in size_patterns:
+            local_rows = sizes[rank]
+            hidden = _filled(local_rows, HIDDEN_SIZE, float(rank + 1))
+            router = _filled(local_rows, NUM_EXPERTS, float((rank + 1) * 10))
+            weights = _filled(local_rows, TOPK, float((rank + 1) * 100))
+            ids = torch.full((local_rows, TOPK), rank, dtype=torch.long)
+
+            expected_hidden = _concat_rank_values(sizes, HIDDEN_SIZE, 1.0)
+            expected_router = _concat_rank_values(sizes, NUM_EXPERTS, 10.0)
+            expected_weights = _concat_rank_values(sizes, TOPK, 100.0)
+            expected_ids = _concat_rank_ids(sizes)
+
+            with _make_forward_context(rank, dp_size, local_rows, sizes):
+                dp_metadata = get_forward_context().dp_metadata
+                assert dp_metadata is not None
+                assert dp_metadata.local_sizes is None
+
+                gathered_hidden, gathered_router = communicator._ep_dispatch_rl_op(
+                    hidden.clone(),
+                    router.clone(),
+                )
+                torch.testing.assert_close(gathered_hidden, expected_hidden)
+                torch.testing.assert_close(gathered_router, expected_router)
+                assert communicator._cached_non_sp_dp_metadata is dp_metadata
+                assert communicator._cached_non_sp_dp_sizes == sizes
+                assert dp_metadata.local_sizes is None
+
+                gathered_hidden2, gathered_router2 = ep_group.dispatch_router_logits(
+                    hidden.clone(),
+                    router.clone(),
+                )
+                torch.testing.assert_close(gathered_hidden2, expected_hidden)
+                torch.testing.assert_close(gathered_router2, expected_router)
+
+                gathered_hidden3, gathered_weights, gathered_ids = ep_group.dispatch(
+                    hidden.clone(),
+                    weights.clone(),
+                    ids.clone(),
+                )
+                torch.testing.assert_close(gathered_hidden3, expected_hidden)
+                torch.testing.assert_close(gathered_weights, expected_weights)
+                torch.testing.assert_close(gathered_ids, expected_ids)
+
+                total_rows = sum(sizes)
+                expert_out = torch.arange(total_rows, dtype=torch.float32).unsqueeze(
+                    1
+                ).expand(total_rows, HIDDEN_SIZE).contiguous() + float(
+                    (rank + 1) * 1000
+                )
+                combined = ep_group.combine(expert_out)
+                torch.testing.assert_close(
+                    combined,
+                    _expected_combined(rank, sizes, HIDDEN_SIZE),
+                )
+                assert communicator._cached_non_sp_dp_metadata is dp_metadata
+                assert communicator._cached_non_sp_dp_sizes == sizes
+                assert dp_metadata.local_sizes is None
+
+        dist.barrier()
+    except Exception as err:
+        _report_worker_failure(rank, err_q, err)
+
+
 def _get_dp_shm_communicator():
     from vllm.distributed.device_communicators.cpu_communicator import (
         CpuCommunicator,
@@ -1070,6 +1154,17 @@ def test_cpu_ep_compile_ragged_fastpath(backend):
         dp_size=2,
         params=(backend, [[2, 1], [0, 3]]),
         timeout_s=60 if backend == "inductor" else None,
+    )
+
+
+@pytest.mark.distributed
+def test_cpu_ep_custom_ops_refresh_cached_non_sp_sizes():
+    _spawn_workers(
+        _cached_non_sp_sizes_worker,
+        world_size=2,
+        tp_size=1,
+        dp_size=2,
+        params=[[2, 1], [0, 3]],
     )
 
 
