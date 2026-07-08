@@ -156,9 +156,9 @@ def test_unquant_cpu_fused_moe_skip_padding(seed):
     ("expert_cls", "supports_ep"),
     [
         (CPUExpertsFp8, True),
-        (CPUExpertsMxfp4, False),
-        (CPUExpertsInt4, False),
-        (CPUExpertsInt8, False),
+        (CPUExpertsMxfp4, True),
+        (CPUExpertsInt4, True),
+        (CPUExpertsInt8, True),
     ],
     ids=["fp8", "mxfp4", "int4-w4a16", "int8-w8a8"],
 )
@@ -1634,6 +1634,357 @@ def test_int8_w8a8_cpu_fused_moe_skip_padding(M, N, K, E, topk, seed):
     )
     torch.testing.assert_close(
         out_all_skipped, torch.zeros(M, K, dtype=out_all_skipped.dtype)
+    )
+
+
+def _make_local_skip_topk() -> tuple[torch.Tensor, torch.Tensor]:
+    topk_ids = torch.tensor(
+        [
+            [0, 2, 5],
+            [1, 4, -1],
+            [3, 5, 0],
+            [4, 1, 2],
+            [5, -1, -1],
+        ],
+        dtype=torch.int32,
+    )
+    topk_weight = torch.tensor(
+        [
+            [0.50, 0.30, 0.20],
+            [0.40, 0.60, 0.00],
+            [0.25, 0.35, 0.40],
+            [0.70, 0.20, 0.10],
+            [1.00, 0.00, 0.00],
+        ],
+        dtype=torch.float32,
+    )
+    return topk_weight, topk_ids
+
+
+def _rank0_all_nonlocal_ids(expert_map: torch.Tensor, topk: int) -> torch.Tensor:
+    nonlocal_ids = (expert_map == -1).nonzero(as_tuple=False).flatten()
+    ids = nonlocal_ids[:topk].to(torch.int32)
+    return ids.unsqueeze(0).repeat(2, 1).contiguous()
+
+
+def _assert_all_nonlocal_local_skip_is_zero(
+    a: torch.Tensor,
+    args: tuple,
+    expert_map: torch.Tensor,
+    topk: int,
+    topk_dtype: torch.dtype,
+):
+    from vllm.model_executor.layers.fused_moe.experts.cpu_moe import (
+        fused_experts_cpu_local_skip,
+    )
+
+    all_nonlocal_ids = _rank0_all_nonlocal_ids(expert_map, topk).to(topk_dtype)
+    all_nonlocal_weights = torch.full((2, topk), 1.0 / topk, dtype=torch.float32)
+    out = fused_experts_cpu_local_skip(
+        a[:2].clone(),
+        *args[:2],
+        all_nonlocal_weights,
+        all_nonlocal_ids,
+        expert_map,
+        *args[2:],
+    )
+    torch.testing.assert_close(out, torch.zeros_like(out))
+
+
+def test_gpt_oss_mxfp4_weight_loader_maps_global_experts_under_ep():
+    from vllm.model_executor.layers.fused_moe.routed_experts import RoutedExperts
+
+    class _GptOssMxfp4QuantConfig:
+        def get_name(self):
+            return "gpt_oss_mxfp4"
+
+    class _ExpertMapManager:
+        def __init__(self, expert_map: torch.Tensor):
+            self.expert_map = expert_map
+
+        def get_local_expert_ids(self) -> list[int]:
+            return (self.expert_map != -1).nonzero(as_tuple=False).flatten().tolist()
+
+        def map_global_to_local(self, expert_id: int) -> int:
+            return int(self.expert_map[expert_id].item())
+
+    local_num_experts, expert_map, _ = determine_expert_map(
+        ep_size=3,
+        ep_rank=1,
+        global_num_experts=6,
+    )
+    assert expert_map is not None
+
+    routed_experts = RoutedExperts.__new__(RoutedExperts)
+    routed_experts.quant_config = _GptOssMxfp4QuantConfig()
+    routed_experts.expert_map_manager = _ExpertMapManager(expert_map)
+
+    param = torch.nn.Parameter(torch.zeros(local_num_experts, 4, 3))
+    loaded_full = torch.arange(6 * 2 * 2, dtype=torch.float32).reshape(6, 2, 2)
+
+    assert (
+        routed_experts.weight_loader(
+            param,
+            loaded_full,
+            weight_name="w13_weight",
+            shard_id="w1",
+            expert_id=0,
+            return_success=True,
+        )
+        is True
+    )
+
+    for global_expert_id in routed_experts.expert_map_manager.get_local_expert_ids():
+        local_expert_id = int(expert_map[global_expert_id].item())
+        torch.testing.assert_close(
+            param.data[local_expert_id, :2, :2],
+            loaded_full[global_expert_id],
+        )
+        torch.testing.assert_close(param.data[local_expert_id, 2:], torch.zeros(2, 3))
+
+    before = param.detach().clone()
+    assert (
+        routed_experts.weight_loader(
+            param,
+            torch.ones(2, 2),
+            weight_name="w13_weight",
+            shard_id="w1",
+            expert_id=0,
+            return_success=True,
+        )
+        is False
+    )
+    torch.testing.assert_close(param, before)
+
+    local_global_expert_id = routed_experts.expert_map_manager.get_local_expert_ids()[0]
+    local_expert_id = int(expert_map[local_global_expert_id].item())
+    single_loaded = torch.full((3, 2), 7.0)
+    assert (
+        routed_experts.weight_loader(
+            param,
+            single_loaded,
+            weight_name="w13_weight",
+            shard_id="w1",
+            expert_id=local_global_expert_id,
+            return_success=True,
+        )
+        is True
+    )
+    torch.testing.assert_close(param.data[local_expert_id, :3, :2], single_loaded)
+
+
+@pytest.mark.parametrize("quant_method", ["fp8", "mxfp4", "int4", "int8"])
+@pytest.mark.parametrize("topk_dtype", [torch.int32, torch.int64])
+@pytest.mark.parametrize("seed", [0])
+def test_cpu_quant_fused_moe_local_skip_matches_full_fused(
+    quant_method,
+    topk_dtype,
+    seed,
+):
+    """Native local-skip matches full fused MoE across CPU quant modes."""
+    if not hasattr(torch.ops._C, "fused_experts_cpu_local_skip"):
+        pytest.skip("fused_experts_cpu_local_skip op not available")
+
+    from vllm.model_executor.layers.fused_moe.experts.cpu_moe import (
+        fused_experts_cpu_local_skip,
+    )
+
+    set_random_seed(seed)
+    M, N, K, E, topk, num_ranks = 5, 128, 128, 6, 3, 3
+    a = torch.randn(M, K, dtype=torch.bfloat16) / math.sqrt(K)
+    topk_weight, topk_ids = _make_local_skip_topk()
+
+    if quant_method == "fp8":
+        w1, w2, w1_s, w2_s = _make_fp8_moe_weights(E, N, K, BLOCK_SIZE)
+        ref = _run_fp8_cpu_fused_moe(
+            a,
+            _prepack_experts(w1),
+            _prepack_experts(w2),
+            topk_weight,
+            topk_ids,
+            w1_s,
+            w2_s,
+        )
+
+        def rank_args(local_experts):
+            return (
+                _prepack_experts(w1[local_experts].contiguous()),
+                _prepack_experts(w2[local_experts].contiguous()),
+                ops.CPUQuantMethod.FP8_W8A16,
+                w1_s[local_experts].contiguous(),
+                w2_s[local_experts].contiguous(),
+                None,
+                None,
+                BLOCK_SIZE,
+                None,
+                None,
+                None,
+                None,
+                True,
+            )
+
+        atol = rtol = 1e-2
+    elif quant_method == "mxfp4":
+        dtype = torch.bfloat16
+        w1_bf16 = torch.randn(E, 2 * N, K, dtype=dtype) / 10
+        w1q, w1s = MXFP4QuantizeUtil.quantize(w1_bf16)
+        w1s = w1s.reshape(E, 2 * N, K // 32)
+        w2_bf16 = torch.randn(E, K, N, dtype=dtype) / 10
+        w2q, w2s = MXFP4QuantizeUtil.quantize(w2_bf16)
+        w2s = w2s.reshape(E, K, N // 32)
+        pw1, pw1s = _prepack_mxfp4_experts(w1q, w1s)
+        pw2, pw2s = _prepack_mxfp4_experts(w2q, w2s)
+        ref = _run_mxfp4_cpu_fused_moe(a, pw1, pw2, topk_weight, topk_ids, pw1s, pw2s)
+
+        def rank_args(local_experts):
+            local_pw1, local_pw1s = _prepack_mxfp4_experts(
+                w1q[local_experts].contiguous(), w1s[local_experts].contiguous()
+            )
+            local_pw2, local_pw2s = _prepack_mxfp4_experts(
+                w2q[local_experts].contiguous(), w2s[local_experts].contiguous()
+            )
+            return (
+                local_pw1,
+                local_pw2,
+                ops.CPUQuantMethod.MXFP4,
+                local_pw1s,
+                local_pw2s,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                True,
+            )
+
+        atol = rtol = 1e-2
+    elif quant_method == "int4":
+        group_size = 64
+        quant_algo = ops.CPUQuantAlgo.GPTQ
+        (
+            _,
+            _,
+            w1_packed,
+            w2_packed,
+            _,
+            _,
+            w1_zeros_packed,
+            w2_zeros_packed,
+            w1_s,
+            w2_s,
+        ) = _make_int4_moe_weights(E, N, K, group_size, quant_algo)
+        blocked = _prepare_int4_moe_layer(
+            w1_packed,
+            w2_packed,
+            w1_s,
+            w2_s,
+            quant_algo,
+            w1_zeros_packed,
+            w2_zeros_packed,
+        )
+        ref = _run_int4_cpu_fused_moe(
+            a,
+            blocked[0],
+            blocked[1],
+            topk_weight,
+            topk_ids,
+            blocked[2],
+            blocked[3],
+            blocked[4],
+            blocked[5],
+        )
+
+        def rank_args(local_experts):
+            local_blocked = _prepare_int4_moe_layer(
+                w1_packed[local_experts].contiguous(),
+                w2_packed[local_experts].contiguous(),
+                w1_s[local_experts].contiguous(),
+                w2_s[local_experts].contiguous(),
+                quant_algo,
+                w1_zeros_packed[local_experts].contiguous(),
+                w2_zeros_packed[local_experts].contiguous(),
+            )
+            return (
+                local_blocked[0],
+                local_blocked[1],
+                ops.CPUQuantMethod.INT4_W4A8,
+                local_blocked[2],
+                local_blocked[3],
+                local_blocked[4],
+                local_blocked[5],
+                None,
+                None,
+                None,
+                None,
+                None,
+                True,
+            )
+
+        atol = rtol = 1e-2
+    else:
+        w1_q, w2_q, w1_s, w2_s = _make_int8_moe_weights(E, N, K)
+        ref = _run_int8_cpu_fused_moe(
+            a,
+            _prepack_experts(w1_q),
+            _prepack_experts(w2_q),
+            topk_weight,
+            topk_ids,
+            w1_s,
+            w2_s,
+            True,
+        )
+
+        def rank_args(local_experts):
+            return (
+                _prepack_experts(w1_q[local_experts].contiguous()),
+                _prepack_experts(w2_q[local_experts].contiguous()),
+                ops.CPUQuantMethod.INT8_W8A8,
+                w1_s[local_experts].contiguous(),
+                w2_s[local_experts].contiguous(),
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                True,
+            )
+
+        atol = rtol = 2e-1
+
+    summed = torch.zeros_like(ref)
+    rank0_args = None
+    rank0_expert_map = None
+    for rank in range(num_ranks):
+        local_num_experts, expert_map, _ = determine_expert_map(
+            ep_size=num_ranks,
+            ep_rank=rank,
+            global_num_experts=E,
+        )
+        assert expert_map is not None
+        local_experts = _get_local_expert_slice(expert_map, local_num_experts)
+        args = rank_args(local_experts)
+        if rank == 0:
+            rank0_args = args
+            rank0_expert_map = expert_map
+        out = fused_experts_cpu_local_skip(
+            a.clone(),
+            args[0],
+            args[1],
+            topk_weight,
+            topk_ids.to(topk_dtype),
+            expert_map,
+            *args[2:],
+        )
+        summed += out
+
+    torch.testing.assert_close(ref, summed, atol=atol, rtol=rtol)
+    assert rank0_args is not None and rank0_expert_map is not None
+    _assert_all_nonlocal_local_skip_is_zero(
+        a, rank0_args, rank0_expert_map, topk, topk_dtype
     )
 
 

@@ -268,7 +268,7 @@ class CPUExpertsMxfp4(mk.FusedMoEExpertsMonolithic):
     def _supports_parallel_config(
         moe_parallel_config: FusedMoEParallelConfig,
     ) -> bool:
-        return not moe_parallel_config.use_ep
+        return True
 
     @staticmethod
     def _supports_quant_scheme(
@@ -344,6 +344,27 @@ class CPUExpertsMxfp4(mk.FusedMoEExpertsMonolithic):
         w2_bias = self.quant_config.w2_bias
         alpha = getattr(self.quant_config, "gemm1_alpha", None)
         limit = getattr(self.quant_config, "gemm1_clamp_limit", None)
+
+        if expert_map is not None:
+            return fused_experts_cpu_local_skip(
+                hidden_states,
+                w1,
+                w2,
+                topk_weights,
+                topk_ids,
+                expert_map,
+                CPUQuantMethod.MXFP4,
+                self.w1_scale,
+                self.w2_scale,
+                None,  # w1_zero
+                None,  # w2_zero
+                None,  # block_size
+                w1_bias,
+                w2_bias,
+                alpha,
+                limit,
+                True,  # is_vnni
+            )
 
         return fused_experts_cpu(
             hidden_states,
@@ -475,7 +496,7 @@ class CPUExpertsInt4(mk.FusedMoEExpertsMonolithic):
     def _supports_parallel_config(
         moe_parallel_config: FusedMoEParallelConfig,
     ) -> bool:
-        return not moe_parallel_config.use_ep
+        return True
 
     @staticmethod
     def _supports_quant_scheme(
@@ -507,7 +528,7 @@ class CPUExpertsInt4(mk.FusedMoEExpertsMonolithic):
         return True
 
     def supports_expert_map(self) -> bool:
-        return False
+        return True
 
     def apply(
         self,
@@ -554,6 +575,27 @@ class CPUExpertsInt4(mk.FusedMoEExpertsMonolithic):
             ),
             e_score_correction_bias=e_score_correction_bias,
         )
+
+        if expert_map is not None:
+            return fused_experts_cpu_local_skip(
+                hidden_states,
+                w1,
+                w2,
+                topk_weights,
+                topk_ids,
+                expert_map,
+                CPUQuantMethod.INT4_W4A8,
+                self.w1_scale,
+                self.w2_scale,
+                self.w1_zp,
+                self.w2_zp,
+                None,  # block_size
+                None,  # w1_bias
+                None,  # w2_bias
+                None,  # alpha
+                None,  # limit
+                True,  # is_vnni
+            )
 
         return fused_experts_cpu(
             hidden_states,
@@ -639,7 +681,7 @@ class CPUExpertsInt8(mk.FusedMoEExpertsMonolithic):
     def _supports_parallel_config(
         moe_parallel_config: FusedMoEParallelConfig,
     ) -> bool:
-        return not moe_parallel_config.use_ep
+        return True
 
     @staticmethod
     def _supports_quant_scheme(
@@ -671,7 +713,7 @@ class CPUExpertsInt8(mk.FusedMoEExpertsMonolithic):
         return True
 
     def supports_expert_map(self) -> bool:
-        return False
+        return True
 
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
         """VNNI-prepack INT8 MoE weights for CPU kernel."""
@@ -720,6 +762,27 @@ class CPUExpertsInt8(mk.FusedMoEExpertsMonolithic):
             ),
             e_score_correction_bias=e_score_correction_bias,
         )
+
+        if expert_map is not None:
+            return fused_experts_cpu_local_skip(
+                hidden_states,
+                w1,
+                w2,
+                topk_weights,
+                topk_ids,
+                expert_map,
+                CPUQuantMethod.INT8_W8A8,
+                self.w1_scale,
+                self.w2_scale,
+                None,  # w1_zero
+                None,  # w2_zero
+                None,  # block_size
+                None,  # w1_bias
+                None,  # w2_bias
+                None,  # alpha
+                None,  # limit
+                True,  # is_vnni
+            )
 
         return fused_experts_cpu(
             hidden_states,

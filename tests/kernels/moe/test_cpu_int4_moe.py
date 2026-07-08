@@ -3,12 +3,14 @@
 """Tests for CPU INT4 W4A8 dynamic quantized fused MoE kernel (CPUExpertsInt4)."""
 
 import sys
+from dataclasses import replace
 
 import pytest
 import torch
 import torch.nn.functional as F
 
 from vllm.model_executor.layers.fused_moe.activation import MoEActivation
+from vllm.model_executor.layers.fused_moe.config import FusedMoEParallelConfig
 from vllm.model_executor.layers.fused_moe.experts.cpu_int4_moe import (
     CPUExpertsInt4,
 )
@@ -28,6 +30,15 @@ if (
 # Tolerance for INT4 W4A8
 INT4_W4A8_ATOL = 2e-2
 INT4_W4A8_RTOL = 2e-2
+HAS_DYNAMIC_4BIT_RUNTIME = current_platform.get_cpu_architecture() == CpuArchEnum.ARM
+
+
+def test_cpu_dynamic_int4_moe_still_rejects_expert_parallel():
+    no_ep = FusedMoEParallelConfig.make_no_parallel()
+    with_ep = replace(no_ep, dp_size=2, ep_size=2, use_ep=True)
+
+    assert CPUExpertsInt4._supports_parallel_config(no_ep)
+    assert not CPUExpertsInt4._supports_parallel_config(with_ep)
 
 
 def _silu_and_mul(x: torch.Tensor) -> torch.Tensor:
@@ -169,6 +180,10 @@ ACTIVATION_DTYPES = [torch.float32, torch.bfloat16, torch.float16]
 @pytest.mark.parametrize("N,K,E,topk,group_size", MoE_CONFIGS)
 @pytest.mark.parametrize("seed", SEEDS)
 @pytest.mark.parametrize("activation_dtype", ACTIVATION_DTYPES)
+@pytest.mark.skipif(
+    not HAS_DYNAMIC_4BIT_RUNTIME,
+    reason="dynamic_4bit_int_moe runtime is currently AArch64-only",
+)
 def test_cpu_int4_moe_kernel(M, N, K, E, topk, group_size, seed, activation_dtype):
     """Test dynamic_4bit_int_moe kernel against dequantized torch reference."""
     set_random_seed(seed)

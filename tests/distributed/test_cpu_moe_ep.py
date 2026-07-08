@@ -166,6 +166,54 @@ def _run_single_rank_reference(a, w1, w2, w1_s, w2_s, topk_weight, topk_ids, E):
     )
 
 
+def _make_int8_moe_weights(E, N, K):
+    def _quantize_per_channel(w):
+        amax = w.abs().amax(dim=-1, keepdim=True).clamp(min=1e-12)
+        scale = amax / 127.0
+        w_q = (w / scale).round().clamp(-128, 127).to(torch.int8)
+        return w_q, scale.float()
+
+    factor = 1e-2
+    w1_f = (torch.randn(E, 2 * N, K) - 0.5) * 2
+    w2_f = (torch.randn(E, K, N) - 0.5) * 2
+
+    w1_q_list, w1_s_list = [], []
+    w2_q_list, w2_s_list = [], []
+    for e in range(E):
+        q, s = _quantize_per_channel(w1_f[e])
+        w1_q_list.append(q)
+        w1_s_list.append(s)
+        q, s = _quantize_per_channel(w2_f[e])
+        w2_q_list.append(q)
+        w2_s_list.append(s)
+
+    return (
+        torch.stack(w1_q_list),
+        torch.stack(w2_q_list),
+        torch.stack(w1_s_list) * factor,
+        torch.stack(w2_s_list) * factor,
+    )
+
+
+def _run_single_rank_int8_reference(a, w1, w2, w1_s, w2_s, topk_weight, topk_ids):
+    pw1, pw2 = _prepack_experts(w1), _prepack_experts(w2)
+    return ops.fused_experts_cpu(
+        a.clone(),
+        pw1,
+        pw2,
+        topk_weight,
+        topk_ids,
+        False,
+        ops.CPUQuantMethod.INT8_W8A8,
+        w1_s,
+        w2_s,
+        None,
+        None,
+        None,
+        is_vnni=True,
+    )
+
+
 def _sequence_parallel_all_gather(
     tensor: torch.Tensor,
     tp_group,
@@ -272,7 +320,8 @@ def _moe_ep_worker(rank, world_size, tp_size, dp_size, port, dp_port, params, er
             determine_expert_map,
         )
 
-        M_per_dp, N, K, E, topk, seed, is_sequence_parallel = params
+        M_per_dp, N, K, E, topk, seed, is_sequence_parallel, *rest = params
+        quant_method = rest[0] if rest else "fp8"
         torch.manual_seed(seed)
 
         dp_rank = rank // tp_size
@@ -283,7 +332,12 @@ def _moe_ep_worker(rank, world_size, tp_size, dp_size, port, dp_port, params, er
         # M_per_dp tokens per DP replica; total M = dp_size * M_per_dp
         total_M = dp_size * M_per_dp
         a_all = torch.randn(total_M, K, dtype=torch.bfloat16) / math.sqrt(K)
-        w1, w2, w1_s, w2_s = _make_fp8_moe_weights(E, N, K, BLOCK_SIZE)
+        if quant_method == "fp8":
+            w1, w2, w1_s, w2_s = _make_fp8_moe_weights(E, N, K, BLOCK_SIZE)
+        elif quant_method == "int8":
+            w1, w2, w1_s, w2_s = _make_int8_moe_weights(E, N, K)
+        else:
+            raise AssertionError(f"Unexpected quant_method={quant_method}")
         score = torch.softmax(
             torch.randn(total_M, E, dtype=torch.bfloat16), dim=-1, dtype=torch.float32
         )
@@ -291,9 +345,14 @@ def _moe_ep_worker(rank, world_size, tp_size, dp_size, port, dp_port, params, er
         topk_ids_all = topk_ids_all.to(torch.int32)
 
         # Single-rank reference (no EP, all experts)
-        ref = _run_single_rank_reference(
-            a_all, w1, w2, w1_s, w2_s, topk_weight_all, topk_ids_all, E
-        )
+        if quant_method == "fp8":
+            ref = _run_single_rank_reference(
+                a_all, w1, w2, w1_s, w2_s, topk_weight_all, topk_ids_all, E
+            )
+        else:
+            ref = _run_single_rank_int8_reference(
+                a_all, w1, w2, w1_s, w2_s, topk_weight_all, topk_ids_all
+            )
 
         # This rank's DP slice
         lo, hi = dp_rank * M_per_dp, (dp_rank + 1) * M_per_dp
@@ -343,6 +402,12 @@ def _moe_ep_worker(rank, world_size, tp_size, dp_size, port, dp_port, params, er
 
             # Expert compute: skip non-local selections (the shipped path).
             pw1, pw2 = _prepack_experts(w1_local), _prepack_experts(w2_local)
+            quant = (
+                ops.CPUQuantMethod.FP8_W8A16
+                if quant_method == "fp8"
+                else ops.CPUQuantMethod.INT8_W8A8
+            )
+            block_size = BLOCK_SIZE if quant_method == "fp8" else None
             expert_out = ops.fused_experts_cpu_local_skip(
                 a_gathered.clone(),
                 pw1,
@@ -350,12 +415,12 @@ def _moe_ep_worker(rank, world_size, tp_size, dp_size, port, dp_port, params, er
                 tw_gathered,
                 tid_gathered,
                 expert_map,
-                ops.CPUQuantMethod.FP8_W8A16,
+                quant,
                 w1_s_local,
                 w2_s_local,
                 None,  # w1_zero
                 None,  # w2_zero
-                BLOCK_SIZE,
+                block_size,
                 None,  # w1_bias
                 None,  # w2_bias
                 None,  # alpha
@@ -401,8 +466,9 @@ def _moe_ep_worker(rank, world_size, tp_size, dp_size, port, dp_port, params, er
 
         if rank == 0:
             assert result_full is not None
+            atol = rtol = 1e-2 if quant_method == "fp8" else 2e-1
             torch.testing.assert_close(
-                ref.bfloat16(), result_full, atol=1e-2, rtol=1e-2
+                ref.bfloat16(), result_full, atol=atol, rtol=rtol
             )
 
         dist.barrier()
@@ -679,6 +745,10 @@ _SP_PARAMS = [
     (7, 256, 512, 10, 2, 0, True),
 ]
 
+_INT8_SP_PARAMS = [
+    (7, 256, 512, 10, 2, 0, True, "int8"),
+]
+
 
 @pytest.mark.distributed
 @pytest.mark.parametrize("params", _PARAMS, ids=["E10-nondiv"])
@@ -698,6 +768,13 @@ def test_cpu_moe_ep_tp2_dp3(params):
 @pytest.mark.parametrize("params", _SP_PARAMS, ids=["E10-nondiv-sp"])
 def test_cpu_moe_ep_tp2_dp3_sequence_parallel(params):
     """TP=2, DP=3: full EP-group AgRs plus TP all-gather restore."""
+    _spawn_workers(_moe_ep_worker, world_size=6, tp_size=2, dp_size=3, params=params)
+
+
+@pytest.mark.distributed
+@pytest.mark.parametrize("params", _INT8_SP_PARAMS, ids=["int8-sp"])
+def test_cpu_moe_ep_tp2_dp3_sequence_parallel_int8(params):
+    """INT8 TP=2, DP=3, EP=true, sequence-parallel distributed coverage."""
     _spawn_workers(_moe_ep_worker, world_size=6, tp_size=2, dp_size=3, params=params)
 
 

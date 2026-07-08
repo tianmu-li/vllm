@@ -604,14 +604,35 @@ class RoutedExperts(PluggableLayer):
     ) -> bool | None:
         quant_config_name = self.quant_config and self.quant_config.get_name()
         if quant_config_name == "gpt_oss_mxfp4":
-            # (FIXME) for gpt-oss all experts are combined
-            if "bias" in weight_name:
-                dim1 = loaded_weight.shape[1]
-                param.data[:, :dim1].copy_(loaded_weight)
+            full_load = loaded_weight.ndim == param.data.ndim
+            if full_load:
+                for global_expert_id in self.expert_map_manager.get_local_expert_ids():
+                    local_expert_id = self._map_global_expert_id_to_local_expert_id(
+                        global_expert_id
+                    )
+                    expert_data = param.data[local_expert_id]
+                    expert_weight = loaded_weight[global_expert_id]
+                    if "bias" in weight_name:
+                        dim1 = min(expert_weight.shape[0], expert_data.shape[0])
+                        expert_data[:dim1].copy_(expert_weight[:dim1])
+                    else:
+                        dim1 = min(expert_weight.shape[0], expert_data.shape[0])
+                        dim2 = min(expert_weight.shape[1], expert_data.shape[1])
+                        expert_data[:dim1, :dim2].copy_(expert_weight[:dim1, :dim2])
             else:
-                dim1 = loaded_weight.shape[1]
-                dim2 = loaded_weight.shape[2]
-                param.data[:, :dim1, :dim2].copy_(loaded_weight)
+                local_expert_id = self._map_global_expert_id_to_local_expert_id(
+                    expert_id
+                )
+                if local_expert_id == -1:
+                    return False if return_success else None
+                expert_data = param.data[local_expert_id]
+                if "bias" in weight_name:
+                    dim1 = min(loaded_weight.shape[0], expert_data.shape[0])
+                    expert_data[:dim1].copy_(loaded_weight[:dim1])
+                else:
+                    dim1 = min(loaded_weight.shape[0], expert_data.shape[0])
+                    dim2 = min(loaded_weight.shape[1], expert_data.shape[1])
+                    expert_data[:dim1, :dim2].copy_(loaded_weight[:dim1, :dim2])
             return True if return_success else None
 
         quant_method_name = self.quant_method.__class__.__name__
