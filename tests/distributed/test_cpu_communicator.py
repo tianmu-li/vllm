@@ -376,8 +376,22 @@ def _sequence_parallel_worker(
 
         ep_communicator = ep_group.device_communicator
         assert isinstance(ep_communicator, CpuCommunicator)
+        shm_counts = {"all_gatherv": 0, "reduce_scatterv": 0}
         if HAS_CPU_SHM:
             assert isinstance(ep_communicator.dist_module, _CPUSHMDistributed)
+            orig_all_gatherv = ep_communicator.dist_module.all_gatherv
+            orig_reduce_scatterv = ep_communicator.dist_module.reduce_scatterv
+
+            def counted_all_gatherv(inputs, outputs, sizes):
+                shm_counts["all_gatherv"] += 1
+                return orig_all_gatherv(inputs, outputs, sizes)
+
+            def counted_reduce_scatterv(input_, output, sizes):
+                shm_counts["reduce_scatterv"] += 1
+                return orig_reduce_scatterv(input_, output, sizes)
+
+            ep_communicator.dist_module.all_gatherv = counted_all_gatherv
+            ep_communicator.dist_module.reduce_scatterv = counted_reduce_scatterv
 
         local_rows = expected_local_sizes[rank]
 
@@ -446,6 +460,9 @@ def _sequence_parallel_worker(
                 assert dp_metadata.local_sizes is sizes
 
             assert dp_metadata.local_sizes is None
+
+        if HAS_CPU_SHM:
+            assert shm_counts == {"all_gatherv": 2, "reduce_scatterv": 1}
 
         dist.barrier()
     except Exception as err:
@@ -574,6 +591,17 @@ def _cached_non_sp_sizes_worker(
                 assert communicator._cached_non_sp_dp_metadata is dp_metadata
                 assert communicator._cached_non_sp_dp_sizes == sizes
                 assert dp_metadata.local_sizes is None
+
+                stale_local_sizes = [0] * dp_size
+                dp_metadata.local_sizes = stale_local_sizes
+                gathered_hidden4, gathered_router4 = ep_group.dispatch_router_logits(
+                    hidden.clone(),
+                    router.clone(),
+                )
+                torch.testing.assert_close(gathered_hidden4, expected_hidden)
+                torch.testing.assert_close(gathered_router4, expected_router)
+                assert dp_metadata.local_sizes == stale_local_sizes
+                dp_metadata.local_sizes = None
 
         dist.barrier()
     except Exception as err:

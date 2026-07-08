@@ -474,8 +474,6 @@ class CpuCommunicator(DeviceCommunicatorBase):
         def _with_non_sp_dp_sizes(fn):
             dp_metadata = get_forward_context().dp_metadata
             assert dp_metadata is not None
-            if dp_metadata.local_sizes is not None:
-                return fn()
 
             if self._cached_non_sp_dp_metadata is not dp_metadata:
                 self._cached_non_sp_dp_metadata = dp_metadata
@@ -484,11 +482,12 @@ class CpuCommunicator(DeviceCommunicatorBase):
                 ]
 
             assert self._cached_non_sp_dp_sizes is not None
+            prev_local_sizes = dp_metadata.local_sizes
             dp_metadata.local_sizes = self._cached_non_sp_dp_sizes
             try:
                 return fn()
             finally:
-                dp_metadata.local_sizes = None
+                dp_metadata.local_sizes = prev_local_sizes
 
         def _with_sp_sizes(fn):
             dp_metadata = get_forward_context().dp_metadata
