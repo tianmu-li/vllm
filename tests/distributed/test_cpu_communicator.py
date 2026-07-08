@@ -1089,6 +1089,72 @@ def _dp_shm_all_reduce_worker(
         _report_worker_failure(rank, err_q, err)
 
 
+def _dp_metadata_shm_all_reduce_worker(
+    rank,
+    world_size,
+    tp_size,
+    dp_size,
+    port,
+    dp_port,
+    params,
+    err_q,
+):
+    """Confirm CPU DP metadata sync uses SHM instead of torch.distributed."""
+    try:
+        os.environ.setdefault(
+            "VLLM_DIST_IDENT", f"test_cpu_dp_metadata_shm_all_reduce_{port}"
+        )
+        _init_tp_dp_environment(rank, tp_size, dp_size, port, dp_port)
+
+        _get_dp_shm_communicator()
+
+        from vllm.config.parallel import ParallelConfig
+        from vllm.v1.worker.dp_utils import coordinate_batch_across_dp
+
+        dp_rank = rank // tp_size
+        num_tokens_unpadded = dp_rank + 1
+        num_tokens_padded = num_tokens_unpadded + 10
+        expected_tokens = torch.tensor([13, 13, 13], dtype=torch.int32)
+
+        orig_all_reduce = dist.all_reduce
+
+        def forbidden_all_reduce(*args, **kwargs):
+            raise AssertionError(
+                "CPU DP metadata all_reduce fell back to torch.distributed"
+            )
+
+        parallel_config = ParallelConfig(
+            tensor_parallel_size=tp_size,
+            data_parallel_size=dp_size,
+            data_parallel_rank=dp_rank,
+            disable_nccl_for_dp_synchronization=True,
+        )
+
+        dist.all_reduce = forbidden_all_reduce
+        try:
+            should_ubatch, num_tokens_after_padding, synced_cudagraph_mode = (
+                coordinate_batch_across_dp(
+                    num_tokens_unpadded=num_tokens_unpadded,
+                    allow_microbatching=False,
+                    parallel_config=parallel_config,
+                    num_tokens_padded=num_tokens_padded,
+                    cudagraph_mode=1,
+                )
+            )
+        finally:
+            dist.all_reduce = orig_all_reduce
+
+        assert not should_ubatch
+        assert synced_cudagraph_mode == 1
+        assert num_tokens_after_padding is not None
+        assert num_tokens_after_padding.dtype == torch.int32
+        torch.testing.assert_close(num_tokens_after_padding, expected_tokens)
+
+        dist.barrier()
+    except Exception as err:
+        _report_worker_failure(rank, err_q, err)
+
+
 def _dp_shm_reduce_scatterv_worker(
     rank,
     world_size,
@@ -1303,6 +1369,18 @@ def test_cpu_dp_shm_all_reduce_matches_gloo():
 def test_cpu_tp_shm_all_reduce_matches_gloo_without_fallback():
     _spawn_workers(
         _tp_shm_all_reduce_worker,
+        world_size=6,
+        tp_size=2,
+        dp_size=3,
+        params=None,
+    )
+
+
+@pytest.mark.distributed
+@pytest.mark.skipif(not HAS_CPU_SHM, reason="CPU SHM communicator required")
+def test_cpu_dp_metadata_shm_all_reduce_without_gloo_fallback():
+    _spawn_workers(
+        _dp_metadata_shm_all_reduce_worker,
         world_size=6,
         tp_size=2,
         dp_size=3,

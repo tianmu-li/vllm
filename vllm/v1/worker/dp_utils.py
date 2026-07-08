@@ -7,6 +7,7 @@ import torch.distributed as dist
 from vllm.config import ParallelConfig
 from vllm.distributed.parallel_state import get_dp_group
 from vllm.logger import init_logger
+from vllm.platforms import current_platform
 from vllm.v1.worker.ubatch_utils import (
     check_ubatch_thresholds,
     is_last_ubatch_empty,
@@ -49,6 +50,15 @@ def _run_ar(
     tensor_cpu[1][dp_rank] = padded_num_tokens_per_ubatch
     tensor_cpu[2][dp_rank] = 1 if should_ubatch else 0
     tensor_cpu[3][dp_rank] = cudagraph_mode
+    if (
+        parallel_config.disable_nccl_for_dp_synchronization
+        and current_platform.is_cpu()
+    ):
+        from vllm.distributed.device_communicators.cpu_communicator import (
+            all_reduce_cpu_dp_metadata,
+        )
+
+        return all_reduce_cpu_dp_metadata(tensor_cpu, get_dp_group())
     tensor = tensor_cpu.to(device, non_blocking=True)
     dist.all_reduce(tensor, group=group)
     return tensor

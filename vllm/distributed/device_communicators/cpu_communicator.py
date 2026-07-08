@@ -18,6 +18,14 @@ from .base_device_communicator import DeviceCommunicatorBase
 logger = init_logger(__name__)
 
 
+def all_reduce_cpu_dp_metadata(
+    tensor: torch.Tensor,
+    dp_group: Any,
+) -> torch.Tensor:
+    metadata = tensor.to(device="cpu", dtype=torch.float32)
+    return dp_group.all_reduce(metadata).to(device="cpu", dtype=torch.int32)
+
+
 class CpuCommunicator(DeviceCommunicatorBase):
     _CPUSHM_GROUP_KINDS = {"tp", "pp", "dp", "ep"}
 
