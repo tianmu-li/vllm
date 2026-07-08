@@ -80,7 +80,8 @@ NUM_EXPERTS = [8, 64]
 TOP_KS = [2, 6]
 
 # dp_size, tp_size, use_ep
-# Note: DP+TP is not yet supported in the FusedMoE layer.
+# Keep no-EP DP+TP out of this broad GPU-oriented matrix; the focused CPU
+# DP+TP no-EP parallel config path is covered in test_cpu_communicator.py.
 PARALLEL_COMBOS = [
     [1, 2, False],
     [1, 4, False],

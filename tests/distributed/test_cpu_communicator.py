@@ -1089,45 +1089,6 @@ def _dp_shm_all_reduce_worker(
         _report_worker_failure(rank, err_q, err)
 
 
-def _tp_shm_all_reduce_worker(
-    rank,
-    world_size,
-    tp_size,
-    dp_size,
-    port,
-    dp_port,
-    params,
-    err_q,
-):
-    """Confirm the TP all-reduce path uses SHM and matches gloo."""
-    try:
-        os.environ.setdefault("VLLM_DIST_IDENT", f"test_cpu_tp_shm_all_reduce_{port}")
-        _init_tp_dp_environment(rank, tp_size, dp_size, port, dp_port)
-
-        tp_group, _ = _get_tp_shm_communicator()
-        tensor = torch.arange(12, dtype=torch.float32).reshape(3, 4) + float(rank)
-
-        ref = tensor.clone()
-        dist.all_reduce(ref, group=tp_group.cpu_group)
-
-        orig_all_reduce = dist.all_reduce
-
-        def forbidden_all_reduce(*args, **kwargs):
-            raise AssertionError("TP SHM all_reduce fell back to torch.distributed")
-
-        dist.all_reduce = forbidden_all_reduce
-        try:
-            shm_result = tp_group.all_reduce(tensor.clone())
-        finally:
-            dist.all_reduce = orig_all_reduce
-
-        torch.testing.assert_close(shm_result, ref)
-
-        dist.barrier()
-    except Exception as err:
-        _report_worker_failure(rank, err_q, err)
-
-
 def _dp_metadata_shm_all_reduce_worker(
     rank,
     world_size,
