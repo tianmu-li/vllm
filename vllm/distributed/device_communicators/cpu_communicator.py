@@ -119,7 +119,10 @@ class CpuCommunicator(DeviceCommunicatorBase):
         return shared_name
 
     def all_reduce(self, input_):
-        self.dist_module.all_reduce(input_, group=self.device_group)
+        if isinstance(self.dist_module, _CPUSHMDistributed):
+            self.dist_module.all_reduce(input_, group=self.device_group)
+        else:
+            torch.distributed.all_reduce(input_, group=self.device_group)
         return input_
 
     def gather(
