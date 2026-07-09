@@ -55,10 +55,10 @@ def _run_ar(
         and current_platform.is_cpu()
     ):
         from vllm.distributed.device_communicators.cpu_communicator import (
-            all_reduce_cpu_dp_metadata,
+            _all_reduce_cpu_dp_metadata,
         )
 
-        return all_reduce_cpu_dp_metadata(tensor_cpu, get_dp_group())
+        return _all_reduce_cpu_dp_metadata(tensor_cpu, get_dp_group())
     tensor = tensor_cpu.to(device, non_blocking=True)
     dist.all_reduce(tensor, group=group)
     return tensor

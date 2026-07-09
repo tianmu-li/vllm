@@ -18,10 +18,11 @@ from .base_device_communicator import DeviceCommunicatorBase
 logger = init_logger(__name__)
 
 
-def all_reduce_cpu_dp_metadata(
+def _all_reduce_cpu_dp_metadata(
     tensor: torch.Tensor,
     dp_group: Any,
 ) -> torch.Tensor:
+    """Reduce int32 DP metadata through the CPU SHM float32 all-reduce path."""
     metadata = tensor.to(device="cpu", dtype=torch.float32)
     return dp_group.all_reduce(metadata).to(device="cpu", dtype=torch.int32)
 

@@ -171,6 +171,9 @@ def test_cpu_quant_expert_parallel_support_is_fail_closed(
 
     assert expert_cls._supports_parallel_config(no_ep)
     assert expert_cls._supports_parallel_config(with_ep) is supports_ep
+    if supports_ep:
+        assert "supports_expert_map" in expert_cls.__dict__
+        assert expert_cls.__new__(expert_cls).supports_expert_map() is True
 
 
 # ===========================================================================

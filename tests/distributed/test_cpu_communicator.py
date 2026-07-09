@@ -1173,18 +1173,33 @@ def _dp_shm_reduce_scatterv_worker(
         _init_tp_dp_environment(rank, tp_size, dp_size, port, dp_port)
 
         dp_group, _ = _get_dp_shm_communicator()
+        from vllm.distributed.device_communicators.cpu_communicator import (
+            _CPUSHMDistributed,
+        )
 
-        for sizes, explicit_sizes, dim in cases:
+        dp_communicator = dp_group.device_communicator
+        assert isinstance(dp_communicator.dist_module, _CPUSHMDistributed)
+        shm_reduce_scatterv_calls = 0
+        orig_reduce_scatterv = dp_communicator.dist_module.reduce_scatterv
+
+        def counted_reduce_scatterv(input_, output, sizes):
+            nonlocal shm_reduce_scatterv_calls
+            shm_reduce_scatterv_calls += 1
+            return orig_reduce_scatterv(input_, output, sizes)
+
+        dp_communicator.dist_module.reduce_scatterv = counted_reduce_scatterv
+
+        for sizes, explicit_sizes, dim, dtype in cases:
             total_rows = sum(sizes)
             if dim == 0:
                 tensor = torch.arange(
                     total_rows * HIDDEN_SIZE,
-                    dtype=torch.float32,
+                    dtype=dtype,
                 ).reshape(total_rows, HIDDEN_SIZE)
             else:
                 tensor = torch.arange(
                     HIDDEN_SIZE * total_rows,
-                    dtype=torch.float32,
+                    dtype=dtype,
                 ).reshape(HIDDEN_SIZE, total_rows)
             tensor = tensor + float((rank + 1) * 1000)
 
@@ -1203,6 +1218,7 @@ def _dp_shm_reduce_scatterv_worker(
                 )
                 torch.testing.assert_close(result, expected)
 
+        assert shm_reduce_scatterv_calls == 2 * len(cases)
         dist.barrier()
     except Exception as err:
         _report_worker_failure(rank, err_q, err)
@@ -1397,10 +1413,11 @@ def test_cpu_dp_shm_reduce_scatterv_matches_all_reduce_slice():
         tp_size=1,
         dp_size=6,
         params=[
-            ([2, 2, 2, 2, 2, 2], True, 0),
-            ([2, 0, 3, 1, 4, 0], True, 0),
-            ([2, 2, 2, 2, 2, 2], False, 0),
-            ([0, 0, 0, 0, 0, 0], True, 0),
-            ([1, 0, 2, 1, 0, 3], True, 1),
+            ([2, 0, 3, 1, 4, 0], True, 0, torch.float32),
+            ([1, 0, 2, 1, 0, 3], True, 1, torch.float32),
+            ([2, 2, 2, 2, 2, 2], False, 0, torch.float32),
+            ([2, 2, 2, 2, 2, 2], False, 1, torch.float32),
+            ([0, 0, 0, 0, 0, 0], True, 0, torch.float32),
+            ([0, 2, 1, 3, 0, 2], True, 0, torch.bfloat16),
         ],
     )
