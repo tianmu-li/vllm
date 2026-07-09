@@ -972,6 +972,101 @@ inline void scatter_add_local_expert_outputs(
   });
 }
 
+template <typename topk_t, typename map_t>
+inline int64_t count_local_expert_selections(
+    const topk_t* __restrict__ topk_ids,
+    const map_t* __restrict__ expert_map,
+    int64_t* __restrict__ token_starts,
+    int64_t M,
+    int64_t topk,
+    int64_t global_num_experts,
+    int64_t local_num_experts) {
+  int64_t selected_count = 0;
+  for (int64_t m = 0; m < M; ++m) {
+    int64_t token_count = 0;
+    for (int64_t k = 0; k < topk; ++k) {
+      int64_t global_expert_id = static_cast<int64_t>(topk_ids[m * topk + k]);
+      if (global_expert_id == -1) {
+        continue;
+      }
+      TORCH_CHECK(
+          0 <= global_expert_id && global_expert_id < global_num_experts,
+          "Invalid expert id ",
+          global_expert_id,
+          " for ",
+          global_num_experts,
+          " experts.");
+      int64_t local_expert_id = static_cast<int64_t>(expert_map[global_expert_id]);
+      if (local_expert_id == -1) {
+        continue;
+      }
+      TORCH_CHECK(
+          0 <= local_expert_id && local_expert_id < local_num_experts,
+          "Invalid local expert id ",
+          local_expert_id,
+          " for ",
+          local_num_experts,
+          " local experts.");
+      token_count++;
+    }
+    selected_count += token_count;
+    token_starts[m + 1] = selected_count;
+  }
+  return selected_count;
+}
+
+template <typename scalar_t, typename topk_t, typename map_t, typename weight_t>
+inline void compact_local_expert_selections(
+    scalar_t* __restrict__ selected_hidden,
+    weight_t* __restrict__ selected_weights,
+    int32_t* __restrict__ selected_ids,
+    const scalar_t* __restrict__ hidden_states,
+    const weight_t* __restrict__ topk_weights,
+    const topk_t* __restrict__ topk_ids,
+    const map_t* __restrict__ expert_map,
+    const int64_t* __restrict__ token_starts,
+    int64_t M,
+    int64_t K,
+    int64_t topk) {
+  for (int64_t m = 0; m < M; ++m) {
+    int64_t out_idx = token_starts[m];
+    for (int64_t k = 0; k < topk; ++k) {
+      int64_t global_expert_id = static_cast<int64_t>(topk_ids[m * topk + k]);
+      if (global_expert_id == -1) {
+        continue;
+      }
+      int64_t local_expert_id = static_cast<int64_t>(expert_map[global_expert_id]);
+      if (local_expert_id == -1) {
+        continue;
+      }
+      copy_stub(selected_hidden + out_idx * K, hidden_states + m * K, K);
+      selected_weights[out_idx] = topk_weights[m * topk + k];
+      selected_ids[out_idx] = static_cast<int32_t>(local_expert_id);
+      out_idx++;
+    }
+  }
+}
+
+template <typename scalar_t>
+inline void scatter_add_local_expert_outputs(
+    scalar_t* __restrict__ output,
+    const scalar_t* __restrict__ selected_output,
+    const int64_t* __restrict__ token_starts,
+    int64_t M,
+    int64_t K) {
+  at::parallel_for(0, M, 0, [&](int64_t begin, int64_t end) {
+    for (int64_t m = begin; m < end; ++m) {
+      scalar_t* __restrict__ out_row = output + m * K;
+      for (int64_t s = token_starts[m]; s < token_starts[m + 1]; ++s) {
+        const scalar_t* __restrict__ selected_row = selected_output + s * K;
+        for (int64_t h = 0; h < K; ++h) {
+          out_row[h] += selected_row[h];
+        }
+      }
+    }
+  });
+}
+
 // hidden_states: [M, K]
 // w1: [E, 2N, K] or [E, 2N, K / 2] for uint8
 // w2: [E, K, N] or [E, K, N / 2] for uint8
