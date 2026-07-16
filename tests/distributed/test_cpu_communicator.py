@@ -2,10 +2,15 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """CPU communicator tests for DP SHM and EP dispatch paths."""
 
+import gc
+import json
 import os
 import signal
+import tempfile
 import time
 import traceback
+import weakref
+from pathlib import Path
 
 import pytest
 import torch
@@ -20,6 +25,7 @@ if not current_platform.is_cpu():
     pytest.skip("CPU-only test", allow_module_level=True)
 
 import vllm._custom_ops  # noqa: E402,F401  # populates torch.ops._C for HAS_CPU_SHM
+from vllm.compilation.decorators import support_torch_compile  # noqa: E402
 
 HIDDEN_SIZE = 8
 NUM_EXPERTS = 6
@@ -28,6 +34,41 @@ HAS_CPU_SHM = hasattr(torch.ops._C, "init_shm_manager") and (
     current_platform.get_cpu_architecture()
     in (CpuArchEnum.X86, CpuArchEnum.ARM, CpuArchEnum.POWERPC)
 )
+
+
+def _cpu_ep_aot_step(
+    hidden_states: torch.Tensor,
+    router_logits: torch.Tensor,
+) -> torch.Tensor:
+    from vllm.distributed.parallel_state import get_ep_group
+
+    gathered_hidden, _ = get_ep_group().dispatch_router_logits(
+        hidden_states,
+        router_logits,
+    )
+    return get_ep_group().combine(gathered_hidden) + hidden_states
+
+
+def _cpu_ep_inductor_postprocess(hidden_states: torch.Tensor) -> torch.Tensor:
+    return hidden_states * 2 + 1
+
+
+@support_torch_compile(
+    dynamic_arg_dims={
+        "hidden_states": {0: "local_rows"},
+        "router_logits": {0: "local_rows"},
+    }
+)
+class _CpuEpAotModel(torch.nn.Module):
+    def __init__(self):
+        super().__init__()
+
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+        router_logits: torch.Tensor,
+    ) -> torch.Tensor:
+        return _cpu_ep_aot_step(hidden_states, router_logits)
 
 
 def test_cpu_shm_group_name_eligibility():
@@ -39,6 +80,178 @@ def test_cpu_shm_group_name_eligibility():
     assert CpuCommunicator._is_cpushm_group_name("ep:0")
     assert not CpuCommunicator._is_cpushm_group_name("eplb:0")
     assert not CpuCommunicator._is_cpushm_group_name("anonymous:0")
+
+
+@pytest.mark.parametrize(
+    ("token_counts", "sp_size", "world_size", "expected"),
+    [
+        ([2, 1], 1, 2, [2, 1]),
+        ([5, 4, 3], 2, 6, [3, 3, 2, 2, 2, 2]),
+    ],
+    ids=["non-sp", "sp"],
+)
+def test_cpu_ep_sizes(token_counts, sp_size, world_size, expected):
+    from vllm.distributed.device_communicators.cpu_communicator import (
+        _get_cpu_ep_sizes,
+    )
+
+    counts = torch.tensor(token_counts, dtype=torch.int32)
+    assert _get_cpu_ep_sizes(counts, sp_size, world_size) == expected
+
+
+@pytest.mark.parametrize(
+    ("token_counts", "sp_size", "world_size", "error"),
+    [
+        (torch.tensor([2.0, 1.0]), 1, 2, "integer dtype"),
+        (torch.tensor([[2, 1]]), 1, 2, "one-dimensional"),
+        (torch.tensor([2, -1]), 1, 2, "nonnegative"),
+        (torch.tensor([2, 1]), 0, 2, "must be positive"),
+        (torch.tensor([2, 1]), 2, 2, "communicator size mismatch"),
+    ],
+    ids=["dtype", "dimensions", "negative", "sp-zero", "world-size"],
+)
+def test_cpu_ep_sizes_reject_invalid_input(
+    token_counts,
+    sp_size,
+    world_size,
+    error,
+):
+    from vllm.distributed.device_communicators.cpu_communicator import (
+        _get_cpu_ep_sizes,
+    )
+
+    with pytest.raises(RuntimeError, match=error):
+        _get_cpu_ep_sizes(token_counts, sp_size, world_size)
+
+
+def _bare_cpu_communicator(group_name):
+    from vllm.distributed.device_communicators.cpu_communicator import CpuCommunicator
+
+    communicator = CpuCommunicator.__new__(CpuCommunicator)
+    communicator.unique_name = group_name
+    return communicator
+
+
+def test_cpu_communicator_registry_rejects_duplicate_live_group(monkeypatch):
+    from vllm.distributed.device_communicators import cpu_communicator
+
+    monkeypatch.setattr(
+        cpu_communicator,
+        "_CPU_COMMUNICATORS",
+        weakref.WeakValueDictionary(),
+    )
+    first = _bare_cpu_communicator("ep:duplicate")
+    second = _bare_cpu_communicator("ep:duplicate")
+
+    cpu_communicator._register_cpu_communicator(first)
+    with pytest.raises(RuntimeError, match="already registered"):
+        cpu_communicator._register_cpu_communicator(second)
+
+
+def test_cpu_communicator_registry_unregisters_only_matching_object(monkeypatch):
+    from vllm.distributed.device_communicators import cpu_communicator
+
+    monkeypatch.setattr(
+        cpu_communicator,
+        "_CPU_COMMUNICATORS",
+        weakref.WeakValueDictionary(),
+    )
+    first = _bare_cpu_communicator("ep:registered")
+    other = _bare_cpu_communicator("ep:registered")
+
+    cpu_communicator._register_cpu_communicator(first)
+    cpu_communicator._unregister_cpu_communicator(other)
+    assert cpu_communicator._resolve_cpu_communicator("ep:registered") is first
+
+    cpu_communicator._unregister_cpu_communicator(first)
+    with pytest.raises(RuntimeError, match="is not registered"):
+        cpu_communicator._resolve_cpu_communicator("ep:registered")
+
+
+def test_cpu_communicator_registry_rejects_unknown_and_expired_groups(monkeypatch):
+    from vllm.distributed.device_communicators import cpu_communicator
+
+    monkeypatch.setattr(
+        cpu_communicator,
+        "_CPU_COMMUNICATORS",
+        weakref.WeakValueDictionary(),
+    )
+    hidden = torch.empty(0, HIDDEN_SIZE)
+    counts = torch.tensor([0], dtype=torch.int32)
+    with pytest.raises(RuntimeError, match="is not registered"):
+        cpu_communicator._cpu_ep_combine_v1(hidden, counts, 1, "ep:unknown")
+
+    communicator = _bare_cpu_communicator("ep:expired")
+    reference = weakref.ref(communicator)
+    cpu_communicator._register_cpu_communicator(communicator)
+    del communicator
+    gc.collect()
+
+    assert reference() is None
+    with pytest.raises(RuntimeError, match="is not registered"):
+        cpu_communicator._cpu_ep_combine_v1(hidden, counts, 1, "ep:expired")
+
+
+def test_cpu_ep_dispatch_fake_outputs_share_dynamic_rows():
+    from torch._subclasses.fake_tensor import FakeTensorMode
+    from torch.fx.experimental.symbolic_shapes import ShapeEnv
+
+    from vllm.distributed.device_communicators.cpu_communicator import (
+        _cpu_ep_dispatch_router_logits_v1,
+        _cpu_ep_dispatch_v1,
+    )
+
+    with FakeTensorMode(shape_env=ShapeEnv()):
+        hidden = torch.empty(2, HIDDEN_SIZE, dtype=torch.bfloat16)
+        router = torch.empty(2, NUM_EXPERTS, dtype=torch.float32)
+        weights = torch.empty(2, TOPK, dtype=torch.float32)
+        ids = torch.empty(2, TOPK, dtype=torch.int64)
+        counts = torch.tensor([2, 1], dtype=torch.int32)
+
+        gathered_hidden, gathered_router = _cpu_ep_dispatch_router_logits_v1(
+            hidden,
+            router,
+            counts,
+            1,
+            "dp:fake",
+        )
+        dispatched_hidden, dispatched_weights, dispatched_ids = _cpu_ep_dispatch_v1(
+            hidden,
+            weights,
+            ids,
+            counts,
+            1,
+            "dp:fake",
+        )
+
+    assert gathered_hidden.shape[0] == gathered_router.shape[0]
+    assert dispatched_hidden.shape[0] == dispatched_weights.shape[0]
+    assert dispatched_hidden.shape[0] == dispatched_ids.shape[0]
+    assert gathered_hidden.shape[1:] == hidden.shape[1:]
+    assert gathered_router.shape[1:] == router.shape[1:]
+    assert dispatched_weights.shape[1:] == weights.shape[1:]
+    assert dispatched_ids.shape[1:] == ids.shape[1:]
+    assert gathered_hidden.dtype == hidden.dtype
+    assert gathered_router.dtype == router.dtype
+    assert dispatched_weights.dtype == weights.dtype
+    assert dispatched_ids.dtype == ids.dtype
+
+
+def test_cpu_ep_combine_fake_preserves_trailing_shape_and_dtype():
+    from torch._subclasses.fake_tensor import FakeTensorMode
+    from torch.fx.experimental.symbolic_shapes import ShapeEnv
+
+    from vllm.distributed.device_communicators.cpu_communicator import (
+        _cpu_ep_combine_v1,
+    )
+
+    with FakeTensorMode(shape_env=ShapeEnv()):
+        hidden = torch.empty(3, HIDDEN_SIZE, dtype=torch.bfloat16)
+        counts = torch.tensor([2, 1], dtype=torch.int32)
+        output = _cpu_ep_combine_v1(hidden, counts, 1, "dp:fake")
+
+    assert output.shape[1:] == hidden.shape[1:]
+    assert output.dtype == hidden.dtype
 
 
 def _ensure_spawn_start_method():
@@ -203,7 +416,13 @@ def _init_tp_dp_environment(rank, tp_size, dp_size, port, dp_port):
         ensure_model_parallel_initialized(tp_size, 1, backend="gloo")
 
 
-def _make_forward_context(dp_rank, dp_size, num_tokens, num_tokens_across_dp):
+def _make_forward_context(
+    dp_rank,
+    dp_size,
+    num_tokens,
+    num_tokens_across_dp,
+    vllm_config=None,
+):
     """Create a forward context with explicit DP token counts."""
     from vllm.config.parallel import ParallelConfig
     from vllm.config.vllm import VllmConfig
@@ -212,7 +431,8 @@ def _make_forward_context(dp_rank, dp_size, num_tokens, num_tokens_across_dp):
     class _AttnMeta:
         dp_metadata = None
 
-    vllm_config = VllmConfig()
+    if vllm_config is None:
+        vllm_config = VllmConfig()
     vllm_config.parallel_config = ParallelConfig(
         data_parallel_size=dp_size,
         is_moe_model=True,
@@ -262,6 +482,10 @@ def _expected_combined(rank, sizes, cols):
     return rows[start:end] * len(sizes) + tag_sum
 
 
+def _assert_no_alias(output, input_):
+    assert not torch._C._is_alias_of(output, input_)
+
+
 def _sp_local_sizes(dp_token_counts, tp_size):
     sizes = []
     for dp_tokens in dp_token_counts:
@@ -303,42 +527,62 @@ def _ragged_dispatch_worker(
         with _make_forward_context(rank, dp_size, local_rows, sizes):
             dp_metadata = get_forward_context().dp_metadata
             assert dp_metadata is not None
+            sentinel_sizes = [101 + rank]
+            dp_metadata.local_sizes = sentinel_sizes
+
+            hidden_input = hidden.clone()
+            router_input = router.clone()
+            gathered_hidden, gathered_router = get_ep_group().dispatch_router_logits(
+                hidden_input,
+                router_input,
+            )
+            torch.testing.assert_close(gathered_hidden, expected_hidden)
+            torch.testing.assert_close(gathered_router, expected_router)
+            _assert_no_alias(gathered_hidden, hidden_input)
+            _assert_no_alias(gathered_router, router_input)
+            assert dp_metadata.local_sizes is sentinel_sizes
+
+            hidden_input = hidden.clone()
+            weights_input = weights.clone()
+            ids_input = ids.clone()
+            gathered_hidden2, gathered_weights, gathered_ids = get_ep_group().dispatch(
+                hidden_input,
+                weights_input,
+                ids_input,
+            )
+            torch.testing.assert_close(gathered_hidden2, expected_hidden)
+            torch.testing.assert_close(gathered_weights, expected_weights)
+            torch.testing.assert_close(gathered_ids, expected_ids)
+            _assert_no_alias(gathered_hidden2, hidden_input)
+            _assert_no_alias(gathered_weights, weights_input)
+            _assert_no_alias(gathered_ids, ids_input)
+            assert dp_metadata.local_sizes is sentinel_sizes
+
+            total_rows = sum(sizes)
+            expert_out = torch.arange(total_rows, dtype=torch.float32).unsqueeze(
+                1
+            ).expand(total_rows, HIDDEN_SIZE).contiguous() + float((rank + 1) * 1000)
+            combined = get_ep_group().combine(expert_out)
+            torch.testing.assert_close(
+                combined,
+                _expected_combined(rank, sizes, HIDDEN_SIZE),
+            )
+            _assert_no_alias(combined, expert_out)
+            assert dp_metadata.local_sizes is sentinel_sizes
 
             with dp_metadata.sp_local_sizes(sequence_parallel_size=1):
-                gathered_hidden, gathered_router, gathered_extras = (
+                gathered_hidden3, gathered_router3, gathered_extras = (
                     get_ep_group().dispatch_router_logits(
                         hidden.clone(),
                         router.clone(),
                         extra_tensors=[extra.clone()],
                     )
                 )
-                torch.testing.assert_close(gathered_hidden, expected_hidden)
-                torch.testing.assert_close(gathered_router, expected_router)
+                torch.testing.assert_close(gathered_hidden3, expected_hidden)
+                torch.testing.assert_close(gathered_router3, expected_router)
                 assert len(gathered_extras) == 1
                 torch.testing.assert_close(gathered_extras[0], expected_extra)
-
-                gathered_hidden2, gathered_weights, gathered_ids = (
-                    get_ep_group().dispatch(
-                        hidden.clone(),
-                        weights.clone(),
-                        ids.clone(),
-                    )
-                )
-                torch.testing.assert_close(gathered_hidden2, expected_hidden)
-                torch.testing.assert_close(gathered_weights, expected_weights)
-                torch.testing.assert_close(gathered_ids, expected_ids)
-
-                total_rows = sum(sizes)
-                expert_out = torch.arange(total_rows, dtype=torch.float32).unsqueeze(
-                    1
-                ).expand(total_rows, HIDDEN_SIZE).contiguous() + float(
-                    (rank + 1) * 1000
-                )
-                combined = get_ep_group().combine(expert_out)
-                torch.testing.assert_close(
-                    combined,
-                    _expected_combined(rank, sizes, HIDDEN_SIZE),
-                )
+            assert dp_metadata.local_sizes is sentinel_sizes
 
         dist.barrier()
     except Exception as err:
@@ -415,10 +659,57 @@ def _sequence_parallel_worker(
         ):
             dp_metadata = get_forward_context().dp_metadata
             assert dp_metadata is not None
+            sentinel_sizes = [201 + rank]
+            dp_metadata.local_sizes = sentinel_sizes
+
+            hidden_input = hidden.clone()
+            router_input = router.clone()
+            gathered_hidden, gathered_router = ep_group.dispatch_router_logits(
+                hidden_input,
+                router_input,
+                is_sequence_parallel=True,
+            )
+            torch.testing.assert_close(gathered_hidden, expected_hidden)
+            torch.testing.assert_close(gathered_router, expected_router)
+            _assert_no_alias(gathered_hidden, hidden_input)
+            _assert_no_alias(gathered_router, router_input)
+            assert dp_metadata.local_sizes is sentinel_sizes
+
+            hidden_input = hidden.clone()
+            weights_input = weights.clone()
+            ids_input = ids.clone()
+            gathered_hidden2, gathered_weights, gathered_ids = ep_group.dispatch(
+                hidden_input,
+                weights_input,
+                ids_input,
+                is_sequence_parallel=True,
+            )
+            torch.testing.assert_close(gathered_hidden2, expected_hidden)
+            torch.testing.assert_close(gathered_weights, expected_weights)
+            torch.testing.assert_close(gathered_ids, expected_ids)
+            _assert_no_alias(gathered_hidden2, hidden_input)
+            _assert_no_alias(gathered_weights, weights_input)
+            _assert_no_alias(gathered_ids, ids_input)
+            assert dp_metadata.local_sizes is sentinel_sizes
+
+            total_rows = sum(expected_local_sizes)
+            expert_out = torch.arange(total_rows, dtype=torch.float32).unsqueeze(
+                1
+            ).expand(total_rows, HIDDEN_SIZE).contiguous() + float((rank + 1) * 1000)
+            combined = ep_group.combine(
+                expert_out,
+                is_sequence_parallel=True,
+            )
+            torch.testing.assert_close(
+                combined,
+                _expected_combined(rank, expected_local_sizes, HIDDEN_SIZE),
+            )
+            _assert_no_alias(combined, expert_out)
+            assert dp_metadata.local_sizes is sentinel_sizes
 
             with dp_metadata.sp_local_sizes(sequence_parallel_size=tp_size) as sizes:
                 assert sizes == expected_local_sizes
-                gathered_hidden, gathered_router, gathered_extras = (
+                gathered_hidden3, gathered_router3, gathered_extras = (
                     ep_group.dispatch_router_logits(
                         hidden.clone(),
                         router.clone(),
@@ -426,43 +717,14 @@ def _sequence_parallel_worker(
                         extra_tensors=[extra.clone()],
                     )
                 )
-                torch.testing.assert_close(gathered_hidden, expected_hidden)
-                torch.testing.assert_close(gathered_router, expected_router)
+                torch.testing.assert_close(gathered_hidden3, expected_hidden)
+                torch.testing.assert_close(gathered_router3, expected_router)
                 assert len(gathered_extras) == 1
                 torch.testing.assert_close(gathered_extras[0], expected_extra)
-                assert dp_metadata.local_sizes is sizes
-
-                gathered_hidden2, gathered_weights, gathered_ids = ep_group.dispatch(
-                    hidden.clone(),
-                    weights.clone(),
-                    ids.clone(),
-                    is_sequence_parallel=True,
-                )
-                torch.testing.assert_close(gathered_hidden2, expected_hidden)
-                torch.testing.assert_close(gathered_weights, expected_weights)
-                torch.testing.assert_close(gathered_ids, expected_ids)
-                assert dp_metadata.local_sizes is sizes
-
-                total_rows = sum(expected_local_sizes)
-                expert_out = torch.arange(total_rows, dtype=torch.float32).unsqueeze(
-                    1
-                ).expand(total_rows, HIDDEN_SIZE).contiguous() + float(
-                    (rank + 1) * 1000
-                )
-                combined = ep_group.combine(
-                    expert_out,
-                    is_sequence_parallel=True,
-                )
-                torch.testing.assert_close(
-                    combined,
-                    _expected_combined(rank, expected_local_sizes, HIDDEN_SIZE),
-                )
-                assert dp_metadata.local_sizes is sizes
-
-            assert dp_metadata.local_sizes is None
+            assert dp_metadata.local_sizes is sentinel_sizes
 
         if HAS_CPU_SHM:
-            assert shm_counts == {"all_gatherv": 2, "reduce_scatterv": 1}
+            assert shm_counts == {"all_gatherv": 3, "reduce_scatterv": 1}
 
         dist.barrier()
     except Exception as err:
@@ -470,50 +732,87 @@ def _sequence_parallel_worker(
 
 
 @torch._dynamo.config.patch(capture_dynamic_output_shape_ops=True)
-def _run_compiled_fastpath(rank, sizes, backend):
+def _run_compiled_fastpath(
+    rank,
+    tp_size,
+    dp_size,
+    size_patterns,
+    is_sequence_parallel,
+):
     from vllm.distributed.parallel_state import get_ep_group
+    from vllm.forward_context import get_forward_context
 
-    def fastpath_step(hidden_states, router_logits):
-        gathered_hidden, _ = get_ep_group().dispatch_router_logits(
+    ep_group = get_ep_group()
+
+    def fastpath_step(hidden_states, router_logits, topk_weights, topk_ids):
+        gathered_hidden, _ = ep_group.dispatch_router_logits(
             hidden_states,
             router_logits,
+            is_sequence_parallel=is_sequence_parallel,
         )
-        return get_ep_group().combine(gathered_hidden) + hidden_states
+        dispatched_hidden, _, _ = ep_group.dispatch(
+            hidden_states,
+            topk_weights,
+            topk_ids,
+            is_sequence_parallel=is_sequence_parallel,
+        )
+        combined = ep_group.combine(
+            gathered_hidden + dispatched_hidden,
+            is_sequence_parallel=is_sequence_parallel,
+        )
+        return combined + hidden_states
 
-    compiled = torch.compile(fastpath_step, fullgraph=True, backend=backend)
-    local_rows = sizes[rank]
-    hidden = _filled(local_rows, HIDDEN_SIZE, float(rank + 1))
-    router = _filled(local_rows, NUM_EXPERTS, float((rank + 1) * 10))
-    output = compiled(hidden, router)
-    torch.testing.assert_close(output, hidden * (len(sizes) + 1))
+    compiled = torch.compile(
+        fastpath_step,
+        fullgraph=True,
+        dynamic=True,
+        backend="inductor",
+    )
+    collective_size = ep_group.world_size if is_sequence_parallel else dp_size
+    dp_rank = rank // tp_size
+
+    with (
+        torch._dynamo.config.patch(error_on_recompile=True),
+        torch.fx.experimental._config.patch(use_duck_shape=False),
+    ):
+        for token_counts in size_patterns:
+            local_sizes = (
+                _sp_local_sizes(token_counts, tp_size)
+                if is_sequence_parallel
+                else token_counts
+            )
+            local_rows = local_sizes[rank if is_sequence_parallel else dp_rank]
+            hidden = _filled(local_rows, HIDDEN_SIZE, float(rank + 1))
+            router = _filled(local_rows, NUM_EXPERTS, float((rank + 1) * 10))
+            weights = _filled(local_rows, TOPK, float((rank + 1) * 100))
+            ids = torch.full((local_rows, TOPK), rank, dtype=torch.long)
+            for tensor in (hidden, router, weights, ids):
+                torch._dynamo.decorators.mark_unbacked(
+                    tensor,
+                    0,
+                    shape_id="local_rows",
+                )
+
+            with _make_forward_context(
+                dp_rank,
+                dp_size,
+                token_counts[dp_rank],
+                token_counts,
+            ):
+                dp_metadata = get_forward_context().dp_metadata
+                assert dp_metadata is not None
+                sentinel_sizes = [301 + rank]
+                dp_metadata.local_sizes = sentinel_sizes
+                output = compiled(hidden, router, weights, ids)
+                assert dp_metadata.local_sizes is sentinel_sizes
+
+            torch.testing.assert_close(
+                output,
+                hidden * (2 * collective_size + 1),
+            )
 
 
 def _compile_fastpath_worker(
-    rank,
-    world_size,
-    tp_size,
-    dp_size,
-    port,
-    dp_port,
-    compile_params,
-    err_q,
-):
-    try:
-        os.environ.setdefault("VLLM_DIST_IDENT", f"test_cpu_ep_compile_{port}")
-        _init_tp_dp_environment(rank, tp_size, dp_size, port, dp_port)
-        torch._dynamo.reset()
-
-        backend, size_patterns = compile_params
-        for sizes in size_patterns:
-            with _make_forward_context(rank, dp_size, sizes[rank], sizes):
-                _run_compiled_fastpath(rank, sizes, backend)
-
-        dist.barrier()
-    except Exception as err:
-        _report_worker_failure(rank, err_q, err)
-
-
-def _cached_non_sp_sizes_worker(
     rank,
     world_size,
     tp_size,
@@ -524,86 +823,143 @@ def _cached_non_sp_sizes_worker(
     err_q,
 ):
     try:
-        os.environ.setdefault("VLLM_DIST_IDENT", f"test_cpu_ep_cached_sizes_{port}")
+        os.environ.setdefault("VLLM_DIST_IDENT", f"test_cpu_ep_compile_{port}")
         _init_tp_dp_environment(rank, tp_size, dp_size, port, dp_port)
-
-        from vllm.distributed.parallel_state import get_ep_group
-        from vllm.forward_context import get_forward_context
-
-        ep_group = get_ep_group()
-        communicator = ep_group.device_communicator
-        assert communicator is not None
-
-        for sizes in size_patterns:
-            local_rows = sizes[rank]
-            hidden = _filled(local_rows, HIDDEN_SIZE, float(rank + 1))
-            router = _filled(local_rows, NUM_EXPERTS, float((rank + 1) * 10))
-            weights = _filled(local_rows, TOPK, float((rank + 1) * 100))
-            ids = torch.full((local_rows, TOPK), rank, dtype=torch.long)
-
-            expected_hidden = _concat_rank_values(sizes, HIDDEN_SIZE, 1.0)
-            expected_router = _concat_rank_values(sizes, NUM_EXPERTS, 10.0)
-            expected_weights = _concat_rank_values(sizes, TOPK, 100.0)
-            expected_ids = _concat_rank_ids(sizes)
-
-            with _make_forward_context(rank, dp_size, local_rows, sizes):
-                dp_metadata = get_forward_context().dp_metadata
-                assert dp_metadata is not None
-                assert dp_metadata.local_sizes is None
-
-                gathered_hidden, gathered_router = communicator._ep_dispatch_rl_op(
-                    hidden.clone(),
-                    router.clone(),
-                )
-                torch.testing.assert_close(gathered_hidden, expected_hidden)
-                torch.testing.assert_close(gathered_router, expected_router)
-                assert communicator._cached_non_sp_dp_metadata is dp_metadata
-                assert communicator._cached_non_sp_dp_sizes == sizes
-                assert dp_metadata.local_sizes is None
-
-                gathered_hidden2, gathered_router2 = ep_group.dispatch_router_logits(
-                    hidden.clone(),
-                    router.clone(),
-                )
-                torch.testing.assert_close(gathered_hidden2, expected_hidden)
-                torch.testing.assert_close(gathered_router2, expected_router)
-
-                gathered_hidden3, gathered_weights, gathered_ids = ep_group.dispatch(
-                    hidden.clone(),
-                    weights.clone(),
-                    ids.clone(),
-                )
-                torch.testing.assert_close(gathered_hidden3, expected_hidden)
-                torch.testing.assert_close(gathered_weights, expected_weights)
-                torch.testing.assert_close(gathered_ids, expected_ids)
-
-                total_rows = sum(sizes)
-                expert_out = torch.arange(total_rows, dtype=torch.float32).unsqueeze(
-                    1
-                ).expand(total_rows, HIDDEN_SIZE).contiguous() + float(
-                    (rank + 1) * 1000
-                )
-                combined = ep_group.combine(expert_out)
-                torch.testing.assert_close(
-                    combined,
-                    _expected_combined(rank, sizes, HIDDEN_SIZE),
-                )
-                assert communicator._cached_non_sp_dp_metadata is dp_metadata
-                assert communicator._cached_non_sp_dp_sizes == sizes
-                assert dp_metadata.local_sizes is None
-
-                stale_local_sizes = [0] * dp_size
-                dp_metadata.local_sizes = stale_local_sizes
-                gathered_hidden4, gathered_router4 = ep_group.dispatch_router_logits(
-                    hidden.clone(),
-                    router.clone(),
-                )
-                torch.testing.assert_close(gathered_hidden4, expected_hidden)
-                torch.testing.assert_close(gathered_router4, expected_router)
-                assert dp_metadata.local_sizes == stale_local_sizes
-                dp_metadata.local_sizes = None
+        torch._dynamo.reset()
+        is_sequence_parallel, patterns = size_patterns
+        _run_compiled_fastpath(
+            rank,
+            tp_size,
+            dp_size,
+            patterns,
+            is_sequence_parallel,
+        )
 
         dist.barrier()
+    except Exception as err:
+        _report_worker_failure(rank, err_q, err)
+
+
+def _aot_cache_worker(
+    rank,
+    world_size,
+    tp_size,
+    dp_size,
+    port,
+    dp_port,
+    params,
+    err_q,
+):
+    try:
+        phase, cache_root, token_counts = params
+        os.environ["VLLM_DIST_IDENT"] = f"test_cpu_ep_aot_{phase}_{port}"
+        os.environ["VLLM_CACHE_ROOT"] = cache_root
+        os.environ["TORCHINDUCTOR_CACHE_DIR"] = str(Path(cache_root) / "torchinductor")
+        os.environ["VLLM_USE_AOT_COMPILE"] = "1"
+        os.environ["VLLM_USE_MEGA_AOT_ARTIFACT"] = "1"
+        os.environ["VLLM_USE_STANDALONE_COMPILE"] = "1"
+        os.environ["VLLM_USE_BYTECODE_HOOK"] = "0"
+
+        from torch._dynamo.utils import counters
+
+        from vllm.compilation.counter import compilation_counter
+        from vllm.config import (
+            CompilationConfig,
+            CompilationMode,
+            VllmConfig,
+            set_current_vllm_config,
+        )
+        from vllm.config.compilation import DynamicShapesConfig, DynamicShapesType
+        from vllm.envs import disable_envs_cache
+        from vllm.forward_context import get_forward_context
+
+        disable_envs_cache()
+        _init_tp_dp_environment(rank, tp_size, dp_size, port, dp_port)
+        torch._dynamo.reset()
+        counters.clear()
+        before = compilation_counter.clone()
+
+        vllm_config = VllmConfig(
+            compilation_config=CompilationConfig(
+                mode=CompilationMode.VLLM_COMPILE,
+                backend="inductor",
+                splitting_ops=[
+                    "vllm::cpu_ep_dispatch_router_logits_v1",
+                    "vllm::cpu_ep_combine_v1",
+                ],
+                dynamic_shapes_config=DynamicShapesConfig(
+                    type=DynamicShapesType.UNBACKED
+                ),
+            )
+        )
+        local_rows = token_counts[rank]
+        hidden = _filled(local_rows, HIDDEN_SIZE, float(rank + 1))
+        router = _filled(local_rows, NUM_EXPERTS, float((rank + 1) * 10))
+
+        with (
+            set_current_vllm_config(vllm_config),
+            _make_forward_context(
+                rank,
+                dp_size,
+                local_rows,
+                token_counts,
+                vllm_config=vllm_config,
+            ),
+            torch._dynamo.config.patch(capture_dynamic_output_shape_ops=True),
+            torch.fx.experimental._config.patch(use_duck_shape=False),
+        ):
+            dp_metadata = get_forward_context().dp_metadata
+            assert dp_metadata is not None
+            sentinel_sizes = [401 + rank]
+            dp_metadata.local_sizes = sentinel_sizes
+            model = _CpuEpAotModel(vllm_config=vllm_config)  # type: ignore[call-arg]
+            dist.barrier()
+            output = model(hidden, router)
+            assert dp_metadata.local_sizes is sentinel_sizes
+            dist.barrier()
+            torch._dynamo.reset()
+            torch._dynamo.decorators.mark_unbacked(
+                output,
+                0,
+                shape_id="local_rows",
+            )
+            postprocess = torch.compile(
+                _cpu_ep_inductor_postprocess,
+                fullgraph=True,
+                dynamic=True,
+                backend="inductor",
+            )
+            postprocessed = postprocess(output)
+
+        torch.testing.assert_close(output, hidden * (dp_size + 1))
+        torch.testing.assert_close(postprocessed, output * 2 + 1)
+        dist.barrier()
+
+        snapshot = {
+            "aot_compiles": (
+                compilation_counter.num_aot_compiles - before.num_aot_compiles
+            ),
+            "aot_saved": (
+                compilation_counter.num_aot_artifacts_saved
+                - before.num_aot_artifacts_saved
+            ),
+            "aot_loaded": (
+                compilation_counter.num_aot_artifacts_loaded
+                - before.num_aot_artifacts_loaded
+            ),
+            "standalone_saved": (
+                compilation_counter.num_compiled_artifacts_saved
+                - before.num_compiled_artifacts_saved
+            ),
+            "standalone_loaded": (
+                compilation_counter.num_compiled_artifacts_loaded
+                - before.num_compiled_artifacts_loaded
+            ),
+            "fxgraph_cache_hit": counters["inductor"]["fxgraph_cache_hit"],
+            "fxgraph_cache_miss": counters["inductor"]["fxgraph_cache_miss"],
+        }
+        result_path = Path(cache_root) / f"{phase}-rank-{rank}.json"
+        result_path.write_text(json.dumps(snapshot), encoding="utf-8")
     except Exception as err:
         _report_worker_failure(rank, err_q, err)
 
@@ -1225,7 +1581,11 @@ def _dp_shm_reduce_scatterv_worker(
 
 
 @pytest.mark.distributed
-@pytest.mark.parametrize("sizes", [[2, 1], [0, 3]], ids=["ragged", "zero-rank"])
+@pytest.mark.parametrize(
+    "sizes",
+    [[2, 1], [0, 3], [4, 0], [0, 0]],
+    ids=["ragged", "zero-rank", "reversed-zero", "all-zero"],
+)
 def test_cpu_ep_dispatch_combine_ragged(sizes):
     _spawn_workers(
         _ragged_dispatch_worker,
@@ -1249,33 +1609,76 @@ def test_cpu_ep_sequence_parallel_uses_ep_group():
 
 @pytest.mark.distributed
 @pytest.mark.skipif(not hasattr(torch, "compile"), reason="torch.compile required")
-@pytest.mark.parametrize(
-    "backend",
-    [
-        "eager",
-        "inductor",
-    ],
-)
-def test_cpu_ep_compile_ragged_fastpath(backend):
+def test_cpu_ep_compile_non_sp_ragged_fastpath():
     _spawn_workers(
         _compile_fastpath_worker,
         world_size=2,
         tp_size=1,
         dp_size=2,
-        params=(backend, [[2, 1], [0, 3]]),
-        timeout_s=60 if backend == "inductor" else None,
+        params=(False, [[2, 1], [0, 3], [4, 0], [0, 0]]),
+        timeout_s=60,
     )
 
 
 @pytest.mark.distributed
-def test_cpu_ep_custom_ops_refresh_cached_non_sp_sizes():
+@pytest.mark.skipif(not hasattr(torch, "compile"), reason="torch.compile required")
+def test_cpu_ep_compile_sp_ragged_fastpath():
     _spawn_workers(
-        _cached_non_sp_sizes_worker,
-        world_size=2,
-        tp_size=1,
+        _compile_fastpath_worker,
+        world_size=4,
+        tp_size=2,
         dp_size=2,
-        params=[[2, 1], [0, 3]],
+        params=(True, [[2, 1], [0, 3], [4, 0], [0, 0]]),
+        timeout_s=60,
     )
+
+
+@pytest.mark.distributed
+@pytest.mark.skipif(not hasattr(torch, "compile"), reason="torch.compile required")
+def test_cpu_ep_aot_cache_fallback_reuses_inductor_cache():
+    with tempfile.TemporaryDirectory(prefix="vllm-cpu-ep-aot-") as cache_root:
+        _spawn_workers(
+            _aot_cache_worker,
+            world_size=2,
+            tp_size=1,
+            dp_size=2,
+            params=("cold", cache_root, [2, 1]),
+        )
+        _spawn_workers(
+            _aot_cache_worker,
+            world_size=2,
+            tp_size=1,
+            dp_size=2,
+            params=("warm", cache_root, [0, 3]),
+        )
+
+        warm_results = []
+        for rank in range(2):
+            cold = json.loads(
+                (Path(cache_root) / f"cold-rank-{rank}.json").read_text(
+                    encoding="utf-8"
+                )
+            )
+            warm = json.loads(
+                (Path(cache_root) / f"warm-rank-{rank}.json").read_text(
+                    encoding="utf-8"
+                )
+            )
+            warm_results.append(warm)
+
+            assert cold["aot_compiles"] == 1
+            assert cold["aot_saved"] == 1
+            assert cold["aot_loaded"] == 0
+            if torch.__version__.split("+", maxsplit=1)[0].startswith("2.11."):
+                assert warm["aot_loaded"] == 0
+                assert warm["aot_compiles"] == 1
+
+            if cold["standalone_saved"] > 0:
+                assert warm["standalone_loaded"] == cold["standalone_saved"]
+                assert warm["standalone_saved"] == 0
+
+        assert sum(result["fxgraph_cache_hit"] for result in warm_results) > 0
+        assert sum(result["fxgraph_cache_miss"] for result in warm_results) == 0
 
 
 @pytest.mark.distributed

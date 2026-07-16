@@ -1,8 +1,11 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+from __future__ import annotations
+
 import os
 from typing import Any
+from weakref import WeakValueDictionary
 
 import torch
 from torch.distributed import ProcessGroup
@@ -16,6 +19,210 @@ from vllm.platforms.interface import CpuArchEnum
 from .base_device_communicator import DeviceCommunicatorBase
 
 logger = init_logger(__name__)
+
+_CPU_COMMUNICATORS: WeakValueDictionary[str, CpuCommunicator] = WeakValueDictionary()
+_INTEGER_DTYPES = {
+    torch.uint8,
+    torch.int8,
+    torch.int16,
+    torch.int32,
+    torch.int64,
+}
+
+
+def _register_cpu_communicator(communicator: CpuCommunicator) -> None:
+    group_name = communicator.unique_name
+    existing = _CPU_COMMUNICATORS.get(group_name)
+    if existing is not None and existing is not communicator:
+        raise RuntimeError(
+            f"CPU communicator group {group_name!r} is already registered"
+        )
+    _CPU_COMMUNICATORS[group_name] = communicator
+
+
+def _unregister_cpu_communicator(communicator: CpuCommunicator) -> None:
+    if _CPU_COMMUNICATORS.get(communicator.unique_name) is communicator:
+        del _CPU_COMMUNICATORS[communicator.unique_name]
+
+
+def _resolve_cpu_communicator(group_name: str) -> CpuCommunicator:
+    communicator = _CPU_COMMUNICATORS.get(group_name)
+    if communicator is None:
+        raise RuntimeError(f"CPU communicator group {group_name!r} is not registered")
+    return communicator
+
+
+def _get_cpu_ep_sizes(
+    token_counts: torch.Tensor,
+    sp_size: int,
+    world_size: int,
+) -> list[int]:
+    if token_counts.device.type != "cpu":
+        raise RuntimeError("CPU EP token counts must be on CPU")
+    if token_counts.dim() != 1:
+        raise RuntimeError("CPU EP token counts must be one-dimensional")
+    if token_counts.dtype not in _INTEGER_DTYPES:
+        raise RuntimeError("CPU EP token counts must have an integer dtype")
+    if sp_size <= 0:
+        raise RuntimeError("CPU EP sequence-parallel size must be positive")
+
+    dp_size = token_counts.numel()
+    if dp_size * sp_size != world_size:
+        raise RuntimeError(
+            "CPU EP communicator size mismatch: "
+            f"dp_size ({dp_size}) * sp_size ({sp_size}) != world_size ({world_size})"
+        )
+    if torch.any(token_counts < 0).item():
+        raise RuntimeError("CPU EP token counts must be nonnegative")
+
+    dp_sizes = [int(size) for size in token_counts.tolist()]
+    if sp_size == 1:
+        return dp_sizes
+    return [
+        (size + sp_size - 1) // sp_size for size in dp_sizes for _ in range(sp_size)
+    ]
+
+
+def _validate_cpu_ep_rows(
+    tensors: list[torch.Tensor],
+    expected_rows: int,
+    operation: str,
+) -> None:
+    for tensor in tensors:
+        if tensor.dim() == 0 or tensor.shape[0] != expected_rows:
+            actual_rows = "scalar" if tensor.dim() == 0 else str(tensor.shape[0])
+            raise RuntimeError(
+                f"CPU EP {operation} expected {expected_rows} rows, "
+                f"but received {actual_rows}"
+            )
+
+
+@torch.library.custom_op(
+    "vllm::cpu_ep_dispatch_router_logits_v1",
+    mutates_args=(),
+    device_types="cpu",
+    tags=(torch.Tag.dynamic_output_shape,),
+)
+def _cpu_ep_dispatch_router_logits_v1(
+    hidden_states: torch.Tensor,
+    router_logits: torch.Tensor,
+    token_counts: torch.Tensor,
+    sp_size: int,
+    group_name: str,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    communicator = _resolve_cpu_communicator(group_name)
+    sizes = _get_cpu_ep_sizes(token_counts, sp_size, communicator.world_size)
+    _validate_cpu_ep_rows(
+        [hidden_states, router_logits],
+        sizes[communicator.rank_in_group],
+        "dispatch",
+    )
+    outputs = communicator.all_gatherv(
+        [hidden_states, router_logits],
+        dim=0,
+        sizes=sizes,
+    )
+    assert isinstance(outputs, list)
+    _validate_cpu_ep_rows(outputs, sum(sizes), "dispatch output")
+    return outputs[0], outputs[1]
+
+
+@_cpu_ep_dispatch_router_logits_v1.register_fake
+def _cpu_ep_dispatch_router_logits_v1_fake(
+    hidden_states: torch.Tensor,
+    router_logits: torch.Tensor,
+    token_counts: torch.Tensor,
+    sp_size: int,
+    group_name: str,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    dynamic_rows = torch.library.get_ctx().new_dynamic_size()
+    return (
+        hidden_states.new_empty((dynamic_rows,) + hidden_states.shape[1:]),
+        router_logits.new_empty((dynamic_rows,) + router_logits.shape[1:]),
+    )
+
+
+@torch.library.custom_op(
+    "vllm::cpu_ep_dispatch_v1",
+    mutates_args=(),
+    device_types="cpu",
+    tags=(torch.Tag.dynamic_output_shape,),
+)
+def _cpu_ep_dispatch_v1(
+    hidden_states: torch.Tensor,
+    topk_weights: torch.Tensor,
+    topk_ids: torch.Tensor,
+    token_counts: torch.Tensor,
+    sp_size: int,
+    group_name: str,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    communicator = _resolve_cpu_communicator(group_name)
+    sizes = _get_cpu_ep_sizes(token_counts, sp_size, communicator.world_size)
+    _validate_cpu_ep_rows(
+        [hidden_states, topk_weights, topk_ids],
+        sizes[communicator.rank_in_group],
+        "dispatch",
+    )
+    outputs = communicator.all_gatherv(
+        [hidden_states, topk_weights, topk_ids],
+        dim=0,
+        sizes=sizes,
+    )
+    assert isinstance(outputs, list)
+    _validate_cpu_ep_rows(outputs, sum(sizes), "dispatch output")
+    return outputs[0], outputs[1], outputs[2]
+
+
+@_cpu_ep_dispatch_v1.register_fake
+def _cpu_ep_dispatch_v1_fake(
+    hidden_states: torch.Tensor,
+    topk_weights: torch.Tensor,
+    topk_ids: torch.Tensor,
+    token_counts: torch.Tensor,
+    sp_size: int,
+    group_name: str,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    dynamic_rows = torch.library.get_ctx().new_dynamic_size()
+    return (
+        hidden_states.new_empty((dynamic_rows,) + hidden_states.shape[1:]),
+        topk_weights.new_empty((dynamic_rows,) + topk_weights.shape[1:]),
+        topk_ids.new_empty((dynamic_rows,) + topk_ids.shape[1:]),
+    )
+
+
+@torch.library.custom_op(
+    "vllm::cpu_ep_combine_v1",
+    mutates_args=(),
+    device_types="cpu",
+    tags=(torch.Tag.dynamic_output_shape,),
+)
+def _cpu_ep_combine_v1(
+    hidden_states: torch.Tensor,
+    token_counts: torch.Tensor,
+    sp_size: int,
+    group_name: str,
+) -> torch.Tensor:
+    communicator = _resolve_cpu_communicator(group_name)
+    sizes = _get_cpu_ep_sizes(token_counts, sp_size, communicator.world_size)
+    _validate_cpu_ep_rows([hidden_states], sum(sizes), "combine")
+    output = communicator.reduce_scatterv(hidden_states, dim=0, sizes=sizes)
+    _validate_cpu_ep_rows(
+        [output],
+        sizes[communicator.rank_in_group],
+        "combine output",
+    )
+    return output
+
+
+@_cpu_ep_combine_v1.register_fake
+def _cpu_ep_combine_v1_fake(
+    hidden_states: torch.Tensor,
+    token_counts: torch.Tensor,
+    sp_size: int,
+    group_name: str,
+) -> torch.Tensor:
+    dynamic_rows = torch.library.get_ctx().new_dynamic_size()
+    return hidden_states.new_empty((dynamic_rows,) + hidden_states.shape[1:])
 
 
 def _all_reduce_cpu_dp_metadata(
@@ -74,8 +281,6 @@ class CpuCommunicator(DeviceCommunicatorBase):
         self._ragged_shm_gather_buffers: dict[
             tuple[torch.dtype, torch.device, tuple[int, ...]], torch.Tensor
         ] = {}
-        self._cached_non_sp_dp_metadata: object | None = None
-        self._cached_non_sp_dp_sizes: list[int] | None = None
 
         if self.use_all2all:
             if self.all2all_backend not in (
@@ -91,7 +296,7 @@ class CpuCommunicator(DeviceCommunicatorBase):
 
             self.all2all_manager = AgRsAll2AllManager(self.cpu_group)
             logger.info("Using allgather_reducescatter all2all manager.")
-            self._register_ep_custom_ops()
+        _register_cpu_communicator(self)
 
     @classmethod
     def _is_cpushm_group_name(cls, unique_name: str) -> bool:
@@ -475,202 +680,25 @@ class CpuCommunicator(DeviceCommunicatorBase):
             )
         return self.dist_module.recv_tensor_dict(src)
 
-    def _register_ep_custom_ops(self) -> None:
-        """Register dispatch/combine as custom ops opaque to torch.compile."""
+    def _cpu_ep_op_args(
+        self,
+        is_sequence_parallel: bool,
+    ) -> tuple[torch.Tensor, int, str]:
+        dp_metadata = get_forward_context().dp_metadata
+        if dp_metadata is None:
+            raise RuntimeError("CPU EP custom ops require DP metadata")
+        token_counts = dp_metadata.num_tokens_across_dp_cpu
+
+        if is_sequence_parallel:
+            dp_size = token_counts.numel()
+            sp_size = self.world_size // dp_size if dp_size else 1
+            return token_counts, sp_size, self.unique_name
+
         assert self.all2all_manager is not None
-        mgr = self.all2all_manager
-        safe_name = (
-            self.unique_name.replace("-", "_").replace("/", "_").replace(":", "_")
-        )
-
-        def _with_non_sp_dp_sizes(fn):
-            dp_metadata = get_forward_context().dp_metadata
-            assert dp_metadata is not None
-
-            if self._cached_non_sp_dp_metadata is not dp_metadata:
-                self._cached_non_sp_dp_metadata = dp_metadata
-                self._cached_non_sp_dp_sizes = [
-                    int(size) for size in dp_metadata.num_tokens_across_dp_cpu.tolist()
-                ]
-
-            assert self._cached_non_sp_dp_sizes is not None
-            prev_local_sizes = dp_metadata.local_sizes
-            dp_metadata.local_sizes = self._cached_non_sp_dp_sizes
-            try:
-                return fn()
-            finally:
-                dp_metadata.local_sizes = prev_local_sizes
-
-        def _with_sp_sizes(fn):
-            dp_metadata = get_forward_context().dp_metadata
-            assert dp_metadata is not None
-            if dp_metadata.local_sizes is not None:
-                return fn()
-            dp_size = len(dp_metadata.num_tokens_across_dp_cpu)
-            assert self.world_size % dp_size == 0
-            sp_size = self.world_size // dp_size
-            with dp_metadata.sp_local_sizes(sp_size):
-                return fn()
-
-        @torch.library.custom_op(
-            f"vllm::cpu_ep_dispatch_rl_{safe_name}",
-            mutates_args=(),
-        )
-        def _dispatch_rl(
-            hidden_states: torch.Tensor,
-            router_logits: torch.Tensor,
-        ) -> tuple[torch.Tensor, torch.Tensor]:
-            return _with_non_sp_dp_sizes(
-                lambda: mgr.dispatch_router_logits(
-                    hidden_states,
-                    router_logits,
-                )
-            )
-
-        @_dispatch_rl.register_fake
-        def _(
-            hidden_states: torch.Tensor,
-            router_logits: torch.Tensor,
-        ) -> tuple[torch.Tensor, torch.Tensor]:
-            # Ragged dispatch: the real op all-gathers each rank's actual row
-            # count and returns sum(per_rank_sizes) rows. That total is
-            # data-dependent and unknown at trace time, so emit an unbacked
-            # symint instead of the uniform shape[0] * world_size (GPU parity).
-            ctx = torch.library.get_ctx()
-            n = ctx.new_dynamic_size()
-            return (
-                hidden_states.new_empty((n,) + hidden_states.shape[1:]),
-                router_logits.new_empty((n,) + router_logits.shape[1:]),
-            )
-
-        @torch.library.custom_op(
-            f"vllm::cpu_ep_dispatch_rl_sp_{safe_name}",
-            mutates_args=(),
-        )
-        def _dispatch_rl_sp(
-            hidden_states: torch.Tensor,
-            router_logits: torch.Tensor,
-        ) -> tuple[torch.Tensor, torch.Tensor]:
-            return _with_sp_sizes(
-                lambda: mgr.dispatch_router_logits(
-                    hidden_states,
-                    router_logits,
-                    is_sequence_parallel=True,
-                )
-            )
-
-        @_dispatch_rl_sp.register_fake
-        def _(
-            hidden_states: torch.Tensor,
-            router_logits: torch.Tensor,
-        ) -> tuple[torch.Tensor, torch.Tensor]:
-            ctx = torch.library.get_ctx()
-            n = ctx.new_dynamic_size()
-            return (
-                hidden_states.new_empty((n,) + hidden_states.shape[1:]),
-                router_logits.new_empty((n,) + router_logits.shape[1:]),
-            )
-
-        @torch.library.custom_op(
-            f"vllm::cpu_ep_dispatch_{safe_name}",
-            mutates_args=(),
-        )
-        def _dispatch(
-            hidden_states: torch.Tensor,
-            topk_weights: torch.Tensor,
-            topk_ids: torch.Tensor,
-        ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-            result = _with_non_sp_dp_sizes(
-                lambda: mgr.dispatch(hidden_states, topk_weights, topk_ids)
-            )
-            return result[0], result[1], result[2]
-
-        @_dispatch.register_fake
-        def _(
-            hidden_states: torch.Tensor,
-            topk_weights: torch.Tensor,
-            topk_ids: torch.Tensor,
-        ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-            # Ragged dispatch: the real op all-gathers each rank's actual row
-            # count and returns sum(per_rank_sizes) rows. That total is
-            # data-dependent and unknown at trace time, so emit an unbacked
-            # symint instead of the uniform shape[0] * world_size (GPU parity).
-            # All three outputs share the same n so downstream sees one row dim.
-            ctx = torch.library.get_ctx()
-            n = ctx.new_dynamic_size()
-            return (
-                hidden_states.new_empty((n,) + hidden_states.shape[1:]),
-                topk_weights.new_empty((n,) + topk_weights.shape[1:]),
-                topk_ids.new_empty((n,) + topk_ids.shape[1:]),
-            )
-
-        @torch.library.custom_op(
-            f"vllm::cpu_ep_dispatch_sp_{safe_name}",
-            mutates_args=(),
-        )
-        def _dispatch_sp(
-            hidden_states: torch.Tensor,
-            topk_weights: torch.Tensor,
-            topk_ids: torch.Tensor,
-        ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-            result = _with_sp_sizes(
-                lambda: mgr.dispatch(
-                    hidden_states,
-                    topk_weights,
-                    topk_ids,
-                    is_sequence_parallel=True,
-                )
-            )
-            return result[0], result[1], result[2]
-
-        @_dispatch_sp.register_fake
-        def _(
-            hidden_states: torch.Tensor,
-            topk_weights: torch.Tensor,
-            topk_ids: torch.Tensor,
-        ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-            ctx = torch.library.get_ctx()
-            n = ctx.new_dynamic_size()
-            return (
-                hidden_states.new_empty((n,) + hidden_states.shape[1:]),
-                topk_weights.new_empty((n,) + topk_weights.shape[1:]),
-                topk_ids.new_empty((n,) + topk_ids.shape[1:]),
-            )
-
-        @torch.library.custom_op(
-            f"vllm::cpu_ep_combine_{safe_name}",
-            mutates_args=(),
-        )
-        def _combine(hidden_states: torch.Tensor) -> torch.Tensor:
-            return _with_non_sp_dp_sizes(lambda: mgr.combine(hidden_states))
-
-        @_combine.register_fake
-        def _(hidden_states: torch.Tensor) -> torch.Tensor:
-            ctx = torch.library.get_ctx()
-            n = ctx.new_dynamic_size()
-            return hidden_states.new_empty((n,) + hidden_states.shape[1:])
-
-        @torch.library.custom_op(
-            f"vllm::cpu_ep_combine_sp_{safe_name}",
-            mutates_args=(),
-        )
-        def _combine_sp(hidden_states: torch.Tensor) -> torch.Tensor:
-            return _with_sp_sizes(
-                lambda: mgr.combine(hidden_states, is_sequence_parallel=True)
-            )
-
-        @_combine_sp.register_fake
-        def _(hidden_states: torch.Tensor) -> torch.Tensor:
-            ctx = torch.library.get_ctx()
-            n = ctx.new_dynamic_size()
-            return hidden_states.new_empty((n,) + hidden_states.shape[1:])
-
-        self._ep_dispatch_rl_op = _dispatch_rl
-        self._ep_dispatch_rl_sp_op = _dispatch_rl_sp
-        self._ep_dispatch_op = _dispatch
-        self._ep_dispatch_sp_op = _dispatch_sp
-        self._ep_combine_op = _combine
-        self._ep_combine_sp_op = _combine_sp
+        dp_communicator = self.all2all_manager.dp_group.device_communicator
+        if not isinstance(dp_communicator, CpuCommunicator):
+            raise RuntimeError("CPU EP custom ops require a CPU DP communicator")
+        return token_counts, 1, dp_communicator.unique_name
 
     def dispatch_router_logits(
         self,
@@ -683,18 +711,17 @@ class CpuCommunicator(DeviceCommunicatorBase):
         | tuple[torch.Tensor, torch.Tensor, list[torch.Tensor]]
     ):
         assert self.all2all_manager is not None
-        if (
-            extra_tensors is None
-            and is_sequence_parallel
-            and hasattr(self, "_ep_dispatch_rl_sp_op")
-        ):
-            return self._ep_dispatch_rl_sp_op(hidden_states, router_logits)
-        if (
-            extra_tensors is None
-            and not is_sequence_parallel
-            and hasattr(self, "_ep_dispatch_rl_op")
-        ):
-            return self._ep_dispatch_rl_op(hidden_states, router_logits)
+        if extra_tensors is None:
+            token_counts, sp_size, group_name = self._cpu_ep_op_args(
+                is_sequence_parallel
+            )
+            return _cpu_ep_dispatch_router_logits_v1(
+                hidden_states,
+                router_logits,
+                token_counts,
+                sp_size,
+                group_name,
+            )
         return self.all2all_manager.dispatch_router_logits(
             hidden_states, router_logits, is_sequence_parallel, extra_tensors
         )
@@ -711,18 +738,18 @@ class CpuCommunicator(DeviceCommunicatorBase):
         | tuple[torch.Tensor, torch.Tensor, torch.Tensor, list[torch.Tensor]]
     ):
         assert self.all2all_manager is not None
-        if (
-            extra_tensors is None
-            and is_sequence_parallel
-            and hasattr(self, "_ep_dispatch_sp_op")
-        ):
-            return self._ep_dispatch_sp_op(hidden_states, topk_weights, topk_ids)
-        if (
-            extra_tensors is None
-            and not is_sequence_parallel
-            and hasattr(self, "_ep_dispatch_op")
-        ):
-            return self._ep_dispatch_op(hidden_states, topk_weights, topk_ids)
+        if extra_tensors is None:
+            token_counts, sp_size, group_name = self._cpu_ep_op_args(
+                is_sequence_parallel
+            )
+            return _cpu_ep_dispatch_v1(
+                hidden_states,
+                topk_weights,
+                topk_ids,
+                token_counts,
+                sp_size,
+                group_name,
+            )
         return self.all2all_manager.dispatch(
             hidden_states,
             topk_weights,
@@ -732,16 +759,22 @@ class CpuCommunicator(DeviceCommunicatorBase):
         )
 
     def combine(
-        self,
-        hidden_states: torch.Tensor,
-        is_sequence_parallel: bool = False,
+        self, hidden_states: torch.Tensor, is_sequence_parallel: bool = False
     ) -> torch.Tensor:
         assert self.all2all_manager is not None
-        if is_sequence_parallel and hasattr(self, "_ep_combine_sp_op"):
-            return self._ep_combine_sp_op(hidden_states)
-        if not is_sequence_parallel and hasattr(self, "_ep_combine_op"):
-            return self._ep_combine_op(hidden_states)
-        return self.all2all_manager.combine(hidden_states, is_sequence_parallel)
+        token_counts, sp_size, group_name = self._cpu_ep_op_args(is_sequence_parallel)
+        return _cpu_ep_combine_v1(
+            hidden_states,
+            token_counts,
+            sp_size,
+            group_name,
+        )
+
+    def destroy(self) -> None:
+        _unregister_cpu_communicator(self)
+        if self.all2all_manager is not None:
+            self.all2all_manager.destroy()
+            self.all2all_manager = None
 
 
 class _CPUSHMDistributed:
