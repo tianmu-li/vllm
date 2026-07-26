@@ -12,6 +12,7 @@ from vllm.model_executor.layers.quantization.utils.w8a8_utils import (
 )
 from vllm.model_executor.layers.utils import check_cpu_sgl_kernel
 from vllm.platforms import current_platform
+from vllm.platforms.cpu import is_avx512_bf16_vnni_supported
 from vllm.platforms.interface import CpuArchEnum
 
 from .BlockScaledMMLinearKernel import (
@@ -222,7 +223,7 @@ class CPUInt8ScaledMMLinearKernel(Int8ScaledMMLinearKernel):
 
 
 class CPUFp8BlockScaledMMKernel(Fp8BlockScaledMMLinearKernel):
-    """FP8 W8A16 block-quantized GEMM via AMX BRGEMM on CPU."""
+    """FP8 W8A16 block-quantized GEMM on AVX512 CPU."""
 
     # Input stays BF16 — no FP8 activation quantization.
     apply_input_quant = False
@@ -233,8 +234,8 @@ class CPUFp8BlockScaledMMKernel(Fp8BlockScaledMMLinearKernel):
     ) -> tuple[bool, str | None]:
         if not current_platform.is_cpu():
             return False, "requires CPU platform."
-        if not torch.cpu._is_amx_tile_supported():
-            return False, "requires AMX tile support (Sapphire Rapids or newer)."
+        if not is_avx512_bf16_vnni_supported():
+            return False, "requires AVX512F, AVX512-BF16, and AVX512-VNNI."
         if not ops._supports_cpu_fp8_w8a16:
             return False, "fp8_scaled_mm_cpu op not available."
         return True, None
@@ -261,7 +262,7 @@ class CPUFp8BlockScaledMMKernel(Fp8BlockScaledMMLinearKernel):
 
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
         # Skip the base class process (FP8 padding / fnuz normalization)
-        # which is GPU-oriented.  Instead, VNNI-prepack weights for AMX.
+        # which is GPU-oriented. Instead, VNNI-prepack weights for CPU.
         params = self._get_layer_params(layer)
         packed_weight = torch.ops._C.convert_weight_packed(params.weight)
         replace_parameter(

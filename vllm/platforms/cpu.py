@@ -23,6 +23,15 @@ from .interface import CpuArchEnum, Platform, PlatformEnum
 
 logger = init_logger(__name__)
 
+
+def is_avx512_bf16_vnni_supported() -> bool:
+    capabilities = torch.cpu.get_capabilities()
+    return all(
+        capabilities.get(capability, False)
+        for capability in ("avx512_f", "avx512_bf16", "avx512_vnni")
+    )
+
+
 if TYPE_CHECKING:
     from vllm.config import VllmConfig
     from vllm.v1.attention.selector import AttentionSelectorConfig
@@ -423,29 +432,52 @@ class CpuPlatform(Platform):
     def num_compute_units(cls, device_id: int = 0) -> int:
         return torch.get_num_threads()
 
+    @staticmethod
+    def _get_x86_cpu_extension_name() -> str:
+        capabilities = torch.cpu.get_capabilities()
+        if is_avx512_bf16_vnni_supported():
+            if capabilities.get("amx_tile", False) and capabilities.get(
+                "amx_bf16", False
+            ):
+                return "_C"
+            return "_C_AVX512_BF16_VNNI"
+        if capabilities.get("avx512_f", False):
+            return "_C_AVX512"
+        return "_C_AVX2"
+
     @classmethod
     def import_kernels(cls) -> None:
         if Platform.get_cpu_architecture() in (CpuArchEnum.X86,):
-            # Note: The lib name is _C_AVX2/AVX512, but the module name is _C.
+            # These extensions register custom ops without defining Python
+            # module initializers, so importing them raises after registration.
             # This will cause a exception "dynamic module does define
             # module export function". But the library is imported
             # successfully. So ignore the exception for now, until we find
             # a solution.
             ignored_msg = "dynamic module does not define module export function"
-            if torch.cpu._is_avx512_supported():
-                if torch.cpu._is_avx512_bf16_supported():
-                    try:
-                        import vllm._C  # noqa: F401
-                    except ImportError as e:
-                        logger.warning_once("Failed to import from vllm._C: %r", e)
-                else:
-                    try:
-                        import vllm._C_AVX512  # noqa: F401
-                    except ImportError as e:
-                        if ignored_msg not in e.msg:
-                            logger.warning_once(
-                                "Failed to import from vllm._C_AVX512: %r", e
-                            )
+            extension_name = cls._get_x86_cpu_extension_name()
+            if extension_name == "_C":
+                try:
+                    import vllm._C  # noqa: F401
+                except ImportError as e:
+                    logger.warning_once("Failed to import from vllm._C: %r", e)
+            elif extension_name == "_C_AVX512_BF16_VNNI":
+                try:
+                    import vllm._C_AVX512_BF16_VNNI  # noqa: F401
+                except ImportError as e:
+                    if ignored_msg not in e.msg:
+                        logger.warning_once(
+                            "Failed to import from vllm._C_AVX512_BF16_VNNI: %r",
+                            e,
+                        )
+            elif extension_name == "_C_AVX512":
+                try:
+                    import vllm._C_AVX512  # noqa: F401
+                except ImportError as e:
+                    if ignored_msg not in e.msg:
+                        logger.warning_once(
+                            "Failed to import from vllm._C_AVX512: %r", e
+                        )
             else:
                 try:
                     import vllm._C_AVX2  # noqa: F401

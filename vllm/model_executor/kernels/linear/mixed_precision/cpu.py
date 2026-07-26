@@ -10,6 +10,7 @@ from vllm.model_executor.layers.quantization.utils.quant_utils import (
     unpack_quantized_values_into_int32,
 )
 from vllm.platforms import CpuArchEnum, current_platform
+from vllm.platforms.cpu import is_avx512_bf16_vnni_supported
 from vllm.scalar_type import scalar_types
 
 from .MPLinearKernel import MPLinearKernel, MPLinearLayerConfig
@@ -168,13 +169,13 @@ class CPUWNA16LinearKernel(MPLinearKernel):
             if zp.output_dim == 0:
                 zp.data = zp.t().contiguous()
 
-        supports_amx = torch.cpu._is_amx_tile_supported()
+        supports_w4a8 = is_avx512_bf16_vnni_supported()
         supports_riscv = current_platform.get_cpu_architecture() == CpuArchEnum.RISCV
         layer.use_w4a8 = (
             envs.VLLM_CPU_INT4_W4A8
             and not self.config.has_g_idx
             and self.config.act_type == torch.bfloat16
-            and (supports_amx or supports_riscv)
+            and (supports_w4a8 or supports_riscv)
         )
         # layer.use_w4a8 = False
         # AWQ format will be converted to GPTQ format in `AutoAWQMarlinLinearMethod`

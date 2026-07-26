@@ -9,6 +9,9 @@ import pytest
 import torch
 
 from vllm import _custom_ops as ops
+from vllm.model_executor.kernels.linear.scaled_mm.cpu import (
+    CPUFp8BlockScaledMMKernel,
+)
 from vllm.platforms import current_platform
 
 if not current_platform.is_cpu():
@@ -18,6 +21,32 @@ if not ops._supports_cpu_fp8_w8a16:
     pytest.skip("fp8_scaled_mm_cpu op not available", allow_module_level=True)
 
 BLOCK_SIZE = [128, 128]
+
+
+@pytest.mark.parametrize(
+    ("capabilities", "expected"),
+    [
+        (
+            {
+                "avx512_f": True,
+                "avx512_bf16": True,
+                "avx512_vnni": True,
+            },
+            True,
+        ),
+        ({"avx512_f": True, "avx512_bf16": True}, False),
+    ],
+)
+def test_cpu_fp8_kernel_isa_support(
+    monkeypatch: pytest.MonkeyPatch,
+    capabilities: dict[str, bool],
+    expected: bool,
+) -> None:
+    monkeypatch.setattr(torch.cpu, "get_capabilities", lambda: capabilities)
+
+    supported, _ = CPUFp8BlockScaledMMKernel.is_supported()
+
+    assert supported is expected
 
 
 def cdiv(a: int, b: int) -> int:

@@ -142,12 +142,14 @@ if (CMAKE_SYSTEM_PROCESSOR MATCHES "x86_64|amd64" OR ENABLE_X86_ISA)
         "-mavx512vl"
         "-mavx512bw"
         "-mavx512dq")
-    list(APPEND CXX_COMPILE_FLAGS_AVX512_AMX 
+    list(APPEND CXX_COMPILE_FLAGS_AVX512_BF16_VNNI
         ${CXX_COMPILE_FLAGS_AVX512}
-        "-mamx-bf16"
-        "-mamx-tile"
         "-mavx512bf16"
         "-mavx512vnni")
+    list(APPEND CXX_COMPILE_FLAGS_AVX512_AMX
+        ${CXX_COMPILE_FLAGS_AVX512_BF16_VNNI}
+        "-mamx-bf16"
+        "-mamx-tile")
     list(APPEND CXX_COMPILE_FLAGS_AVX2
         "-mavx2")
 elseif (POWER9_FOUND OR POWER10_FOUND OR POWER11_FOUND)
@@ -394,6 +396,7 @@ endif()
 # TODO: Refactor this
 if (ENABLE_X86_ISA)
     message(STATUS "CPU extension (AVX512F + BF16 + VNNI + AMX) compile flags: ${CXX_COMPILE_FLAGS_AVX512_AMX}")
+    message(STATUS "CPU extension (AVX512F + BF16 + VNNI) compile flags: ${CXX_COMPILE_FLAGS_AVX512_BF16_VNNI}")
     message(STATUS "CPU extension (AVX512F) compile flags: ${CXX_COMPILE_FLAGS_AVX512}")
     message(STATUS "CPU extension (AVX2) compile flags: ${CXX_COMPILE_FLAGS_AVX2}")
 else()
@@ -533,10 +536,12 @@ if (ENABLE_X86_ISA)
         "csrc/moe/dynamic_4bit_int_moe_cpu.cpp") 
 
     message(STATUS "CPU extension (AVX512F + BF16 + VNNI + AMX) source files: ${VLLM_EXT_SRC_AVX512} ${VLLM_EXT_SRC_SGL}")
+    message(STATUS "CPU extension (AVX512F + BF16 + VNNI) source files: ${VLLM_EXT_SRC_AVX512} ${VLLM_EXT_SRC_SGL}")
     message(STATUS "CPU extension (AVX512F) source files: ${VLLM_EXT_SRC_AVX512}")
     message(STATUS "CPU extension (AVX2) source files: ${VLLM_EXT_SRC_AVX2}")
 
     set(_C_LIBS numa dnnl_ext)
+    set(_C_AVX512_BF16_VNNI_LIBS numa dnnl_ext)
     set(_C_AVX512_LIBS numa dnnl_ext)
     set(_C_AVX2_LIBS numa dnnl_ext)
 
@@ -554,6 +559,18 @@ if (ENABLE_X86_ISA)
 
     # For AMX kernels
     target_compile_definitions(_C PRIVATE "-DCPU_CAPABILITY_AMXBF16")
+
+    # AVX512F + AVX512BF16 + AVX512VNNI
+    define_extension_target(
+        _C_AVX512_BF16_VNNI
+        DESTINATION vllm
+        LANGUAGE CXX
+        SOURCES ${VLLM_EXT_SRC_AVX512} ${VLLM_EXT_SRC_SGL}
+        LIBRARIES ${_C_AVX512_BF16_VNNI_LIBS}
+        COMPILE_FLAGS ${CXX_COMPILE_FLAGS_AVX512_BF16_VNNI}
+        USE_SABI 3
+        WITH_SOABI
+    )
 
     # AVX512F 
     define_extension_target(

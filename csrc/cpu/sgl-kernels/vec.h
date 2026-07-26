@@ -5,7 +5,8 @@
 
 #pragma once
 
-#if defined(__AVX512F__) && defined(__AVX512BF16__) && defined(__AMX_BF16__)
+#if defined(__AVX512F__) && defined(__AVX512BF16__) && \
+    defined(__AVX512VNNI__)
 #define CPU_CAPABILITY_AVX512
 #endif
 
