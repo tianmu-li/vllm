@@ -2,11 +2,29 @@
 #include "ops.h"
 #include "core/registration.h"
 
+#include <ATen/cpu/Utils.h>
 #include <torch/library.h>
 
 // Note: overwrite the external definition for sharing same name between
 // libraries use different ISAs.
 #define TORCH_EXTENSION_NAME _C
+
+#if defined(VLLM_CPU_SGL_KERNELS_LINKED)
+namespace {
+
+bool cpu_supports_sgl_kernels() {
+  const auto capabilities = at::cpu::get_cpu_capabilities();
+  for (const char* capability : {"avx512_f", "avx512_bf16", "avx512_vnni"}) {
+    const auto it = capabilities.find(capability);
+    if (it == capabilities.end() || !it->second.toBool()) {
+      return false;
+    }
+  }
+  return true;
+}
+
+}  // namespace
+#endif
 
 void release_dnnl_matmul_handler(int64_t handler);
 
@@ -471,60 +489,75 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, ops) {
 #endif  // #if defined(__AVX512F__) || defined(__aarch64__)
 
   // sgl-kernels
-#if defined(__AVX512BF16__) && defined(__AVX512F__) && defined(__AVX512VNNI__)
-  ops.def(
-      "weight_packed_linear(Tensor(a0!) mat1, Tensor(a1!) mat2, Tensor(a2!)? "
-      "bias, bool is_vnni) -> Tensor");
-  ops.impl("weight_packed_linear", torch::kCPU, &weight_packed_linear);
-  ops.def("convert_weight_packed(Tensor! weight) -> Tensor");
-  ops.impl("convert_weight_packed", torch::kCPU, &convert_weight_packed);
-  ops.def("convert_scale_packed(Tensor! scale) -> Tensor");
-  ops.impl("convert_scale_packed", torch::kCPU, &convert_scale_packed);
-  ops.def(
-      "fused_experts_cpu(Tensor hidden_states, Tensor w1, Tensor w2, Tensor "
-      "topk_weights, Tensor topk_ids, bool "
-      "inplace, int moe_comp_method, Tensor? w1_scale, Tensor? w2_scale, "
-      "Tensor? w1_zero, Tensor? w2_zero, int[]? block_size, "
-      "Tensor? w1_bias, Tensor? w2_bias, float? alpha, float? limit, "
-      "bool is_vnni) -> "
-      "Tensor");
-  ops.impl("fused_experts_cpu", torch::kCPU, &fused_experts_cpu);
-  ops.def(
-      "int8_scaled_mm_with_quant(Tensor mat1, Tensor mat2, Tensor scales2, "
-      "Tensor? bias, ScalarType out_dtype, bool is_vnni) -> Tensor");
-  ops.impl("int8_scaled_mm_with_quant", torch::kCPU,
-           &int8_scaled_mm_with_quant);
+#if defined(VLLM_CPU_SGL_KERNELS_LINKED)
+  if (cpu_supports_sgl_kernels()) {
+    ops.def(
+        "weight_packed_linear(Tensor(a0!) mat1, Tensor(a1!) mat2, Tensor(a2!)? "
+        "bias, bool is_vnni) -> Tensor");
+    ops.impl("weight_packed_linear", torch::kCPU, &weight_packed_linear);
+    ops.def("convert_weight_packed(Tensor! weight) -> Tensor");
+    ops.impl("convert_weight_packed", torch::kCPU, &convert_weight_packed);
+    ops.def("convert_scale_packed(Tensor! scale) -> Tensor");
+    ops.impl("convert_scale_packed", torch::kCPU, &convert_scale_packed);
+    ops.def(
+        "fused_experts_cpu(Tensor hidden_states, Tensor w1, Tensor w2, Tensor "
+        "topk_weights, Tensor topk_ids, bool "
+        "inplace, int moe_comp_method, Tensor? w1_scale, Tensor? w2_scale, "
+        "Tensor? w1_zero, Tensor? w2_zero, int[]? block_size, "
+        "Tensor? w1_bias, Tensor? w2_bias, float? alpha, float? limit, "
+        "bool is_vnni) -> "
+        "Tensor");
+    ops.impl("fused_experts_cpu", torch::kCPU, &fused_experts_cpu);
+    ops.def(
+        "int8_scaled_mm_with_quant(Tensor mat1, Tensor mat2, Tensor scales2, "
+        "Tensor? bias, ScalarType out_dtype, bool is_vnni) -> Tensor");
+    ops.impl("int8_scaled_mm_with_quant", torch::kCPU,
+             &int8_scaled_mm_with_quant);
 
-  // Adapted from sglang: FP8 W8A16 kernel
-  ops.def(
-      "fp8_scaled_mm_cpu(Tensor(a0!) mat1, Tensor(a1!) mat2, Tensor(a2!) "
-      "scales2, SymInt[] block_size, Tensor? bias, ScalarType out_dtype, "
-      "bool is_vnni) -> Tensor");
-  ops.impl("fp8_scaled_mm_cpu", torch::kCPU, &fp8_scaled_mm_cpu);
+    // Adapted from sglang: FP8 W8A16 kernel
+    ops.def(
+        "fp8_scaled_mm_cpu(Tensor(a0!) mat1, Tensor(a1!) mat2, Tensor(a2!) "
+        "scales2, SymInt[] block_size, Tensor? bias, ScalarType out_dtype, "
+        "bool is_vnni) -> Tensor");
+    ops.impl("fp8_scaled_mm_cpu", torch::kCPU, &fp8_scaled_mm_cpu);
 
-  // Adapted from sglang: casual_conv1d kernels
-  ops.def("causal_conv1d_weight_pack(Tensor weight) -> Tensor");
-  ops.impl("causal_conv1d_weight_pack", torch::kCPU,
-           &causal_conv1d_weight_pack);
-  ops.def(
-      "causal_conv1d_fwd_cpu(Tensor x, Tensor weight, Tensor? bias, Tensor? "
-      "conv_states, Tensor? query_start_loc,"
-      "Tensor? cache_indices, Tensor? has_initial_state, bool silu_activation, "
-      "int pad_slot_id, bool is_vnni) -> "
-      "Tensor");
-  ops.impl("causal_conv1d_fwd_cpu", torch::kCPU, &causal_conv1d_fwd_cpu);
-  ops.def(
-      "causal_conv1d_update_cpu(Tensor x, Tensor(a!) conv_states, Tensor "
-      "weight, Tensor? bias, bool silu_activation,"
-      "Tensor? num_accepted_tokens, Tensor? conv_state_indices, int "
-      "pad_slot_id, "
-      "bool is_vnni) -> Tensor");
-  ops.impl("causal_conv1d_update_cpu", torch::kCPU, &causal_conv1d_update_cpu);
+    // Adapted from sglang: casual_conv1d kernels
+    ops.def("causal_conv1d_weight_pack(Tensor weight) -> Tensor");
+    ops.impl("causal_conv1d_weight_pack", torch::kCPU,
+             &causal_conv1d_weight_pack);
+    ops.def(
+        "causal_conv1d_fwd_cpu(Tensor x, Tensor weight, Tensor? bias, Tensor? "
+        "conv_states, Tensor? query_start_loc,"
+        "Tensor? cache_indices, Tensor? has_initial_state, bool "
+        "silu_activation, "
+        "int pad_slot_id, bool is_vnni) -> "
+        "Tensor");
+    ops.impl("causal_conv1d_fwd_cpu", torch::kCPU, &causal_conv1d_fwd_cpu);
+    ops.def(
+        "causal_conv1d_update_cpu(Tensor x, Tensor(a!) conv_states, Tensor "
+        "weight, Tensor? bias, bool silu_activation,"
+        "Tensor? num_accepted_tokens, Tensor? conv_state_indices, int "
+        "pad_slot_id, "
+        "bool is_vnni) -> Tensor");
+    ops.impl("causal_conv1d_update_cpu", torch::kCPU,
+             &causal_conv1d_update_cpu);
+
+    // Adapted from sglang: INT4 W4A8 kernels
+    ops.def(
+        "convert_weight_packed_scale_zp(Tensor weight, Tensor qzeros, Tensor "
+        "scales, int quant_method_4bit) -> (Tensor, "
+        "Tensor, Tensor)");
+    ops.impl("convert_weight_packed_scale_zp", torch::kCPU,
+             &convert_weight_packed_scale_zp);
+
+    ops.def(
+        "int4_scaled_mm_cpu(Tensor(a0!) x, Tensor(a1!) w, Tensor(a2!) w_zeros, "
+        "Tensor(a3!) w_scales, Tensor? bias) -> Tensor");
+    ops.impl("int4_scaled_mm_cpu", torch::kCPU, &int4_scaled_mm_cpu);
+  }
 #endif
 
-#if (defined(__AVX512BF16__) && defined(__AVX512F__) && \
-     defined(__AVX512VNNI__)) ||                        \
-    defined(__riscv)
+#if defined(__riscv)
   // Adapted from sglang: INT4 W4A8 kernels
   ops.def(
       "convert_weight_packed_scale_zp(Tensor weight, Tensor qzeros, Tensor "

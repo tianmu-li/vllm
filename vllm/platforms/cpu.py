@@ -435,12 +435,12 @@ class CpuPlatform(Platform):
     @staticmethod
     def _get_x86_cpu_extension_name() -> str:
         capabilities = torch.cpu.get_capabilities()
-        if is_avx512_bf16_vnni_supported():
-            if capabilities.get("amx_tile", False) and capabilities.get(
-                "amx_bf16", False
-            ):
-                return "_C"
-            return "_C_AVX512_BF16_VNNI"
+        if (
+            is_avx512_bf16_vnni_supported()
+            and capabilities.get("amx_tile", False)
+            and capabilities.get("amx_bf16", False)
+        ):
+            return "_C"
         if capabilities.get("avx512_f", False):
             return "_C_AVX512"
         return "_C_AVX2"
@@ -461,15 +461,6 @@ class CpuPlatform(Platform):
                     import vllm._C  # noqa: F401
                 except ImportError as e:
                     logger.warning_once("Failed to import from vllm._C: %r", e)
-            elif extension_name == "_C_AVX512_BF16_VNNI":
-                try:
-                    import vllm._C_AVX512_BF16_VNNI  # noqa: F401
-                except ImportError as e:
-                    if ignored_msg not in e.msg:
-                        logger.warning_once(
-                            "Failed to import from vllm._C_AVX512_BF16_VNNI: %r",
-                            e,
-                        )
             elif extension_name == "_C_AVX512":
                 try:
                     import vllm._C_AVX512  # noqa: F401
