@@ -9,10 +9,10 @@
 // libraries use different ISAs.
 #define TORCH_EXTENSION_NAME _C
 
-#if defined(VLLM_CPU_SGL_KERNELS_LINKED)
+#if defined(VLLM_CPU_SGL_BF16_VNNI_KERNELS_LINKED)
 namespace {
 
-bool cpu_supports_sgl_kernels() {
+bool cpu_supports_sgl_bf16_vnni_kernels() {
   const auto capabilities = at::cpu::get_cpu_capabilities();
   for (const char* capability : {"avx512_f", "avx512_bf16", "avx512_vnni"}) {
     const auto it = capabilities.find(capability);
@@ -489,8 +489,8 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, ops) {
 #endif  // #if defined(__AVX512F__) || defined(__aarch64__)
 
   // sgl-kernels
-#if defined(VLLM_CPU_SGL_KERNELS_LINKED)
-  if (cpu_supports_sgl_kernels()) {
+#if defined(VLLM_CPU_SGL_BF16_VNNI_KERNELS_LINKED)
+  if (cpu_supports_sgl_bf16_vnni_kernels()) {
     ops.def(
         "weight_packed_linear(Tensor(a0!) mat1, Tensor(a1!) mat2, Tensor(a2!)? "
         "bias, bool is_vnni) -> Tensor");
@@ -555,6 +555,11 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, ops) {
         "Tensor(a3!) w_scales, Tensor? bias) -> Tensor");
     ops.impl("int4_scaled_mm_cpu", torch::kCPU, &int4_scaled_mm_cpu);
   }
+#endif
+
+#if defined(VLLM_CPU_SGL_AMX_KERNELS_LINKED)
+  // AMX-only SGL registrations belong here. Do not add them to the
+  // AVX512-BF16/VNNI registration tier above.
 #endif
 
 #if defined(__riscv)

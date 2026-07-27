@@ -8,7 +8,41 @@
 #include "common.h"
 #include "gemm.h"
 
+#include <ATen/cpu/Utils.h>
+#include <initializer_list>
+
 namespace {
+
+bool cpu_supports_fused_experts_method(int64_t moe_comp_method) {
+  if (moe_comp_method == CPUQuantMethod::BF16) {
+    return true;
+  }
+
+  const auto capabilities = at::cpu::get_cpu_capabilities();
+  const auto supports = [&capabilities](std::initializer_list<const char*> required) {
+    for (const char* capability : required) {
+      const auto it = capabilities.find(capability);
+      if (it == capabilities.end() || !it->second.toBool()) {
+        return false;
+      }
+    }
+    return true;
+  };
+
+  if (!supports({"avx512_f", "avx512_bf16", "avx512_vnni"})) {
+    return false;
+  }
+
+  switch (static_cast<CPUQuantMethod>(moe_comp_method)) {
+    case CPUQuantMethod::INT8_W8A8:
+    case CPUQuantMethod::FP8_W8A16:
+    case CPUQuantMethod::INT4_W4A8:
+    case CPUQuantMethod::MXFP4:
+      return true;
+    default:
+      return supports({"amx_tile", "amx_bf16"});
+  }
+}
 
 // [NOTE]: Fused MoE kernel with AMX
 //
@@ -870,6 +904,11 @@ at::Tensor fused_experts_cpu(
     const std::optional<double>& alpha,
     const std::optional<double>& limit,
     bool is_vnni) {
+  TORCH_CHECK(
+      cpu_supports_fused_experts_method(moe_comp_method),
+      "fused_experts_cpu requires AVX512F, AVX512-BF16, and AVX512-VNNI "
+      "for validated quant methods; other methods require AMX BF16.");
+
   auto packed_w1 = is_vnni ? w1 : convert_weight_packed(w1);
   auto packed_w2 = is_vnni ? w2 : convert_weight_packed(w2);
 

@@ -30,6 +30,21 @@ from vllm.model_executor.layers.quantization.utils.quant_utils import (
     kMxfp4Static,
 )
 from vllm.platforms import CpuArchEnum, current_platform
+from vllm.platforms.cpu import _is_fused_experts_cpu_method_supported
+
+
+def _has_fused_experts_cpu_op() -> bool:
+    return hasattr(torch.ops._C, "fused_experts_cpu")
+
+
+def _supports_x86_fused_experts_cpu(method: CPUQuantMethod) -> bool:
+    return (
+        current_platform.is_cpu()
+        and current_platform.get_cpu_architecture() == CpuArchEnum.X86
+        and _is_fused_experts_cpu_method_supported(method)
+        and _has_fused_experts_cpu_op()
+    )
+
 
 # ===========================================================================
 # FP8 W8A16 MoE
@@ -69,7 +84,7 @@ class CPUExpertsFp8(mk.FusedMoEExpertsMonolithic):
 
     @staticmethod
     def _supports_current_device() -> bool:
-        return current_platform.is_cpu()
+        return _supports_x86_fused_experts_cpu(CPUQuantMethod.FP8_W8A16)
 
     @staticmethod
     def _supports_no_act_and_mul() -> bool:
@@ -227,7 +242,7 @@ class CPUExpertsMxfp4(mk.FusedMoEExpertsMonolithic):
 
     @staticmethod
     def _supports_current_device() -> bool:
-        return current_platform.is_cpu()
+        return _supports_x86_fused_experts_cpu(CPUQuantMethod.MXFP4)
 
     @staticmethod
     def _supports_no_act_and_mul() -> bool:
@@ -434,7 +449,7 @@ class CPUExpertsInt4(mk.FusedMoEExpertsMonolithic):
 
     @staticmethod
     def _supports_current_device() -> bool:
-        return current_platform.is_cpu()
+        return _supports_x86_fused_experts_cpu(CPUQuantMethod.INT4_W4A8)
 
     @staticmethod
     def _supports_no_act_and_mul() -> bool:
@@ -595,10 +610,7 @@ class CPUExpertsInt8(mk.FusedMoEExpertsMonolithic):
 
     @staticmethod
     def _supports_current_device() -> bool:
-        return (
-            current_platform.is_cpu()
-            and current_platform.get_cpu_architecture() == CpuArchEnum.X86
-        )
+        return _supports_x86_fused_experts_cpu(CPUQuantMethod.INT8_W8A8)
 
     @staticmethod
     def _supports_no_act_and_mul() -> bool:

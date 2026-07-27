@@ -490,7 +490,7 @@ if (CMAKE_SYSTEM_PROCESSOR MATCHES "riscv64")
 endif()
 
 if (ENABLE_X86_ISA)
-    set(VLLM_EXT_SRC_SGL
+    set(VLLM_EXT_SRC_SGL_BF16_VNNI
         "csrc/cpu/sgl-kernels/conv.cpp"
         "csrc/cpu/sgl-kernels/gemm.cpp"
         "csrc/cpu/sgl-kernels/gemm_int8.cpp"
@@ -502,9 +502,13 @@ if (ENABLE_X86_ISA)
         "csrc/cpu/sgl-kernels/moe_fp8.cpp")
 
     set_property(
-        SOURCE ${VLLM_EXT_SRC_SGL}
+        SOURCE ${VLLM_EXT_SRC_SGL_BF16_VNNI}
         APPEND PROPERTY COMPILE_OPTIONS
         ${CXX_COMPILE_FLAGS_AVX512_BF16_VNNI})
+
+    # Add AMX-only SGL sources here with their corresponding registrations in
+    # torch_bindings.cpp. The validated sources above must remain non-AMX.
+    set(VLLM_EXT_SRC_SGL_AMX)
 
     set(VLLM_EXT_SRC_AVX512
         "csrc/cpu/sgl-kernels/fla.cpp"
@@ -539,8 +543,8 @@ if (ENABLE_X86_ISA)
         "csrc/cpu/pos_encoding.cpp"
         "csrc/moe/dynamic_4bit_int_moe_cpu.cpp") 
 
-    message(STATUS "CPU extension (AVX512F + BF16 + VNNI + AMX) source files: ${VLLM_EXT_SRC_AVX512} ${VLLM_EXT_SRC_SGL}")
-    message(STATUS "CPU extension (AVX512F) source files: ${VLLM_EXT_SRC_AVX512} ${VLLM_EXT_SRC_SGL}")
+    message(STATUS "CPU extension (AVX512F + BF16 + VNNI + AMX) source files: ${VLLM_EXT_SRC_AVX512} ${VLLM_EXT_SRC_SGL_BF16_VNNI} ${VLLM_EXT_SRC_SGL_AMX}")
+    message(STATUS "CPU extension (AVX512F) source files: ${VLLM_EXT_SRC_AVX512} ${VLLM_EXT_SRC_SGL_BF16_VNNI}")
     message(STATUS "CPU extension (AVX2) source files: ${VLLM_EXT_SRC_AVX2}")
 
     set(_C_LIBS numa dnnl_ext)
@@ -552,7 +556,7 @@ if (ENABLE_X86_ISA)
         _C
         DESTINATION vllm
         LANGUAGE CXX
-        SOURCES ${VLLM_EXT_SRC_AVX512} ${VLLM_EXT_SRC_SGL}
+        SOURCES ${VLLM_EXT_SRC_AVX512} ${VLLM_EXT_SRC_SGL_BF16_VNNI} ${VLLM_EXT_SRC_SGL_AMX}
         LIBRARIES ${_C_LIBS}
         COMPILE_FLAGS ${CXX_COMPILE_FLAGS_AVX512_AMX}
         USE_SABI 3
@@ -563,14 +567,15 @@ if (ENABLE_X86_ISA)
     target_compile_definitions(
         _C PRIVATE
         CPU_CAPABILITY_AMXBF16
-        VLLM_CPU_SGL_KERNELS_LINKED)
+        VLLM_CPU_SGL_BF16_VNNI_KERNELS_LINKED
+        VLLM_CPU_SGL_AMX_KERNELS_LINKED)
 
     # AVX512F 
     define_extension_target(
         _C_AVX512
         DESTINATION vllm
         LANGUAGE CXX
-        SOURCES ${VLLM_EXT_SRC_AVX512} ${VLLM_EXT_SRC_SGL}
+        SOURCES ${VLLM_EXT_SRC_AVX512} ${VLLM_EXT_SRC_SGL_BF16_VNNI}
         LIBRARIES ${_C_AVX512_LIBS}
         COMPILE_FLAGS ${CXX_COMPILE_FLAGS_AVX512}
         USE_SABI 3
@@ -578,7 +583,7 @@ if (ENABLE_X86_ISA)
     )
 
     target_compile_definitions(
-        _C_AVX512 PRIVATE VLLM_CPU_SGL_KERNELS_LINKED)
+        _C_AVX512 PRIVATE VLLM_CPU_SGL_BF16_VNNI_KERNELS_LINKED)
 
     # AVX2 
     define_extension_target(

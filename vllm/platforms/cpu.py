@@ -24,12 +24,40 @@ from .interface import CpuArchEnum, Platform, PlatformEnum
 logger = init_logger(__name__)
 
 
-def is_avx512_bf16_vnni_supported() -> bool:
+_AVX512_BF16_VNNI_CAPABILITIES = (
+    "avx512_f",
+    "avx512_bf16",
+    "avx512_vnni",
+)
+_AMX_BF16_CAPABILITIES = (
+    "amx_tile",
+    "amx_bf16",
+)
+_NON_AMX_FUSED_EXPERTS_CPU_METHODS = frozenset((1, 2, 3, 4))
+
+
+def _is_cpu_quant_kernel_supported(*, require_amx: bool = True) -> bool:
+    """Check the x86 ISA required by a CPU quantized kernel."""
     capabilities = torch.cpu.get_capabilities()
-    return all(
-        capabilities.get(capability, False)
-        for capability in ("avx512_f", "avx512_bf16", "avx512_vnni")
+    required_capabilities = (
+        _AVX512_BF16_VNNI_CAPABILITIES + _AMX_BF16_CAPABILITIES
+        if require_amx
+        else _AVX512_BF16_VNNI_CAPABILITIES
     )
+    return all(
+        capabilities.get(capability, False) for capability in required_capabilities
+    )
+
+
+def _is_fused_experts_cpu_method_supported(moe_comp_method: int) -> bool:
+    """Check whether a fused_experts_cpu quant method is supported."""
+    return _is_cpu_quant_kernel_supported(
+        require_amx=int(moe_comp_method) not in _NON_AMX_FUSED_EXPERTS_CPU_METHODS
+    )
+
+
+def is_avx512_bf16_vnni_supported() -> bool:
+    return _is_cpu_quant_kernel_supported(require_amx=False)
 
 
 if TYPE_CHECKING:

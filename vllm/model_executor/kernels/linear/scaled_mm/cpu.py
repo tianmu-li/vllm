@@ -12,7 +12,7 @@ from vllm.model_executor.layers.quantization.utils.w8a8_utils import (
 )
 from vllm.model_executor.layers.utils import check_cpu_sgl_kernel
 from vllm.platforms import current_platform
-from vllm.platforms.cpu import is_avx512_bf16_vnni_supported
+from vllm.platforms.cpu import _is_cpu_quant_kernel_supported
 from vllm.platforms.interface import CpuArchEnum
 
 from .BlockScaledMMLinearKernel import (
@@ -234,7 +234,7 @@ class CPUFp8BlockScaledMMKernel(Fp8BlockScaledMMLinearKernel):
     ) -> tuple[bool, str | None]:
         if not current_platform.is_cpu():
             return False, "requires CPU platform."
-        if not is_avx512_bf16_vnni_supported():
+        if not _is_cpu_quant_kernel_supported(require_amx=False):
             return False, "requires AVX512F, AVX512-BF16, and AVX512-VNNI."
         if not ops._supports_cpu_fp8_w8a16:
             return False, "fp8_scaled_mm_cpu op not available."
