@@ -10,6 +10,7 @@ import torch
 import torch.nn.functional as F
 
 from vllm.platforms import current_platform
+from vllm.platforms.cpu import is_avx512_bf16_vnni_supported
 from vllm.utils.torch_utils import set_random_seed
 
 if not current_platform.is_cpu():
@@ -17,8 +18,15 @@ if not current_platform.is_cpu():
 
 import vllm._custom_ops as ops  # noqa: E402
 
-if not hasattr(torch.ops._C, "fused_experts_cpu"):
-    pytest.skip("fused_experts_cpu op not available", allow_module_level=True)
+if not is_avx512_bf16_vnni_supported():
+    pytest.skip(
+        "fused_experts_cpu requires AVX512F, AVX512-BF16, and AVX512-VNNI",
+        allow_module_level=True,
+    )
+
+assert hasattr(torch.ops._C, "fused_experts_cpu"), (
+    "fused_experts_cpu must be registered on AVX512F/BF16/VNNI CPUs"
+)
 
 
 def _silu_and_mul(x: torch.Tensor) -> torch.Tensor:
