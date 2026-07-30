@@ -1281,12 +1281,24 @@ class GroupCoordinator:
             return hidden_states, topk_weights, topk_ids
 
     def combine(
-        self, hidden_states, is_sequence_parallel: bool = False
+        self,
+        hidden_states: torch.Tensor,
+        is_sequence_parallel: bool = False,
+        output_num_tokens: int | None = None,
     ) -> torch.Tensor:
         if self.device_communicator is not None:
+            from vllm.distributed.device_communicators.cpu_communicator import (
+                CpuCommunicator,
+            )
+
+            if isinstance(self.device_communicator, CpuCommunicator):
+                return self.device_communicator.combine(
+                    hidden_states,
+                    is_sequence_parallel,
+                    output_num_tokens,
+                )
             return self.device_communicator.combine(hidden_states, is_sequence_parallel)
-        else:
-            return hidden_states
+        return hidden_states
 
 
 _WORLD: GroupCoordinator | None = None

@@ -127,6 +127,7 @@ class MoEPrepareAndFinalizeNoDPEPMonolithic(mk.FusedMoEPrepareAndFinalizeMonolit
     def finalize(
         self,
         fused_expert_output: torch.Tensor,
+        _output_num_tokens: int,
     ) -> torch.Tensor:
         return fused_expert_output
 

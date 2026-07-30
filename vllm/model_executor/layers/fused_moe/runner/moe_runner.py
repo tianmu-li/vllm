@@ -816,10 +816,13 @@ class MoERunner(MoERunnerInterface):
         self,
         shared_output: torch.Tensor | None,
         hidden_states: torch.Tensor,
+        output_num_tokens: int,
     ) -> torch.Tensor | tuple[torch.Tensor | None, torch.Tensor]:
         if self.do_naive_dispatch_combine:
             hidden_states = get_ep_group().combine(
-                hidden_states, self.moe_config.is_sequence_parallel
+                hidden_states,
+                self.moe_config.is_sequence_parallel,
+                output_num_tokens,
             )
 
         if (
@@ -869,6 +872,7 @@ class MoERunner(MoERunnerInterface):
             else:
                 router_logits, _ = self.gate(hidden_states)
 
+        output_num_tokens = hidden_states.shape[0]
         with self._sequence_parallel_context():
             # TODO(bnell): parts of the dispatch/combine steps will go away once
             # #32567 lands and the remaining kernels are made MKs.  The PCP
@@ -888,6 +892,7 @@ class MoERunner(MoERunnerInterface):
             return self._maybe_combine(
                 shared_output,
                 hidden_states,
+                output_num_tokens,
             )
 
     #########################################################

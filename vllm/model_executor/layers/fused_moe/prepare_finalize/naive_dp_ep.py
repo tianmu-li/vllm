@@ -205,7 +205,11 @@ class MoEPrepareAndFinalizeNaiveDPEPModular(mk.FusedMoEPrepareAndFinalizeModular
         )
 
         output.copy_(
-            get_ep_group().combine(out, is_sequence_parallel=self.is_sequence_parallel)
+            get_ep_group().combine(
+                out,
+                is_sequence_parallel=self.is_sequence_parallel,
+                output_num_tokens=output.shape[0],
+            )
         )
 
 
@@ -276,9 +280,12 @@ class MoEPrepareAndFinalizeNaiveDPEPMonolithic(mk.FusedMoEPrepareAndFinalizeMono
     def finalize(
         self,
         fused_expert_output: torch.Tensor,
+        output_num_tokens: int,
     ) -> torch.Tensor:
         out = get_ep_group().combine(
-            fused_expert_output, is_sequence_parallel=self.is_sequence_parallel
+            fused_expert_output,
+            is_sequence_parallel=self.is_sequence_parallel,
+            output_num_tokens=output_num_tokens,
         )
         return out
 

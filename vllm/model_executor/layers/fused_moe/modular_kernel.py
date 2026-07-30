@@ -449,7 +449,11 @@ class FusedMoEPrepareAndFinalizeMonolithic(FusedMoEPrepareAndFinalize):
         raise NotImplementedError
 
     @abstractmethod
-    def finalize(self, fused_expert_output: torch.Tensor) -> torch.Tensor:
+    def finalize(
+        self,
+        fused_expert_output: torch.Tensor,
+        output_num_tokens: int,
+    ) -> torch.Tensor:
         """
         Optional method for subclasses compatible with monolithic
         FusedMoEExpertsModular kernels.
@@ -458,6 +462,7 @@ class FusedMoEPrepareAndFinalizeMonolithic(FusedMoEPrepareAndFinalize):
         fused experts output.
         - fused_expert_output: The unweighted, unreduced output of the fused
           experts, it will have (M, topk, K) shape.
+        - output_num_tokens: The original local input row count.
         """
         raise NotImplementedError
 
@@ -1579,7 +1584,10 @@ class FusedMoEKernelMonolithicImpl:
             topk_group=topk_group,
         )
 
-        output = self.prepare_finalize.finalize(fused_out)
+        output = self.prepare_finalize.finalize(
+            fused_out,
+            output_num_tokens=hidden_states.shape[0],
+        )
 
         return output
 
