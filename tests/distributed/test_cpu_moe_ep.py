@@ -370,7 +370,6 @@ def _moe_ep_worker(rank, world_size, tp_size, dp_size, port, dp_port, params, er
                 combined = ep_group.combine(
                     expert_out,
                     is_sequence_parallel=is_sequence_parallel,
-                    output_num_tokens=a_local.shape[0],
                 )
 
         tp_group = get_tp_group()
@@ -463,7 +462,6 @@ def _make_monolithic_ep_step(
         combined = get_ep_group().combine(
             expert_out,
             is_sequence_parallel=True,
-            output_num_tokens=local_sp_tokens,
         )
         torch._check(combined.shape[0] == local_sp_tokens)
         return get_tp_group().all_gather(combined, dim=0)[:num_real_tokens]

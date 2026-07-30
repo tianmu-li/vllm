@@ -3,6 +3,8 @@
 """CPU communicator tests for DP SHM and EP dispatch paths."""
 
 import os
+import signal
+import time
 import traceback
 
 import pytest
@@ -49,12 +51,52 @@ def _report_worker_failure(rank: int, err_q: mp.Queue, err: Exception) -> None:
     raise SystemExit(1) from err
 
 
-def _collect_worker_failures(procs, err_q: mp.Queue) -> list[str]:
-    exit_errors = []
-    for rank, proc in enumerate(procs):
+def _terminate_worker_process_groups(procs) -> None:
+    for proc in procs:
+        if not proc.is_alive():
+            continue
+        if os.name == "posix" and proc.pid is not None:
+            os.killpg(proc.pid, signal.SIGTERM)
+        else:
+            proc.terminate()
+
+    deadline = time.monotonic() + 5
+    for proc in procs:
+        if proc.is_alive():
+            proc.join(max(deadline - time.monotonic(), 0))
+
+    for proc in procs:
+        if not proc.is_alive():
+            continue
+        if os.name == "posix" and proc.pid is not None:
+            os.killpg(proc.pid, signal.SIGKILL)
+        else:
+            proc.kill()
         proc.join()
+
+
+def _collect_worker_failures(
+    procs,
+    err_q: mp.Queue,
+    timeout_s: float | None = None,
+) -> list[str]:
+    exit_errors = []
+    deadline = None if timeout_s is None else time.monotonic() + timeout_s
+    for rank, proc in enumerate(procs):
+        if deadline is None:
+            proc.join()
+        else:
+            proc.join(max(deadline - time.monotonic(), 0))
+
+    timed_out = deadline is not None and any(proc.is_alive() for proc in procs)
+    if timed_out:
+        _terminate_worker_process_groups(procs)
+
+    for rank, proc in enumerate(procs):
         if proc.exitcode != 0:
             exit_errors.append(f"[Rank {rank}] worker exited with code {proc.exitcode}")
+    if timed_out:
+        exit_errors.append(f"Worker(s) exceeded the {timeout_s:.0f}s timeout")
 
     errors = []
     while not err_q.empty():
@@ -76,6 +118,8 @@ def _run_worker(
     err_q,
 ):
     try:
+        if os.name == "posix":
+            os.setsid()
         worker_fn(rank, world_size, tp_size, dp_size, port, dp_port, params, err_q)
     except Exception as err:
         err_q.put(f"[Rank {rank}]\n{traceback.format_exc()}")
@@ -91,6 +135,7 @@ def _spawn_workers(
     *,
     distributed_init_ports=None,
     dp_port=None,
+    timeout_s: float | None = None,
 ):
     _ensure_spawn_start_method()
 
@@ -123,7 +168,7 @@ def _spawn_workers(
         proc.start()
         procs.append(proc)
 
-    failures = _collect_worker_failures(procs, err_q)
+    failures = _collect_worker_failures(procs, err_q, timeout_s)
     if failures:
         pytest.fail("Worker(s) failed:\n" + "\n---\n".join(failures))
 
@@ -289,10 +334,7 @@ def _ragged_dispatch_worker(
                 ).expand(total_rows, HIDDEN_SIZE).contiguous() + float(
                     (rank + 1) * 1000
                 )
-                combined = get_ep_group().combine(
-                    expert_out,
-                    output_num_tokens=local_rows,
-                )
+                combined = get_ep_group().combine(expert_out)
                 torch.testing.assert_close(
                     combined,
                     _expected_combined(rank, sizes, HIDDEN_SIZE),
@@ -396,7 +438,6 @@ def _sequence_parallel_worker(
                 combined = ep_group.combine(
                     expert_out,
                     is_sequence_parallel=True,
-                    output_num_tokens=local_rows,
                 )
                 torch.testing.assert_close(
                     combined,
@@ -420,13 +461,7 @@ def _run_compiled_fastpath(rank, sizes, backend):
             hidden_states,
             router_logits,
         )
-        return (
-            get_ep_group().combine(
-                gathered_hidden,
-                output_num_tokens=hidden_states.shape[0],
-            )
-            + hidden_states
-        )
+        return get_ep_group().combine(gathered_hidden) + hidden_states
 
     compiled = torch.compile(fastpath_step, fullgraph=True, backend=backend)
     local_rows = sizes[rank]
@@ -905,13 +940,7 @@ def test_cpu_ep_sequence_parallel_uses_ep_group():
     "backend",
     [
         "eager",
-        pytest.param(
-            "inductor",
-            marks=pytest.mark.skipif(
-                os.environ.get("VLLM_CPU_EP_INDUCTOR_COMPILE_TEST") != "1",
-                reason="CPU Inductor compile regression is opt-in",
-            ),
-        ),
+        "inductor",
     ],
 )
 def test_cpu_ep_compile_ragged_fastpath(backend):
@@ -921,6 +950,7 @@ def test_cpu_ep_compile_ragged_fastpath(backend):
         tp_size=1,
         dp_size=2,
         params=(backend, [[2, 1], [0, 3]]),
+        timeout_s=60 if backend == "inductor" else None,
     )
 
 

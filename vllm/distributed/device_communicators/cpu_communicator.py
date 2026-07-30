@@ -436,7 +436,8 @@ class CpuCommunicator(DeviceCommunicatorBase):
                 return fn()
 
         @torch.library.custom_op(
-            f"vllm::cpu_ep_dispatch_rl_{safe_name}", mutates_args=()
+            f"vllm::cpu_ep_dispatch_rl_{safe_name}",
+            mutates_args=(),
         )
         def _dispatch_rl(
             hidden_states: torch.Tensor,
@@ -451,7 +452,8 @@ class CpuCommunicator(DeviceCommunicatorBase):
 
         @_dispatch_rl.register_fake
         def _(
-            hidden_states: torch.Tensor, router_logits: torch.Tensor
+            hidden_states: torch.Tensor,
+            router_logits: torch.Tensor,
         ) -> tuple[torch.Tensor, torch.Tensor]:
             # Ragged dispatch: the real op all-gathers each rank's actual row
             # count and returns sum(per_rank_sizes) rows. That total is
@@ -465,7 +467,8 @@ class CpuCommunicator(DeviceCommunicatorBase):
             )
 
         @torch.library.custom_op(
-            f"vllm::cpu_ep_dispatch_rl_sp_{safe_name}", mutates_args=()
+            f"vllm::cpu_ep_dispatch_rl_sp_{safe_name}",
+            mutates_args=(),
         )
         def _dispatch_rl_sp(
             hidden_states: torch.Tensor,
@@ -491,7 +494,10 @@ class CpuCommunicator(DeviceCommunicatorBase):
                 router_logits.new_empty((n,) + router_logits.shape[1:]),
             )
 
-        @torch.library.custom_op(f"vllm::cpu_ep_dispatch_{safe_name}", mutates_args=())
+        @torch.library.custom_op(
+            f"vllm::cpu_ep_dispatch_{safe_name}",
+            mutates_args=(),
+        )
         def _dispatch(
             hidden_states: torch.Tensor,
             topk_weights: torch.Tensor,
@@ -522,7 +528,8 @@ class CpuCommunicator(DeviceCommunicatorBase):
             )
 
         @torch.library.custom_op(
-            f"vllm::cpu_ep_dispatch_sp_{safe_name}", mutates_args=()
+            f"vllm::cpu_ep_dispatch_sp_{safe_name}",
+            mutates_args=(),
         )
         def _dispatch_sp(
             hidden_states: torch.Tensor,
@@ -553,37 +560,33 @@ class CpuCommunicator(DeviceCommunicatorBase):
                 topk_ids.new_empty((n,) + topk_ids.shape[1:]),
             )
 
-        @torch.library.custom_op(f"vllm::cpu_ep_combine_{safe_name}", mutates_args=())
-        def _combine(
-            hidden_states: torch.Tensor, output_num_tokens: int
-        ) -> torch.Tensor:
-            output = _with_non_sp_dp_sizes(lambda: mgr.combine(hidden_states))
-            assert output.shape[0] == output_num_tokens
-            return output
+        @torch.library.custom_op(
+            f"vllm::cpu_ep_combine_{safe_name}",
+            mutates_args=(),
+        )
+        def _combine(hidden_states: torch.Tensor) -> torch.Tensor:
+            return _with_non_sp_dp_sizes(lambda: mgr.combine(hidden_states))
 
         @_combine.register_fake
-        def _(hidden_states: torch.Tensor, output_num_tokens: int) -> torch.Tensor:
-            return hidden_states.new_empty(
-                (output_num_tokens,) + hidden_states.shape[1:]
-            )
+        def _(hidden_states: torch.Tensor) -> torch.Tensor:
+            ctx = torch.library.get_ctx()
+            n = ctx.new_dynamic_size()
+            return hidden_states.new_empty((n,) + hidden_states.shape[1:])
 
         @torch.library.custom_op(
-            f"vllm::cpu_ep_combine_sp_{safe_name}", mutates_args=()
+            f"vllm::cpu_ep_combine_sp_{safe_name}",
+            mutates_args=(),
         )
-        def _combine_sp(
-            hidden_states: torch.Tensor, output_num_tokens: int
-        ) -> torch.Tensor:
-            output = _with_sp_sizes(
+        def _combine_sp(hidden_states: torch.Tensor) -> torch.Tensor:
+            return _with_sp_sizes(
                 lambda: mgr.combine(hidden_states, is_sequence_parallel=True)
             )
-            assert output.shape[0] == output_num_tokens
-            return output
 
         @_combine_sp.register_fake
-        def _(hidden_states: torch.Tensor, output_num_tokens: int) -> torch.Tensor:
-            return hidden_states.new_empty(
-                (output_num_tokens,) + hidden_states.shape[1:]
-            )
+        def _(hidden_states: torch.Tensor) -> torch.Tensor:
+            ctx = torch.library.get_ctx()
+            n = ctx.new_dynamic_size()
+            return hidden_states.new_empty((n,) + hidden_states.shape[1:])
 
         self._ep_dispatch_rl_op = _dispatch_rl
         self._ep_dispatch_rl_sp_op = _dispatch_rl_sp
@@ -655,21 +658,12 @@ class CpuCommunicator(DeviceCommunicatorBase):
         self,
         hidden_states: torch.Tensor,
         is_sequence_parallel: bool = False,
-        output_num_tokens: int | None = None,
     ) -> torch.Tensor:
         assert self.all2all_manager is not None
-        if (
-            output_num_tokens is not None
-            and is_sequence_parallel
-            and hasattr(self, "_ep_combine_sp_op")
-        ):
-            return self._ep_combine_sp_op(hidden_states, output_num_tokens)
-        if (
-            output_num_tokens is not None
-            and not is_sequence_parallel
-            and hasattr(self, "_ep_combine_op")
-        ):
-            return self._ep_combine_op(hidden_states, output_num_tokens)
+        if is_sequence_parallel and hasattr(self, "_ep_combine_sp_op"):
+            return self._ep_combine_sp_op(hidden_states)
+        if not is_sequence_parallel and hasattr(self, "_ep_combine_op"):
+            return self._ep_combine_op(hidden_states)
         return self.all2all_manager.combine(hidden_states, is_sequence_parallel)
 
 
