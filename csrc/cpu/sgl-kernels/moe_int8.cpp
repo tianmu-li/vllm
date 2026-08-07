@@ -522,9 +522,6 @@ void fused_experts_int8_kernel_impl(
   const int64_t stride_e = 2 * N * packed_K;
   const int64_t stride_n = packed_K;
 
-  int64_t avg_M = std::max(int64_t(1), M * topk / E);
-  const bool use_brgemm = can_use_brgemm<int8_t>(avg_M);
-
   // here we only parallel on half of 2N to fuse silu_and_mul with gemm
   parallel_2d(MB, NB, [&](int64_t mb0, int64_t mb1, int64_t nb0, int64_t nb1) {
     // get local pointers
@@ -534,6 +531,7 @@ void fused_experts_int8_kernel_impl(
     int32_t* __restrict__ C1 = C0 + BLOCK_M * BLOCK_N;
 
     alignas(64) float As[BLOCK_M];
+    bool use_brgemm = false;
 
     loop_2d<int8_t>(mb0, mb1, nb0, nb1, BLOCK_N * K * 2, [&](int64_t mb, int64_t nb, int64_t nb_offset) {
       // nb_upper from top half and nb_lower from bottom half
@@ -548,6 +546,11 @@ void fused_experts_int8_kernel_impl(
       const float* __restrict__ Bs1 = w1s + expert_id * 2 * N + nb_lower * BLOCK_N;
 
       int64_t m_size = offsets[mb + 1] - offsets[mb];
+      if (m_size == 0) {
+        return;
+      }
+      const bool brg = can_use_brgemm<int8_t>(m_size, n_size);
+      use_brgemm |= brg;
 
       if (nb_offset == 0) {
         // 1.a load A
@@ -559,7 +562,7 @@ void fused_experts_int8_kernel_impl(
         }
       }
 
-      if (use_brgemm) {
+      if (brg) {
         // 1.b gemm: C0 = A @ B0
         at::native::cpublas::brgemm(
             /* M     */ m_size,
@@ -640,10 +643,16 @@ void fused_experts_int8_kernel_impl(
     int tid = get_thread_num();
     float* __restrict__ C = C_tmp + tid * 2 * BLOCK_M * BLOCK_N;
     int32_t* __restrict__ C32 = reinterpret_cast<int32_t*>(C + BLOCK_M * BLOCK_N);
+    bool use_brgemm = false;
 
     loop_2d<int8_t>(mb0, mb1, nb0, nb1, BLOCK_N * IC, [&](int64_t mb, int64_t nb, int64_t nb_offset) {
       int64_t m_size = offsets[mb + 1] - offsets[mb];
       int64_t n_size = std::min(OC - nb * BLOCK_N, BLOCK_N);
+      if (m_size == 0) {
+        return;
+      }
+      const bool brg = can_use_brgemm<int8_t>(m_size, n_size);
+      use_brgemm |= brg;
 
       // A ptr from ic1 of [M * topk, N] in sorted order
       // so as to avoid copy A to tmp buffer again
@@ -657,7 +666,7 @@ void fused_experts_int8_kernel_impl(
       const float* __restrict__ Bs = w2s + expert_id * K + nb * BLOCK_N;
 
       // 2.a gemm: C = A @ B
-      if (use_brgemm) {
+      if (brg) {
         at::native::cpublas::brgemm(
             /* M     */ m_size,
             /* N     */ n_size,

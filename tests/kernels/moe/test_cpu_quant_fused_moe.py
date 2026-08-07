@@ -847,6 +847,77 @@ def test_int4_w4a16_cpu_fused_moe(M, N, K, E, topk, group_size, quant_algo, seed
     torch.testing.assert_close(ref_out.bfloat16(), out, atol=1e-2, rtol=1e-2)
 
 
+@pytest.mark.parametrize("quant_algo", [ops.CPUQuantAlgo.GPTQ, ops.CPUQuantAlgo.AWQ])
+def test_int4_w4a8_cpu_fused_moe_small_expert_blocks(quant_algo):
+    """Test W4A8 dispatch across exact and multi-block expert boundaries."""
+    set_random_seed(0)
+    block_sizes = (4, 5, 33)
+    M, N, K, E, group_size = sum(block_sizes), 128, 128, 16, 128
+    a = torch.randn(M, K, dtype=torch.bfloat16) / (0.5 * K**0.5)
+    (
+        w1_int4,
+        w2_int4,
+        w1_packed,
+        w2_packed,
+        w1_zeros,
+        w2_zeros,
+        w1_zeros_packed,
+        w2_zeros_packed,
+        w1_s,
+        w2_s,
+    ) = _make_int4_moe_weights(E, N, K, group_size, quant_algo)
+    topk_weight, topk_ids = _deterministic_expert_routes(block_sizes)
+
+    ref_out = _ref_int4_moe(
+        a,
+        w1_int4,
+        w2_int4,
+        w1_zeros,
+        w2_zeros,
+        w1_s,
+        w2_s,
+        topk_weight,
+        topk_ids,
+        group_size,
+    )
+
+    from vllm.model_executor.layers.fused_moe.experts.cpu_moe import (
+        prepare_int4_moe_layer_for_cpu,
+    )
+
+    blocked_w1, blocked_w2, blocked_s1, blocked_s2, blocked_z1, blocked_z2 = (
+        prepare_int4_moe_layer_for_cpu(
+            w1_packed,
+            w2_packed,
+            w1_s,
+            w2_s,
+            quant_algo=quant_algo,
+            w13_zeros=w1_zeros_packed,
+            w2_zeros=w2_zeros_packed,
+        )
+    )
+    out = ops.fused_experts_cpu(
+        a.clone(),
+        blocked_w1,
+        blocked_w2,
+        topk_weight,
+        topk_ids,
+        False,
+        ops.CPUQuantMethod.INT4_W4A8,
+        blocked_s1,
+        blocked_s2,
+        blocked_z1,
+        blocked_z2,
+        None,
+        None,
+        None,
+        None,
+        None,
+        True,
+    )
+    torch.testing.assert_close(ref_out.bfloat16(), out, atol=1e-2, rtol=1e-2)
+
+
 # ===========================================================================
 # INT8 W8A8 MoE
 # ===========================================================================
@@ -965,6 +1036,47 @@ def test_int8_w8a8_cpu_fused_moe(M, N, K, E, topk, seed, is_vnni, inplace):
         None,  # w2_bias
         None,  # alpha
         None,  # limit
+        is_vnni,
+    )
+    torch.testing.assert_close(
+        ref_out.bfloat16(),
+        out,
+        atol=2e-1,
+        rtol=2e-1,
+    )
+
+
+@pytest.mark.parametrize("is_vnni", [False, True])
+@pytest.mark.parametrize("inplace", [False, True])
+def test_int8_w8a8_cpu_fused_moe_small_expert_blocks(is_vnni, inplace):
+    """Test W8A8 dispatch when expert occupancy differs from global average M."""
+    set_random_seed(0)
+    block_sizes = (4, 5, 33)
+    M, N, K, E = sum(block_sizes), 128, 128, 16
+    a = torch.randn(M, K, dtype=torch.bfloat16) / (0.5 * K**0.5)
+    w1_q, w2_q, w1_s, w2_s = _make_int8_moe_weights(E, N, K)
+    topk_weight, topk_ids = _deterministic_expert_routes(block_sizes)
+    ref_out = _ref_int8_moe(a, w1_q, w2_q, w1_s, w2_s, topk_weight, topk_ids)
+
+    w1 = _prepack_experts(w1_q) if is_vnni else w1_q
+    w2 = _prepack_experts(w2_q) if is_vnni else w2_q
+    out = ops.fused_experts_cpu(
+        a.clone(),
+        w1,
+        w2,
+        topk_weight,
+        topk_ids,
+        inplace,
+        ops.CPUQuantMethod.INT8_W8A8,
+        w1_s,
+        w2_s,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
         is_vnni,
     )
     torch.testing.assert_close(
