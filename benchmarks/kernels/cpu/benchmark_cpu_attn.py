@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 import functools
+import json
 import time
 
 import numpy as np
@@ -9,6 +10,7 @@ import torch
 
 from vllm._custom_ops import (
     cpu_attention_with_kv_cache,
+    cpu_attn_get_scheduler_diagnostics,
     cpu_attn_get_scheduler_metadata,
     cpu_attn_reshape_and_cache,
 )
@@ -26,6 +28,11 @@ if torch.cpu._is_amx_tile_supported():
     torch.cpu._init_amx()
 
 KV_CACHE_DTYPE_CHOICES = ["auto", "fp8_e4m3", "fp8_e5m2"]
+SCHEDULER_DIAGNOSTIC_FIELDS = (
+    "q_head_group",
+    "kv_split_count",
+    "eligible_requests",
+)
 
 
 def get_attn_isa(
@@ -61,17 +68,22 @@ def main(
     seq_lens: list[tuple[int, int]],
     num_heads: tuple[int, int],
     head_size: int,
-    sliding_window: int = None,
+    sliding_window: int | None = None,
     dtype: torch.dtype = torch.bfloat16,
     block_size: int = 128,
     num_blocks: int = 4096,
     use_sink: bool = False,
     enable_kv_split: bool = False,
+    forced_q_head_group: int = 0,
+    forced_kv_split_count: int = 0,
     isa: str | None = None,
     kv_cache_dtype: str = "auto",
     seed: int = 0,
     iters: int = 20,
-) -> None:
+    decode: bool = False,
+    print_schedule_diagnostics: bool = False,
+    output_json: str | None = None,
+) -> dict[str, object]:
     set_random_seed(seed)
     num_seqs = len(seq_lens)
     query_lens = [x[0] for x in seq_lens]
@@ -80,7 +92,7 @@ def main(
     num_kv_heads = num_heads[1]
     assert num_query_heads % num_kv_heads == 0
     max_kv_len = max(kv_lens)
-    window_size = (sliding_window - 1, 0) if sliding_window is not None else (-1, -1)
+    window_size = sliding_window if sliding_window is not None else -1
     scale = head_size**-0.5
     token_num = sum(query_lens)
 
@@ -95,7 +107,7 @@ def main(
     kv_cache_torch_dtype = torch.uint8 if is_fp8_kv else dtype
 
     if isa is None:
-        isa = get_attn_isa(block_size, dtype, kv_cache_dtype)
+        isa = get_attn_isa(block_size, dtype, head_size, kv_cache_dtype)
 
     s_aux = (
         15 * torch.rand((num_query_heads,), dtype=torch.bfloat16) if use_sink else None
@@ -151,19 +163,31 @@ def main(
         kv_cache_dtype=kv_cache_dtype,
     )
 
-    metadata = cpu_attn_get_scheduler_metadata(
-        num_reqs=num_seqs,
-        num_heads=num_query_heads,
-        num_kv_heads=num_kv_heads,
-        head_dim=head_size,
-        seq_lens=kv_lens_tensor,
-        dtype=dtype,
-        query_start_loc=cu_query_lens,
-        causal=True,
-        sliding_window_size=sliding_window if sliding_window is not None else -1,
-        isa=isa,
-        enable_kv_split=enable_kv_split,
-    )
+    metadata_kwargs = {
+        "num_reqs": num_seqs,
+        "num_heads": num_query_heads,
+        "num_kv_heads": num_kv_heads,
+        "head_dim": head_size,
+        "seq_lens": kv_lens_tensor,
+        "dtype": dtype,
+        "query_start_loc": cu_query_lens,
+        "causal": True,
+        "sliding_window_size": (sliding_window if sliding_window is not None else -1),
+        "isa": isa,
+        "enable_kv_split": enable_kv_split,
+        "kv_cache_dtype": kv_cache_dtype,
+        "forced_q_head_group": forced_q_head_group,
+        "forced_kv_split_count": forced_kv_split_count,
+    }
+    if decode:
+        metadata_kwargs["decode_mask"] = torch.ones(num_seqs, dtype=torch.bool)
+    metadata = cpu_attn_get_scheduler_metadata(**metadata_kwargs)
+    scheduler = cpu_attn_get_scheduler_diagnostics(metadata)
+    schedule_diagnostics = {
+        field: scheduler[field] for field in SCHEDULER_DIAGNOSTIC_FIELDS
+    }
+    if print_schedule_diagnostics:
+        print("schedule =", json.dumps(schedule_diagnostics, sort_keys=True))
 
     out_with_split = torch.empty_like(query)
 
@@ -181,7 +205,7 @@ def main(
                 scale=scale,
                 causal=True,
                 alibi_slopes=None,
-                sliding_window=window_size if sliding_window is not None else -1,
+                sliding_window=window_size,
                 block_table=block_tables,
                 softcap=0,
                 scheduler_metadata=metadata,
@@ -201,12 +225,52 @@ def main(
     time_max = max(times)
     time_mean = np.mean(times)
     time_std = np.std(times)
+    time_median = np.median(times)
 
     print("\tmin (ms) = ", time_min)
     print("\tmax (ms) = ", time_max)
     print("\tmean (ms) = ", time_mean)
     print("\tstd = ", time_std)
-    print("\tmedian (ms) = ", np.median(times))
+    print("\tmedian (ms) = ", time_median)
+
+    result = {
+        "configuration": {
+            "seq_lens": [list(seq_len) for seq_len in seq_lens],
+            "num_heads": list(num_heads),
+            "head_size": head_size,
+            "sliding_window": sliding_window,
+            "dtype": str(dtype),
+            "block_size": block_size,
+            "num_blocks": num_blocks,
+            "use_sink": use_sink,
+            "enable_kv_split": enable_kv_split,
+            "forced_q_head_group": forced_q_head_group,
+            "forced_kv_split_count": forced_kv_split_count,
+            "isa": isa,
+            "kv_cache_dtype": kv_cache_dtype,
+            "seed": seed,
+            "warmup_iters": 5,
+            "iters": iters,
+            "decode": decode,
+            "print_schedule_diagnostics": print_schedule_diagnostics,
+        },
+        "raw_iteration_times_ms": times,
+        "summary": {
+            "min_ms": float(time_min),
+            "max_ms": float(time_max),
+            "mean_ms": float(time_mean),
+            "std_ms": float(time_std),
+            "median_ms": float(time_median),
+        },
+        "schedule": schedule_diagnostics
+        | {"metadata_bytes": metadata.numel() * metadata.element_size()},
+    }
+    if output_json is not None:
+        with open(output_json, "w", encoding="utf-8") as output_file:
+            json.dump(result, output_file, indent=2)
+            output_file.write("\n")
+        print("results saved to ", output_json)
+    return result
 
 
 def generate_seq_lens(
@@ -261,6 +325,23 @@ if __name__ == "__main__":
     )
     parser.add_argument("--use-sink", action="store_true")
     parser.add_argument(
+        "--forced-q-head-group",
+        type=int,
+        default=0,
+        help="Force the query-head group size; 0 lets the scheduler choose.",
+    )
+    parser.add_argument(
+        "--forced-kv-split-count",
+        type=int,
+        default=0,
+        help="Force the KV split count; 0 lets the scheduler choose.",
+    )
+    parser.add_argument(
+        "--print-schedule-diagnostics",
+        action="store_true",
+        help="Print the selected scheduler diagnostics.",
+    )
+    parser.add_argument(
         "--isa",
         type=str,
         choices=["vec", "neon", "amx", "amx_fp8", "vec16", "rvv"],
@@ -277,6 +358,17 @@ if __name__ == "__main__":
     )
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--iters", type=int, default=20)
+    parser.add_argument(
+        "--decode",
+        action="store_true",
+        help="Treat every request as semantic decode/verification work.",
+    )
+    parser.add_argument(
+        "--output-json",
+        type=str,
+        default=None,
+        help="Write configuration, timings, and scheduler diagnostics to JSON.",
+    )
 
     args = parser.parse_args()
     print(args)
@@ -302,6 +394,8 @@ if __name__ == "__main__":
         num_blocks=args.num_blocks,
         use_sink=args.use_sink,
         enable_kv_split=args.enable_kv_split,
+        forced_q_head_group=args.forced_q_head_group,
+        forced_kv_split_count=args.forced_kv_split_count,
         isa=args.isa
         if args.isa is not None
         else get_attn_isa(
@@ -313,4 +407,7 @@ if __name__ == "__main__":
         kv_cache_dtype=args.kv_cache_dtype,
         seed=args.seed,
         iters=args.iters,
+        decode=args.decode,
+        print_schedule_diagnostics=args.print_schedule_diagnostics,
+        output_json=args.output_json,
     )

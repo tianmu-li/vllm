@@ -3816,6 +3816,13 @@ def onednn_scaled_mm(
     return output
 
 
+CPU_ATTN_SCHEDULER_DIAGNOSTIC_FIELDS = (
+    "q_head_group",
+    "kv_split_count",
+    "eligible_requests",
+)
+
+
 def cpu_attn_get_scheduler_metadata(
     num_reqs: int,
     num_heads: int,
@@ -3830,6 +3837,9 @@ def cpu_attn_get_scheduler_metadata(
     enable_kv_split: bool,
     dynamic_causal: torch.Tensor | None = None,
     kv_cache_dtype: str = "auto",
+    decode_mask: torch.Tensor | None = None,
+    forced_q_head_group: int = 0,
+    forced_kv_split_count: int = 0,
 ) -> torch.Tensor:
     scheduler_metadata = torch.ops._C.get_scheduler_metadata(
         num_reqs,
@@ -3845,8 +3855,18 @@ def cpu_attn_get_scheduler_metadata(
         enable_kv_split,
         dynamic_causal,
         kv_cache_dtype,
+        decode_mask,
+        forced_q_head_group,
+        forced_kv_split_count,
     )
     return scheduler_metadata
+
+
+def cpu_attn_get_scheduler_diagnostics(
+    scheduler_metadata: torch.Tensor,
+) -> dict[str, int]:
+    values = torch.ops._C.get_scheduler_diagnostics(scheduler_metadata).tolist()
+    return dict(zip(CPU_ATTN_SCHEDULER_DIAGNOSTIC_FIELDS, values))
 
 
 def cpu_attn_reshape_and_cache(

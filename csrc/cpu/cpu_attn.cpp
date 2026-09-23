@@ -44,7 +44,19 @@ torch::Tensor get_scheduler_metadata(
     const int64_t window_size, const std::string& isa_hint,
     const bool enable_kv_split,
     const std::optional<torch::Tensor>& dynamic_causal,
-    const std::string& kv_cache_dtype) {
+    const std::string& kv_cache_dtype,
+    const std::optional<torch::Tensor>& decode_mask,
+    const int64_t forced_q_head_group, const int64_t forced_kv_split_count) {
+  if (decode_mask.has_value()) {
+    TORCH_CHECK(decode_mask->device().is_cpu(),
+                "decode_mask must be a CPU tensor");
+    TORCH_CHECK_EQ(decode_mask->scalar_type(), at::ScalarType::Bool);
+    TORCH_CHECK(decode_mask->is_contiguous(), "decode_mask must be contiguous");
+    TORCH_CHECK(decode_mask->dim() == 1, "decode_mask must be one-dimensional");
+    TORCH_CHECK(decode_mask->numel() == num_req,
+                "decode_mask must contain one value per request");
+  }
+
   cpu_attention::ISA isa;
   if (isa_hint == "amx") {
     isa = cpu_attention::ISA::AMX;
@@ -80,9 +92,14 @@ torch::Tensor get_scheduler_metadata(
   input.enable_kv_split = enable_kv_split;
   input.dynamic_causal =
       dynamic_causal.has_value() ? dynamic_causal->data_ptr<bool>() : nullptr;
+  input.decode_mask =
+      decode_mask.has_value() ? decode_mask->data_ptr<bool>() : nullptr;
 
   const int64_t kv_cache_idx =
       static_cast<int64_t>(parse_fp8_kv_dtype(kv_cache_dtype));
+  input.fp8_kv_cache = kv_cache_idx != 0;
+  input.forced_q_head_group = forced_q_head_group;
+  input.forced_kv_split_count = forced_kv_split_count;
   VLLM_DISPATCH_FLOATING_TYPES(dtype, "get_scheduler_metadata", [&]() {
     CPU_ATTN_DISPATCH(head_dim, isa, kv_cache_idx, [&]() {
       input.elem_size = sizeof(attn_impl::kv_cache_t);
@@ -98,6 +115,27 @@ torch::Tensor get_scheduler_metadata(
   cpu_attention::AttentionScheduler scheduler;
   torch::Tensor metadata = scheduler.schedule(input);
   return metadata;
+}
+
+torch::Tensor get_scheduler_diagnostics(
+    const torch::Tensor& scheduler_metadata) {
+  TORCH_CHECK(scheduler_metadata.device().is_cpu(),
+              "scheduler_metadata must be a CPU tensor");
+  TORCH_CHECK_EQ(scheduler_metadata.scalar_type(), at::ScalarType::Char);
+  TORCH_CHECK(scheduler_metadata.is_contiguous(),
+              "scheduler_metadata must be contiguous");
+  TORCH_CHECK_GE(scheduler_metadata.numel(),
+                 sizeof(cpu_attention::AttentionMetadata));
+  const auto* metadata =
+      reinterpret_cast<const cpu_attention::AttentionMetadata*>(
+          scheduler_metadata.data_ptr());
+  torch::Tensor diagnostics =
+      torch::empty({3}, torch::TensorOptions().dtype(torch::kInt64));
+  int64_t* values = diagnostics.data_ptr<int64_t>();
+  values[0] = metadata->selected_q_head_group;
+  values[1] = metadata->selected_kv_split_count;
+  values[2] = metadata->eligible_request_num;
+  return diagnostics;
 }
 
 void cpu_attn_reshape_and_cache(

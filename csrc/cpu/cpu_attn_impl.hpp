@@ -1,8 +1,10 @@
 #ifndef CPU_ATTN_HPP
 #define CPU_ATTN_HPP
 
-#include <type_traits>
+#include <cmath>
 #include <cstddef>
+#include <numeric>
+#include <type_traits>
 
 #if defined(__APPLE__)
   #include <sys/sysctl.h>
@@ -33,35 +35,47 @@ class AttentionImpl {
 
 struct AttentionWorkItemGroup {
   int32_t req_id;
+  int32_t kv_head_idx;
+  int32_t q_head_start;
+  int32_t q_head_num;
   int32_t q_token_id_start;
   int32_t q_token_num;
   int32_t kv_split_pos_start;
   int32_t kv_split_pos_end;
 
-  int64_t total_kv_len;
+  int32_t reduction_id;
   int32_t split_id;
   int32_t local_split_id;
+  int32_t _padding;
 
   AttentionWorkItemGroup(const int32_t req_id, const int32_t q_token_id_start,
                          const int32_t kv_split_pos_start,
-                         const int32_t kv_split_pos_end)
+                         const int32_t kv_split_pos_end,
+                         const int32_t q_head_num)
       : req_id(req_id),
+        kv_head_idx(-1),
+        q_head_start(0),
+        q_head_num(q_head_num),
         q_token_id_start(q_token_id_start),
         q_token_num(0),
         kv_split_pos_start(kv_split_pos_start),
         kv_split_pos_end(kv_split_pos_end),
-        total_kv_len(0),
+        reduction_id(-1),
         split_id(-1),
-        local_split_id(0) {}
+        local_split_id(0),
+        _padding(0) {}
 
   std::string to_string() const {
     std::stringstream ss;
     ss << '[' << "req_id: " << req_id << ",\n";
+    ss << "kv_head_idx: " << kv_head_idx << ",\n";
+    ss << "q_head_start: " << q_head_start << ",\n";
+    ss << "q_head_num: " << q_head_num << ",\n";
     ss << "q_token_id_start: " << q_token_id_start << ",\n";
     ss << "q_token_num: " << q_token_num << ",\n";
     ss << "kv_split_pos_start: " << kv_split_pos_start << ",\n";
     ss << "kv_split_pos_end: " << kv_split_pos_end << ",\n";
-    ss << "total_kv_len: " << total_kv_len << ",\n";
+    ss << "reduction_id: " << reduction_id << ",\n";
     ss << "split_id: " << split_id << ",\n";
     ss << "local_split_id: " << local_split_id << ",\n";
     ss << ']';
@@ -72,27 +86,32 @@ struct AttentionWorkItemGroup {
 
 struct ReductionWorkItemGroup {
   int32_t req_id;
+  int32_t q_head_start;
+  int32_t q_head_num;
   int32_t q_token_id_start;
   int32_t q_token_id_num;
-  int32_t split_start_id;
   int32_t split_num;
+  int64_t scratch_offset;
 
   ReductionWorkItemGroup(const int32_t req_id, const int32_t q_token_id_start,
-                         const int32_t q_token_id_num,
-                         const int32_t split_start_id)
+                         const int32_t q_token_id_num, const int32_t q_head_num)
       : req_id(req_id),
+        q_head_start(0),
+        q_head_num(q_head_num),
         q_token_id_start(q_token_id_start),
         q_token_id_num(q_token_id_num),
-        split_start_id(split_start_id),
-        split_num(0) {}
+        split_num(0),
+        scratch_offset(0) {}
 
   std::string to_string() const {
     std::stringstream ss;
     ss << '[' << "req_id: " << req_id << ",\n";
+    ss << "q_head_start: " << q_head_start << ",\n";
+    ss << "q_head_num: " << q_head_num << ",\n";
     ss << "q_token_id_start: " << q_token_id_start << ",\n";
     ss << "q_token_id_num: " << q_token_id_num << ",\n";
-    ss << "split_start_id: " << split_start_id << ",\n";
     ss << "split_num: " << split_num << ",\n";
+    ss << "scratch_offset: " << scratch_offset << ",\n";
     ss << ']';
 
     return ss.str();
@@ -107,35 +126,34 @@ struct AttentionMetadata {
   int32_t reduction_item_num;
   int32_t reduction_split_num;
   int32_t thread_num;
-  int32_t effective_thread_num;  // non-zero item num in workitem_num_per_thread
-  int32_t split_kv_q_token_num_threshold;
   int64_t attention_scratchpad_size_per_thread;
-  int64_t reduction_scratchpad_size_per_kv_head;
+  int64_t reduction_scratchpad_size;
   AttentionWorkItemGroup* workitem_groups_ptr;
   ReductionWorkItemGroup* reduction_items_ptr;
-  int32_t cu_workitem_num_per_thread[1025] = {
-      0};  // prefix sum of workitem_num_per_thread
-  char _padding2[56];
+  int32_t selected_q_head_group;
+  int32_t selected_kv_split_count;
+  int32_t eligible_request_num;
+  char _padding2[60];
 
   AttentionMetadata(ISA isa, int32_t workitem_group_num,
-                    int32_t reduction_item_num, int32_t reduction_split_num,
-                    int32_t split_kv_q_token_num_threshold)
-      : isa(isa),
+                    int32_t reduction_item_num, int32_t reduction_split_num)
+      : counter(0),
+        isa(isa),
         workitem_group_num(workitem_group_num),
         reduction_item_num(reduction_item_num),
         reduction_split_num(reduction_split_num),
         thread_num(cpu_utils::get_max_threads()),
-        effective_thread_num(thread_num),
-        split_kv_q_token_num_threshold(split_kv_q_token_num_threshold),
         attention_scratchpad_size_per_thread(0),
-        reduction_scratchpad_size_per_kv_head(0),
+        reduction_scratchpad_size(0),
         workitem_groups_ptr(
             (AttentionWorkItemGroup*)((char*)this + sizeof(AttentionMetadata))),
         reduction_items_ptr(
             (ReductionWorkItemGroup*)((char*)this + sizeof(AttentionMetadata) +
                                       workitem_group_num *
                                           sizeof(AttentionWorkItemGroup))),
-        counter(0) {
+        selected_q_head_group(1),
+        selected_kv_split_count(1),
+        eligible_request_num(0) {
     TORCH_CHECK_LE(thread_num, 1024);
     static_assert(sizeof(AttentionMetadata) % 64 == 0);
     TORCH_CHECK(reinterpret_cast<size_t>(this) % 64 == 0);
@@ -178,20 +196,13 @@ struct AttentionMetadata {
        << ", reduction_item_num: " << reduction_item_num
        << ", reduction_split_num: " << reduction_split_num
        << ", thread_num: " << thread_num
-       << ", effective_thread_num: " << effective_thread_num
        << ", attention_scratchpad_size_per_thread: "
        << attention_scratchpad_size_per_thread
-       << ", reduction_scratchpad_size_per_kv_head: "
-       << reduction_scratchpad_size_per_kv_head << ", workitem groups:\n";
+       << ", reduction_scratchpad_size: " << reduction_scratchpad_size
+       << ", workitem groups:\n";
     for (int32_t i = 0; i < workitem_group_num; ++i) {
       ss << (workitem_groups_ptr + i)->to_string() << ",\n";
     }
-
-    ss << "cu_workitem_num_per_thread: [";
-    for (int32_t i = 0; i < thread_num + 1; ++i) {
-      ss << cu_workitem_num_per_thread[i] << ", ";
-    }
-    ss << "]\n";
 
     ss << "reduction items: \n";
 
@@ -225,9 +236,7 @@ class AttentionScratchPad {
         reduction_scratchpad_ptr(
             static_cast<int8_t*>(scratchpad_ptr) +
             attention_metadata.thread_num *
-                attention_metadata.attention_scratchpad_size_per_thread),
-        reduction_scratchpad_size_per_kv_head(
-            attention_metadata.reduction_scratchpad_size_per_kv_head) {}
+                attention_metadata.attention_scratchpad_size_per_thread) {}
 
   // for attention
   void update(const int64_t head_dim, const int64_t q_buffer_elem_size,
@@ -251,10 +260,10 @@ class AttentionScratchPad {
   }
 
   // for reduction
-  void update(const int32_t kv_head_idx, const int32_t total_split_num,
+  void update(const int64_t scratch_offset, const int32_t total_split_num,
               const int64_t head_dim, const int64_t q_head_tile_size,
               const int64_t output_buffer_elem_size) {
-    int64_t buffer_offset = kv_head_idx * reduction_scratchpad_size_per_kv_head;
+    int64_t buffer_offset = scratch_offset;
     reduce_flag_buffer_offset_ = buffer_offset;
     buffer_offset += calcu_reduce_flag_buffer_size(total_split_num);
     reduce_output_buffer_offset_ = buffer_offset;
@@ -364,7 +373,6 @@ class AttentionScratchPad {
  private:
   int8_t* thread_scratchpad_ptr;
   int8_t* reduction_scratchpad_ptr;
-  int64_t reduction_scratchpad_size_per_kv_head;
   // attention buffers
   int64_t q_buffer_offset_;
   int64_t logits_buffer_offset_;
@@ -398,6 +406,10 @@ class AttentionScheduler {
     int32_t kv_block_alignment;  // context length alignment requirement
     bool enable_kv_split;
     bool* dynamic_causal;
+    bool* decode_mask;
+    bool fp8_kv_cache;
+    int32_t forced_q_head_group;
+    int32_t forced_kv_split_count;
   };
 
   static constexpr int32_t MaxQTileIterNum = 128;
@@ -412,232 +424,429 @@ class AttentionScheduler {
     const int64_t cache_size = cpu_utils::get_available_l2_size();
     const int32_t max_num_q_per_iter = input.max_num_q_per_iter;
     const int32_t kv_len_alignment = input.kv_block_alignment;
-    bool has_decode_request = false;
-    bool decode_only_batch = true;
-    for (int32_t req_id = 0; req_id < input.num_reqs; ++req_id) {
-      const int32_t q_token_num =
-          input.query_start_loc[req_id + 1] - input.query_start_loc[req_id];
-      has_decode_request = has_decode_request || (q_token_num == 1);
-      decode_only_batch = decode_only_batch && (q_token_num == 1);
-    }
+    const auto request_q_token_num = [&](const int32_t req_id) {
+      return input.query_start_loc[req_id + 1] - input.query_start_loc[req_id];
+    };
+    const auto request_decode_eligible = [&](const int32_t req_id) {
+      return input.decode_mask != nullptr && input.decode_mask[req_id];
+    };
     const int32_t original_q_head_per_kv =
         input.num_heads_q / input.num_heads_kv;
-    int32_t q_head_per_kv = original_q_head_per_kv;
     const bool supports_gqa = original_q_head_per_kv <= max_num_q_per_iter;
-    const bool use_gqa_fast_path = supports_gqa && decode_only_batch;
-    const bool use_gqa_scratchpad = supports_gqa && has_decode_request;
-    if (!use_gqa_scratchpad) {
-      q_head_per_kv = 1;  // fallback to MHA
-    }
+    const bool uses_amx = input.isa == ISA::AMX || input.isa == ISA::AMX_FP8;
     const int32_t min_split_kv_len =
         ((max_num_q_per_iter * 4 + kv_len_alignment - 1) / kv_len_alignment) *
         kv_len_alignment;
-    const int32_t max_num_q_token_per_iter = max_num_q_per_iter / q_head_per_kv;
+    const int32_t min_auto_verify_split_kv_len =
+        ((max_num_q_per_iter * 8 + kv_len_alignment - 1) / kv_len_alignment) *
+        kv_len_alignment;
     const int64_t default_tile_size = calcu_default_tile_size(
         cache_size, input.head_dim, input.elem_size, input.q_buffer_elem_size,
         input.logits_buffer_elem_size, input.output_buffer_elem_size,
         max_num_q_per_iter, max_num_q_per_iter);
-    const int32_t default_tile_token_num = default_tile_size / q_head_per_kv;
-    const int32_t split_kv_q_token_num_threshold =
-        input.enable_kv_split ? 1 : 0;
-    const int32_t sliding_window_size = input.sliding_window_size;
-    TORCH_CHECK_LE(split_kv_q_token_num_threshold * q_head_per_kv, 16);
-
-    // get total kv len
-    int64_t total_kv_len = 0;
-    for (int32_t req_id = 0; req_id < input.num_reqs; ++req_id) {
-      const int32_t seq_len = input.seq_lens[req_id];
-      const int32_t q_token_num =
-          input.query_start_loc[req_id + 1] - input.query_start_loc[req_id];
-      const bool req_causal =
-          is_dynamic_causal ? input.dynamic_causal[req_id] : causal;
-      const int32_t q_start_pos = seq_len - q_token_num;
-      const int32_t kv_start_pos = 0;
-      const int32_t kv_end_pos = seq_len;
-
-      for (int32_t token_id = 0; token_id < q_token_num;
-           token_id += max_num_q_token_per_iter) {
-        const int32_t q_tile_token_num =
-            std::min(max_num_q_token_per_iter, q_token_num - token_id);
-        const int32_t q_tile_pos_left = q_start_pos + token_id;
-        const int32_t q_tile_pos_right = q_tile_pos_left + q_tile_token_num;
-        const auto [kv_tile_pos_left, kv_tile_pos_right] = calcu_kv_tile_pos(
-            kv_start_pos, kv_end_pos, q_tile_pos_left, q_tile_pos_right,
-            sliding_window_size, req_causal);
-        const auto [aligned_kv_tile_pos_left, aligned_kv_tile_pos_right] =
-            align_kv_tile_pos(kv_tile_pos_left, kv_tile_pos_right,
-                              kv_len_alignment);
-
-        int32_t curr_kv_len =
-            aligned_kv_tile_pos_right - aligned_kv_tile_pos_left;
-        total_kv_len += curr_kv_len;
+    struct SchedulePlan {
+      int32_t q_head_num;
+      int32_t kv_split_num;
+      bool grouped;
+    };
+    struct ScheduleMetrics {
+      int64_t amx_tile_passes = 0;
+      int64_t useful_rows = 0;
+      int64_t allocated_rows = 0;
+      int64_t aligned_kv_bytes = 0;
+      int64_t fp8_conversion_bytes = 0;
+      int64_t runnable_tasks = 0;
+      int64_t task_waves = 0;
+      int64_t max_task_bytes = 0;
+      int64_t reduction_bytes = 0;
+      int64_t reduction_items = 0;
+      int64_t synchronization_items = 0;
+      int64_t descriptor_bytes = 0;
+      int64_t amx_tile_operations = 0;
+      double score = std::numeric_limits<double>::infinity();
+    };
+    const auto request_causal = [&](const int32_t req_id) {
+      return is_dynamic_causal ? input.dynamic_causal[req_id] : causal;
+    };
+    const bool has_forced_plan =
+        input.forced_q_head_group > 0 || input.forced_kv_split_count > 0;
+    const auto request_semantic_eligible = [&](const int32_t req_id) {
+      return request_q_token_num(req_id) > 0 &&
+             request_decode_eligible(req_id) && request_causal(req_id);
+    };
+    const auto request_adaptive_eligible = [&](const int32_t req_id) {
+      return request_semantic_eligible(req_id) && supports_gqa &&
+             original_q_head_per_kv > 1 && request_q_token_num(req_id) > 1 &&
+             uses_amx;
+    };
+    struct RequestClassification {
+      int32_t eligible_request_num;
+      bool has_multi_token_request;
+    };
+    const auto classify_requests = [&]() {
+      RequestClassification classification{0, false};
+      for (int32_t req_id = 0; req_id < input.num_reqs; ++req_id) {
+        classification.eligible_request_num +=
+            request_semantic_eligible(req_id);
+        classification.has_multi_token_request |=
+            request_adaptive_eligible(req_id);
       }
+      return classification;
+    };
+    const RequestClassification classification = classify_requests();
+    const int32_t eligible_request_num = classification.eligible_request_num;
+    const bool has_multi_token_request = classification.has_multi_token_request;
+
+    TORCH_CHECK(input.forced_q_head_group >= 0,
+                "forced_q_head_group must be nonnegative");
+    TORCH_CHECK(input.forced_kv_split_count >= 0,
+                "forced_kv_split_count must be nonnegative");
+    if (input.forced_q_head_group > 0) {
+      TORCH_CHECK_LE(input.forced_q_head_group, max_num_q_per_iter);
+      TORCH_CHECK_EQ(original_q_head_per_kv % input.forced_q_head_group, 0);
+      TORCH_CHECK(input.forced_q_head_group == 1 || supports_gqa,
+                  "The forced Q-head group is unsupported by this ISA");
     }
-    const int64_t kv_len_per_thread =
-        (((total_kv_len / thread_num) + kv_len_alignment - 1) /
-         kv_len_alignment) *
-        kv_len_alignment;
-    std::vector<AttentionWorkItemGroup> workitems;
-    std::vector<ReductionWorkItemGroup> reduce_workitems;
-    workitems.reserve(1024);
-    reduce_workitems.reserve(1024);
-    std::vector<int32_t> workitem_num_per_thread(thread_num, 0);
+    TORCH_CHECK(
+        input.forced_q_head_group != 1 || input.forced_kv_split_count <= 1,
+        "The MHA fallback does not support forced KV splitting");
+    TORCH_CHECK(!has_forced_plan || eligible_request_num > 0,
+                "Forced CPU attention overrides require an eligible request");
 
-    // split tasks
-    int32_t curr_thread_id = 0;
-    int64_t remaining_kv_len = kv_len_per_thread;
-    int32_t cum_split_num = 0;
-    for (int32_t req_id = 0; req_id < input.num_reqs; ++req_id) {
-      const int32_t seq_len = input.seq_lens[req_id];
-      const int32_t q_token_num =
-          input.query_start_loc[req_id + 1] - input.query_start_loc[req_id];
-      const bool req_causal =
-          is_dynamic_causal ? input.dynamic_causal[req_id] : causal;
-      const int32_t q_start_pos = seq_len - q_token_num;
-      const int32_t kv_start_pos = 0;
-      const int32_t kv_end_pos = seq_len;
-      int32_t local_split_id = 0;
-
-      AttentionWorkItemGroup curr_workitem(req_id, 0, 0, seq_len);
-      for (int32_t token_id = 0; token_id < q_token_num;
-           token_id += max_num_q_token_per_iter) {
-        const int32_t q_tile_token_num =
-            std::min(max_num_q_token_per_iter, q_token_num - token_id);
-        const int32_t q_tile_pos_left = q_start_pos + token_id;
-        const int32_t q_tile_pos_right = q_tile_pos_left + q_tile_token_num;
-        const auto [kv_tile_pos_left, kv_tile_pos_right] = calcu_kv_tile_pos(
-            kv_start_pos, kv_end_pos, q_tile_pos_left, q_tile_pos_right,
-            sliding_window_size, req_causal);
-        const auto [aligned_kv_tile_pos_left, aligned_kv_tile_pos_right] =
-            align_kv_tile_pos(kv_tile_pos_left, kv_tile_pos_right,
-                              kv_len_alignment);
-        int32_t curr_kv_len =
-            aligned_kv_tile_pos_right - aligned_kv_tile_pos_left;
-        int32_t kv_token_pos_start = aligned_kv_tile_pos_left;
-
-        while (curr_kv_len > 0) {
-          if (curr_kv_len <= (remaining_kv_len + min_split_kv_len) ||
-              curr_thread_id == (thread_num - 1)) {
-            curr_workitem.q_token_num += q_tile_token_num;
-            curr_workitem.total_kv_len += curr_kv_len;
-            remaining_kv_len -= curr_kv_len;
-            curr_kv_len = 0;
-
-            if (remaining_kv_len < 0) {
-              // stop to accept more workitems
-              remaining_kv_len -= min_split_kv_len;
-            }
-
-            if (curr_workitem.kv_split_pos_start != 0) {
-              // got a partial kv spilt, need to create a single workitem
-              curr_workitem.split_id = cum_split_num;
-              curr_workitem.local_split_id = local_split_id;
-              workitems.emplace_back(curr_workitem);
-              ++workitem_num_per_thread[curr_thread_id];
-              ++reduce_workitems.back().split_num;
-              ++cum_split_num;
-
-              curr_workitem = AttentionWorkItemGroup(
-                  req_id, token_id + max_num_q_token_per_iter, 0, seq_len);
-            }
-
-            break;
+    const auto for_each_query_tile =
+        [&](const int32_t req_id, const SchedulePlan& plan, auto&& callback) {
+          const int32_t q_token_num = request_q_token_num(req_id);
+          const int32_t q_tokens_per_tile =
+              plan.grouped ? max_num_q_per_iter / plan.q_head_num
+                           : default_tile_size;
+          const int32_t q_start_pos = input.seq_lens[req_id] - q_token_num;
+          for (int32_t token_id = 0; token_id < q_token_num;
+               token_id += q_tokens_per_tile) {
+            const int32_t tile_q =
+                std::min(q_tokens_per_tile, q_token_num - token_id);
+            const auto [kv_left, kv_right] = calcu_kv_tile_pos(
+                0, input.seq_lens[req_id], q_start_pos + token_id,
+                q_start_pos + token_id + tile_q, input.sliding_window_size,
+                request_causal(req_id));
+            const auto [aligned_left, aligned_right] =
+                align_kv_tile_pos(kv_left, kv_right, kv_len_alignment);
+            callback(token_id, tile_q, kv_left, kv_right, aligned_left,
+                     aligned_right);
           }
-
-          if (remaining_kv_len < min_split_kv_len &&
-              (curr_workitem.total_kv_len > 0 ||
-               workitem_num_per_thread[curr_thread_id] > 0)) {
-            // remaining_kv_len is too short, and have allocated workitems, just
-            // leave to next thread
-            if (curr_workitem.total_kv_len > 0) {
-              workitems.emplace_back(curr_workitem);
-              ++workitem_num_per_thread[curr_thread_id];
-              curr_workitem =
-                  AttentionWorkItemGroup(req_id, token_id, 0, seq_len);
-            }
-
-            // switch to next thread
-            ++curr_thread_id;
-            remaining_kv_len = kv_len_per_thread;
-
-            // retry this iteration
-            continue;
-          }
-
-          // only split tail splits with q_tile_token_num <=
-          // split_kv_q_token_num_threshold
-          if (token_id + max_num_q_token_per_iter < q_token_num ||
-              q_tile_token_num > split_kv_q_token_num_threshold) {
-            // if requires a new q tile iteration and already has workitems,
-            // leave this workitem to next thread
-            if (curr_workitem.q_token_num % default_tile_token_num == 0 &&
-                (curr_workitem.total_kv_len > 0 ||
-                 workitem_num_per_thread[curr_thread_id] > 0)) {
-              if (curr_workitem.total_kv_len > 0) {
-                workitems.emplace_back(curr_workitem);
-                ++workitem_num_per_thread[curr_thread_id];
+        };
+    const auto split_is_viable = [&](const int32_t req_id,
+                                     const SchedulePlan& plan,
+                                     const int32_t min_split_len) {
+      bool viable = true;
+      if (plan.kv_split_num > 1) {
+        for_each_query_tile(
+            req_id, plan,
+            [&](const int32_t, const int32_t, const int32_t, const int32_t,
+                const int32_t aligned_left, const int32_t aligned_right) {
+              viable &= aligned_right - aligned_left >=
+                        plan.kv_split_num * min_split_len;
+            });
+      }
+      return viable;
+    };
+    const auto evaluate_plan = [&](const SchedulePlan& plan) {
+      ScheduleMetrics metrics;
+      bool valid = true;
+      for (int32_t req_id = 0; req_id < input.num_reqs; ++req_id) {
+        if (request_q_token_num(req_id) == 0) {
+          continue;
+        }
+        const bool plan_eligible = has_forced_plan
+                                       ? request_semantic_eligible(req_id)
+                                       : request_adaptive_eligible(req_id);
+        const bool ordinary_decode = !has_forced_plan && supports_gqa &&
+                                     request_q_token_num(req_id) == 1;
+        SchedulePlan req_plan =
+            plan_eligible ? plan
+                          : (ordinary_decode
+                                 ? SchedulePlan{original_q_head_per_kv, 1, true}
+                                 : SchedulePlan{1, 1, false});
+        const int32_t required_split_kv_len = !has_forced_plan && plan_eligible
+                                                  ? min_auto_verify_split_kv_len
+                                                  : min_split_kv_len;
+        if (!has_forced_plan &&
+            !split_is_viable(req_id, req_plan, required_split_kv_len)) {
+          req_plan.kv_split_num = 1;
+        }
+        const int32_t groups_per_kv =
+            original_q_head_per_kv / req_plan.q_head_num;
+        for_each_query_tile(
+            req_id, req_plan,
+            [&](const int32_t, const int32_t tile_q, const int32_t,
+                const int32_t, const int32_t aligned_left,
+                const int32_t aligned_right) {
+              const int64_t aligned_kv_len = aligned_right - aligned_left;
+              if (req_plan.kv_split_num > 1 &&
+                  aligned_kv_len < static_cast<int64_t>(req_plan.kv_split_num) *
+                                       required_split_kv_len) {
+                valid = false;
+                return;
               }
-              curr_workitem =
-                  AttentionWorkItemGroup(req_id, token_id, 0, seq_len);
-
-              // switch to next thread
-              ++curr_thread_id;
-              remaining_kv_len = kv_len_per_thread;
-            }
-
-            curr_workitem.q_token_num += q_tile_token_num;
-            curr_workitem.total_kv_len += curr_kv_len;
-            remaining_kv_len -= curr_kv_len;
-            curr_kv_len = 0;
-            break;
-          }
-
-          // split kv
-          if (curr_workitem.total_kv_len > 0) {
-            // write back curr workitem
-            workitems.emplace_back(curr_workitem);
-            ++workitem_num_per_thread[curr_thread_id];
-          }
-
-          if (kv_token_pos_start == aligned_kv_tile_pos_left) {
-            // first split, init the workitem
-            reduce_workitems.emplace_back(ReductionWorkItemGroup(
-                req_id, token_id, q_tile_token_num, cum_split_num));
-          }
-
-          int32_t spilt_size =
-              std::min(std::max(remaining_kv_len, (int64_t)min_split_kv_len),
-                       (int64_t)curr_kv_len);
-          curr_workitem =
-              AttentionWorkItemGroup(req_id, token_id, kv_token_pos_start,
-                                     kv_token_pos_start + spilt_size);
-          curr_workitem.q_token_num += q_tile_token_num;
-          curr_workitem.total_kv_len += spilt_size;
-          curr_workitem.split_id = cum_split_num;
-          curr_workitem.local_split_id = local_split_id;
-          workitems.emplace_back(curr_workitem);
-          ++workitem_num_per_thread[curr_thread_id];
-          ++reduce_workitems.back().split_num;
-          ++cum_split_num;
-          ++local_split_id;
-
-          kv_token_pos_start += spilt_size;
-          curr_kv_len -= spilt_size;
-          curr_workitem = AttentionWorkItemGroup(req_id, token_id,
-                                                 kv_token_pos_start, seq_len);
-
-          // switch to next thread
-          ++curr_thread_id;
-          remaining_kv_len = kv_len_per_thread;
+              const int64_t instances =
+                  static_cast<int64_t>(input.num_heads_kv) * groups_per_kv;
+              const int64_t useful_rows = tile_q * req_plan.q_head_num;
+              const int64_t row_tiles = (useful_rows + 15) / 16;
+              const int64_t kv_bytes = instances * aligned_kv_len * 2 *
+                                       input.head_dim * input.elem_size;
+              const int64_t split_units = (aligned_kv_len / kv_len_alignment +
+                                           req_plan.kv_split_num - 1) /
+                                          req_plan.kv_split_num;
+              const int64_t fp8_conversion_bytes =
+                  input.isa == ISA::AMX && input.fp8_kv_cache
+                      ? instances * 2 * aligned_kv_len * input.head_dim * 4
+                      : 0;
+              const int64_t tile_operations =
+                  input.isa == ISA::AMX_FP8
+                      ? instances * 8 * row_tiles *
+                            (aligned_kv_len / kv_len_alignment) *
+                            (input.head_dim / 64)
+                  : uses_amx ? instances * 4 * row_tiles *
+                                   (aligned_kv_len / kv_len_alignment) *
+                                   (input.head_dim / 32)
+                             : 0;
+              const int64_t task_bytes =
+                  split_units * kv_len_alignment * 2 * input.head_dim *
+                      input.elem_size +
+                  fp8_conversion_bytes / (instances * req_plan.kv_split_num) +
+                  tile_operations * 64 / (instances * req_plan.kv_split_num);
+              metrics.amx_tile_passes += instances * row_tiles;
+              metrics.amx_tile_operations += tile_operations;
+              metrics.useful_rows += instances * useful_rows;
+              metrics.allocated_rows += instances * row_tiles * 16;
+              metrics.aligned_kv_bytes += kv_bytes;
+              metrics.fp8_conversion_bytes += fp8_conversion_bytes;
+              metrics.runnable_tasks += instances * req_plan.kv_split_num;
+              metrics.max_task_bytes =
+                  std::max(metrics.max_task_bytes, task_bytes);
+              if (req_plan.kv_split_num > 1) {
+                const int64_t rows = tile_q * req_plan.q_head_num;
+                const auto round64 = [](const int64_t value) {
+                  return ((value + 63) / 64) * 64;
+                };
+                const int64_t producer_bytes =
+                    static_cast<int64_t>(req_plan.kv_split_num) * rows *
+                    (input.head_dim * input.output_buffer_elem_size + 2 * 4);
+                const int64_t combine_bytes =
+                    (req_plan.kv_split_num - 1) * 3 * rows * input.head_dim *
+                        4 +
+                    8 * rows * (req_plan.kv_split_num + 1);
+                const int64_t scratch_bytes =
+                    round64(req_plan.kv_split_num) +
+                    round64(static_cast<int64_t>(req_plan.kv_split_num) * rows *
+                            input.head_dim * input.output_buffer_elem_size) +
+                    2 * round64(static_cast<int64_t>(req_plan.kv_split_num) *
+                                rows * sizeof(float));
+                metrics.reduction_bytes +=
+                    instances *
+                    (producer_bytes + combine_bytes + scratch_bytes);
+                metrics.reduction_items += instances;
+                metrics.synchronization_items +=
+                    instances * req_plan.kv_split_num;
+              }
+            });
+        if (!valid) {
+          break;
         }
       }
+      if (!valid || metrics.runnable_tasks == 0) {
+        return metrics;
+      }
+      metrics.task_waves =
+          (metrics.runnable_tasks + thread_num - 1) / thread_num +
+          (metrics.reduction_items + thread_num - 1) / thread_num;
+      metrics.descriptor_bytes =
+          metrics.runnable_tasks * sizeof(AttentionWorkItemGroup) +
+          metrics.reduction_items * sizeof(ReductionWorkItemGroup);
+      metrics.synchronization_items +=
+          metrics.runnable_tasks + metrics.reduction_items + thread_num +
+          (metrics.reduction_items > 0 ? thread_num : 0);
+      if (!has_forced_plan && has_multi_token_request && plan.grouped &&
+          input.isa == ISA::AMX && metrics.runnable_tasks < thread_num) {
+        return metrics;
+      }
+      const double effective_bytes =
+          metrics.aligned_kv_bytes + metrics.fp8_conversion_bytes +
+          metrics.amx_tile_operations * 64 + metrics.reduction_bytes;
+      const int64_t effective_parallelism =
+          has_multi_token_request
+              ? std::min<int64_t>(thread_num, metrics.runnable_tasks)
+              : thread_num;
+      const double serial_work =
+          std::max(effective_bytes / effective_parallelism,
+                   static_cast<double>(metrics.max_task_bytes));
+      metrics.score = serial_work * thread_num + 64.0 * metrics.task_waves +
+                      64.0 * metrics.synchronization_items +
+                      metrics.descriptor_bytes;
+      return metrics;
+    };
 
-      if (curr_workitem.total_kv_len > 0) {
-        // write back curr workitem
-        workitems.emplace_back(curr_workitem);
-        ++workitem_num_per_thread[curr_thread_id];
+    const SchedulePlan mha_plan{1, 1, false};
+    const ScheduleMetrics mha_metrics = evaluate_plan(mha_plan);
+    SchedulePlan batch_plan = mha_plan;
+    ScheduleMetrics batch_metrics =
+        !has_forced_plan || input.forced_q_head_group == 1 ? mha_metrics
+                                                           : ScheduleMetrics{};
+    if ((has_forced_plan && eligible_request_num > 0) ||
+        (!has_forced_plan && has_multi_token_request)) {
+      double best_score = batch_metrics.score;
+      for (int32_t group = 2; group <= original_q_head_per_kv; ++group) {
+        if (original_q_head_per_kv % group != 0 || group > max_num_q_per_iter ||
+            (input.forced_q_head_group > 0 &&
+             group != input.forced_q_head_group)) {
+          continue;
+        }
+        std::vector<int32_t> split_candidates;
+        if (input.forced_kv_split_count > 0) {
+          split_candidates.push_back(input.forced_kv_split_count);
+        } else if (input.enable_kv_split) {
+          for (int32_t split = 1; split <= thread_num; split *= 2) {
+            split_candidates.push_back(split);
+          }
+        } else {
+          split_candidates.push_back(1);
+        }
+        for (const int32_t split : split_candidates) {
+          SchedulePlan candidate{group, split, true};
+          ScheduleMetrics metrics = evaluate_plan(candidate);
+          if (metrics.score < best_score) {
+            best_score = metrics.score;
+            batch_plan = candidate;
+            batch_metrics = metrics;
+          }
+        }
+      }
+      TORCH_CHECK(std::isfinite(batch_metrics.score),
+                  "No valid CPU attention schedule for the forced overrides");
+    } else {
+      bool decode_only_batch = supports_gqa;
+      for (int32_t req_id = 0; req_id < input.num_reqs; ++req_id) {
+        decode_only_batch &= request_q_token_num(req_id) == 0 ||
+                             request_q_token_num(req_id) == 1;
+      }
+      if (decode_only_batch) {
+        batch_plan = {original_q_head_per_kv, 1, true};
       }
     }
+    const auto materialize_plan = [&](const SchedulePlan& selected_plan) {
+      std::vector<SchedulePlan> request_plans;
+      request_plans.reserve(input.num_reqs);
+      for (int32_t req_id = 0; req_id < input.num_reqs; ++req_id) {
+        const bool plan_eligible = has_forced_plan
+                                       ? request_semantic_eligible(req_id)
+                                       : request_adaptive_eligible(req_id);
+        if (plan_eligible) {
+          SchedulePlan request_plan = selected_plan;
+          if (!has_forced_plan &&
+              !split_is_viable(req_id, request_plan,
+                               min_auto_verify_split_kv_len)) {
+            request_plan.kv_split_num = 1;
+          }
+          request_plans.emplace_back(request_plan);
+        } else if (!has_forced_plan && supports_gqa &&
+                   request_q_token_num(req_id) == 1) {
+          request_plans.push_back({original_q_head_per_kv, 1, true});
+        } else {
+          request_plans.push_back({1, 1, false});
+        }
+      }
+      std::vector<AttentionWorkItemGroup> workitems;
+      std::vector<ReductionWorkItemGroup> reduce_workitems;
+      workitems.reserve(1024);
+      reduce_workitems.reserve(1024);
+      for (int32_t req_id = 0; req_id < input.num_reqs; ++req_id) {
+        const SchedulePlan req_plan = request_plans[req_id];
+        const int32_t req_q_heads_per_kv = req_plan.q_head_num;
+        for_each_query_tile(
+            req_id, req_plan,
+            [&](const int32_t token_id, const int32_t q_tile_token_num,
+                const int32_t kv_tile_pos_left, const int32_t kv_tile_pos_right,
+                const int32_t aligned_kv_tile_pos_left,
+                const int32_t aligned_kv_tile_pos_right) {
+              const int32_t aligned_kv_len =
+                  aligned_kv_tile_pos_right - aligned_kv_tile_pos_left;
+              const int32_t split_num = req_plan.kv_split_num;
+              const int32_t reduction_id =
+                  split_num > 1 ? reduce_workitems.size() : -1;
+              if (split_num > 1) {
+                reduce_workitems.emplace_back(ReductionWorkItemGroup(
+                    req_id, token_id, q_tile_token_num, req_q_heads_per_kv));
+              }
+              const int32_t aligned_units = aligned_kv_len / kv_len_alignment;
+              const int32_t units_per_split = aligned_units / split_num;
+              const int32_t extra_units = aligned_units % split_num;
+              int32_t split_start = aligned_kv_tile_pos_left;
+              for (int32_t split_id = 0; split_id < split_num; ++split_id) {
+                const int32_t split_units =
+                    units_per_split + (split_id < extra_units);
+                const int32_t split_end =
+                    split_start + split_units * kv_len_alignment;
+                const int32_t logical_split_start =
+                    split_id == 0 ? kv_tile_pos_left : split_start;
+                const int32_t logical_split_end =
+                    split_id + 1 == split_num ? kv_tile_pos_right : split_end;
+                AttentionWorkItemGroup item(
+                    req_id, token_id, logical_split_start, logical_split_end,
+                    req_q_heads_per_kv);
+                item.q_token_num = q_tile_token_num;
+                item.reduction_id = reduction_id;
+                item.split_id = split_num > 1 ? split_id : -1;
+                item.local_split_id = split_id;
+                workitems.emplace_back(item);
+                split_start = split_end;
+              }
+              if (split_num > 1) {
+                reduce_workitems.back().split_num = split_num;
+              }
+            });
+      }
+
+      std::vector<AttentionWorkItemGroup> head_workitems;
+      std::vector<ReductionWorkItemGroup> head_reduce_workitems;
+      std::vector<int32_t> reduction_offsets(reduce_workitems.size() + 1, 0);
+      for (size_t reduction_idx = 0; reduction_idx < reduce_workitems.size();
+           ++reduction_idx) {
+        ReductionWorkItemGroup item = reduce_workitems[reduction_idx];
+        const int32_t groups_per_kv = original_q_head_per_kv / item.q_head_num;
+        reduction_offsets[reduction_idx] = head_reduce_workitems.size();
+        for (int32_t kv_head_idx = 0; kv_head_idx < input.num_heads_kv;
+             ++kv_head_idx) {
+          for (int32_t group_idx = 0; group_idx < groups_per_kv; ++group_idx) {
+            ReductionWorkItemGroup head_item = item;
+            head_item.q_head_start = kv_head_idx * original_q_head_per_kv +
+                                     group_idx * item.q_head_num;
+            head_reduce_workitems.emplace_back(head_item);
+          }
+        }
+      }
+      reduction_offsets.back() = head_reduce_workitems.size();
+
+      for (const AttentionWorkItemGroup& item : workitems) {
+        const int32_t groups_per_kv = original_q_head_per_kv / item.q_head_num;
+        for (int32_t kv_head_idx = 0; kv_head_idx < input.num_heads_kv;
+             ++kv_head_idx) {
+          for (int32_t group_idx = 0; group_idx < groups_per_kv; ++group_idx) {
+            AttentionWorkItemGroup head_item = item;
+            head_item.kv_head_idx = kv_head_idx;
+            head_item.q_head_start = kv_head_idx * original_q_head_per_kv +
+                                     group_idx * item.q_head_num;
+            if (item.reduction_id >= 0) {
+              head_item.reduction_id = reduction_offsets[item.reduction_id] +
+                                       kv_head_idx * groups_per_kv + group_idx;
+            }
+            head_workitems.emplace_back(head_item);
+          }
+        }
+      }
+      workitems = std::move(head_workitems);
+      reduce_workitems = std::move(head_reduce_workitems);
+      return std::make_pair(std::move(workitems), std::move(reduce_workitems));
+    };
+    auto [workitems, reduce_workitems] = materialize_plan(batch_plan);
 
     int64_t metadata_tensor_size =
         sizeof(AttentionMetadata) +
@@ -647,9 +856,17 @@ class AttentionScheduler {
         torch::TensorOptions().dtype(torch::kInt8).device(torch::kCPU);
     torch::Tensor metadata_tensor =
         torch::empty({metadata_tensor_size}, options);
+    const int32_t total_reduction_split_num = std::accumulate(
+        reduce_workitems.begin(), reduce_workitems.end(), 0,
+        [](const int32_t total, const ReductionWorkItemGroup& item) {
+          return total + item.split_num;
+        });
     AttentionMetadata* metadata_ptr = new (metadata_tensor.data_ptr())
         AttentionMetadata(input.isa, workitems.size(), reduce_workitems.size(),
-                          cum_split_num, split_kv_q_token_num_threshold);
+                          total_reduction_split_num);
+    metadata_ptr->selected_q_head_group = batch_plan.q_head_num;
+    metadata_ptr->selected_kv_split_count = batch_plan.kv_split_num;
+    metadata_ptr->eligible_request_num = eligible_request_num;
     AttentionWorkItemGroup* workitem_groups_ptr =
         metadata_ptr->workitem_groups_ptr;
     ReductionWorkItemGroup* reduction_items_ptr =
@@ -659,33 +876,20 @@ class AttentionScheduler {
     std::memcpy(reduction_items_ptr, reduce_workitems.data(),
                 reduce_workitems.size() * sizeof(ReductionWorkItemGroup));
 
-    int32_t effective_thread_num = 0;
-    for (; effective_thread_num < thread_num; ++effective_thread_num) {
-      if (workitem_num_per_thread[effective_thread_num] == 0) {
-        break;
-      }
-    }
-
-    std::memcpy(metadata_ptr->cu_workitem_num_per_thread + 1,
-                workitem_num_per_thread.data(),
-                workitem_num_per_thread.size() * sizeof(int32_t));
-    for (int32_t i = 1; i <= thread_num; ++i) {
-      metadata_ptr->cu_workitem_num_per_thread[i] +=
-          metadata_ptr->cu_workitem_num_per_thread[i - 1];
-    }
-    metadata_ptr->effective_thread_num = effective_thread_num;
-
     {
       AttentionScratchPad sc(0, *metadata_ptr, 0x0);
       int64_t max_attention_scratchpad_size = 0;
 
       for (const AttentionWorkItemGroup& item : workitems) {
-        const bool curr_use_gqa =
-            use_gqa_fast_path || (supports_gqa && item.q_token_num == 1);
-        const int32_t curr_q_heads_per_kv =
-            curr_use_gqa ? original_q_head_per_kv : 1;
+        const int32_t curr_q_heads_per_kv = item.q_head_num;
+        const int32_t curr_max_q_token_num_per_iter =
+            max_num_q_per_iter / curr_q_heads_per_kv;
         const int32_t curr_default_q_tile_token_num =
-            default_tile_size / curr_q_heads_per_kv;
+            curr_q_heads_per_kv > 1
+                ? std::min(static_cast<int32_t>(default_tile_size /
+                                                curr_q_heads_per_kv),
+                           MaxQTileIterNum * curr_max_q_token_num_per_iter)
+                : default_tile_size;
 
         for (int32_t q_token_offset = 0; q_token_offset < item.q_token_num;
              q_token_offset += curr_default_q_tile_token_num) {
@@ -718,32 +922,26 @@ class AttentionScheduler {
       metadata_ptr->attention_scratchpad_size_per_thread =
           ((max_attention_scratchpad_size + 63) / 64) * 64;
 
-      int32_t max_reduction_q_head_tile_size = 0;
-      for (const ReductionWorkItemGroup& item : reduce_workitems) {
-        const bool curr_use_gqa =
-            use_gqa_fast_path || (supports_gqa && item.q_token_id_num == 1);
-        const int32_t curr_q_heads_per_kv =
-            curr_use_gqa ? original_q_head_per_kv : 1;
-
-        max_reduction_q_head_tile_size =
-            std::max(max_reduction_q_head_tile_size,
-                     item.q_token_id_num * curr_q_heads_per_kv);
+      int64_t reduction_scratchpad_size = 0;
+      for (int32_t item_idx = 0; item_idx < metadata_ptr->reduction_item_num;
+           ++item_idx) {
+        ReductionWorkItemGroup& item =
+            metadata_ptr->reduction_items_ptr[item_idx];
+        item.scratch_offset = reduction_scratchpad_size;
+        sc.update(item.scratch_offset, item.split_num, input.head_dim,
+                  item.q_token_id_num * item.q_head_num,
+                  input.output_buffer_elem_size);
+        reduction_scratchpad_size =
+            ((sc.get_reduction_scratchpad_size() + 63) / 64) * 64;
       }
-
-      sc.update(0, metadata_ptr->reduction_split_num, input.head_dim,
-                max_reduction_q_head_tile_size, input.output_buffer_elem_size);
-      metadata_ptr->reduction_scratchpad_size_per_kv_head =
-          ((sc.get_reduction_scratchpad_size() + 63) / 64) * 64;
+      metadata_ptr->reduction_scratchpad_size = reduction_scratchpad_size;
     }
     int64_t scratchpad_size =
         metadata_ptr->attention_scratchpad_size_per_thread *
             metadata_ptr->thread_num +
-        metadata_ptr->reduction_scratchpad_size_per_kv_head *
-            (use_gqa_fast_path ? input.num_heads_kv : input.num_heads_q);
+        metadata_ptr->reduction_scratchpad_size;
     cpu_utils::ScratchPadManager::get_scratchpad_manager()->realloc(
         scratchpad_size);
-
-    // metadata_ptr->print();
 
     // test out of boundary access
     // {
@@ -1540,26 +1738,10 @@ class AttentionMainLoop {
 
       // general information
       const int32_t q_head_num = input->num_heads;
-      const int32_t kv_head_num = input->num_kv_heads;
-      const int32_t q_heads_per_kv = q_head_num / kv_head_num;
       AttentionWorkItemGroup* const workitem_groups =
           metadata.workitem_groups_ptr;
-      const int32_t* cu_workitem_num_per_thread =
-          metadata.cu_workitem_num_per_thread;
       ReductionWorkItemGroup* const reduction_items =
           metadata.reduction_items_ptr;
-      const bool supports_gqa = q_heads_per_kv <= max_q_head_num_per_iter;
-      bool decode_only_batch = true;
-      for (int32_t i = 0; i < metadata.workitem_group_num; ++i) {
-        decode_only_batch =
-            decode_only_batch && (workitem_groups[i].q_token_num == 1);
-      }
-      const bool use_gqa_fast_path = supports_gqa && decode_only_batch;
-      const int32_t actual_kv_head_num =
-          use_gqa_fast_path ? kv_head_num : q_head_num;
-      const int32_t actual_q_heads_per_kv =
-          use_gqa_fast_path ? q_heads_per_kv : 1;
-      TORCH_CHECK_LE(actual_q_heads_per_kv, max_q_head_num_per_iter);
       const int64_t q_token_num_stride = input->query_num_tokens_stride;
       const int64_t q_head_num_stride = input->query_num_heads_stride;
       const int64_t kv_cache_head_num_stride = input->cache_num_kv_heads_stride;
@@ -1584,17 +1766,16 @@ class AttentionMainLoop {
               ->get_data<void>();
       AttentionScratchPad buffer_manager(thread_id, metadata, scratchpad_ptr);
 
-      const int32_t total_reduction_split_num = metadata.reduction_split_num;
       if (metadata.reduction_split_num > 0) {
-        // reset split flag
-        for (int32_t head_idx = thread_id; head_idx < actual_kv_head_num;
-             head_idx += thread_num) {
-          buffer_manager.update(head_idx, total_reduction_split_num, head_dim,
-                                0, sizeof(partial_output_buffer_t));
+        for (int32_t item_idx = thread_id;
+             item_idx < metadata.reduction_item_num; item_idx += thread_num) {
+          const ReductionWorkItemGroup& item = reduction_items[item_idx];
+          buffer_manager.update(item.scratch_offset, item.split_num, head_dim,
+                                item.q_token_id_num * item.q_head_num,
+                                sizeof(partial_output_buffer_t));
           volatile bool* __restrict__ curr_flag_ptr =
               buffer_manager.get_reduce_flag_buffer();
-          for (int32_t split_idx = 0; split_idx < total_reduction_split_num;
-               ++split_idx) {
+          for (int32_t split_idx = 0; split_idx < item.split_num; ++split_idx) {
             curr_flag_ptr[split_idx] = false;
           }
         }
@@ -1608,14 +1789,9 @@ class AttentionMainLoop {
               sizeof(partial_output_buffer_t), max_q_head_num_per_iter,
               max_q_head_num_per_iter);
 
-      const int32_t effective_thread_num = metadata.effective_thread_num;
       const int32_t reduction_item_num = metadata.reduction_item_num;
-      const int32_t split_kv_q_token_num_threshold =
-          metadata.split_kv_q_token_num_threshold;
-      const int32_t workitem_groups_counter_num =
-          actual_kv_head_num * effective_thread_num;
-      const int32_t reduction_items_counter_num =
-          actual_kv_head_num * reduction_item_num;
+      const int32_t workitem_groups_counter_num = metadata.workitem_group_num;
+      const int32_t reduction_items_counter_num = reduction_item_num;
       const int32_t total_counter_num =
           workitem_groups_counter_num + reduction_items_counter_num;
 
@@ -1642,365 +1818,331 @@ class AttentionMainLoop {
         if (task_idx < workitem_groups_counter_num) {
           // attention task
           // map task_idx to workitem_groups
-          const int32_t kv_head_idx = task_idx / effective_thread_num;
-          const int32_t thread_offset = task_idx % effective_thread_num;
-          AttentionWorkItemGroup* const curr_workitem_groups =
-              workitem_groups + cu_workitem_num_per_thread[thread_offset];
-          const int32_t curr_workitem_groups_num =
-              cu_workitem_num_per_thread[thread_offset + 1] -
-              cu_workitem_num_per_thread[thread_offset];
+          AttentionWorkItemGroup* const current_workitem_group =
+              workitem_groups + task_idx;
 
-          for (int32_t workitem_group_idx = 0;
-               workitem_group_idx < curr_workitem_groups_num;
-               ++workitem_group_idx) {
-            AttentionWorkItemGroup* const current_workitem_group =
-                &curr_workitem_groups[workitem_group_idx];
+          const int32_t current_group_idx = current_workitem_group->req_id;
+          const int32_t current_group_causal =
+              is_dynamic_causal ? dynamic_causal[current_group_idx] : causal;
+          auto [sliding_window_left, sliding_window_right] =
+              AttentionScheduler::calcu_sliding_window_size(
+                  sliding_window_size, current_group_causal);
+          const int32_t kv_start_pos =
+              current_workitem_group->kv_split_pos_start;
+          const int32_t kv_end_pos = current_workitem_group->kv_split_pos_end;
+          const int32_t curr_spilt_id = current_workitem_group->split_id;
+          const int32_t q_token_id_start =
+              current_workitem_group->q_token_id_start;
+          const int32_t q_token_num = current_workitem_group->q_token_num;
+          const int32_t kv_head_idx = current_workitem_group->kv_head_idx;
+          const int32_t curr_q_heads_per_kv =
+              current_workitem_group->q_head_num;
+          const int32_t curr_max_q_token_num_per_iter =
+              max_q_head_num_per_iter / curr_q_heads_per_kv;
+          const int32_t curr_default_q_tile_token_num =
+              curr_q_heads_per_kv > 1
+                  ? std::min(default_tile_size / curr_q_heads_per_kv,
+                             AttentionScheduler::MaxQTileIterNum *
+                                 curr_max_q_token_num_per_iter)
+                  : default_tile_size;
+          const int32_t q_head_start_idx = current_workitem_group->q_head_start;
 
-            const int32_t current_group_idx = current_workitem_group->req_id;
-            const int32_t current_group_causal =
-                is_dynamic_causal ? dynamic_causal[current_group_idx] : causal;
-            auto [sliding_window_left, sliding_window_right] =
-                AttentionScheduler::calcu_sliding_window_size(
-                    sliding_window_size, current_group_causal);
-            const int32_t kv_start_pos =
-                current_workitem_group->kv_split_pos_start;
-            const int32_t kv_end_pos = current_workitem_group->kv_split_pos_end;
-            const int32_t curr_spilt_id = current_workitem_group->split_id;
-            const int32_t q_token_id_start =
-                current_workitem_group->q_token_id_start;
-            const int32_t q_token_num = current_workitem_group->q_token_num;
-            const bool curr_use_gqa =
-                use_gqa_fast_path || (supports_gqa && q_token_num == 1);
-            if (!use_gqa_fast_path && curr_use_gqa &&
-                kv_head_idx % q_heads_per_kv != 0) {
-              continue;
+          // taskgroup general information
+          const int32_t q_end = input->query_start_loc[current_group_idx + 1];
+          const int32_t q_start = input->query_start_loc[current_group_idx];
+          const int32_t seq_len = input->seq_lens[current_group_idx];
+          const int32_t q_start_pos = seq_len - (q_end - q_start);
+          const int32_t block_num = (seq_len + block_size - 1) / block_size;
+          // Only apply sink for the first KV split
+          bool use_sink =
+              (s_aux != nullptr && current_workitem_group->local_split_id == 0);
+
+          for (int32_t q_token_offset = 0; q_token_offset < q_token_num;
+               q_token_offset += curr_default_q_tile_token_num) {
+            bool first_iter_flag[AttentionScheduler::MaxQTileIterNum];
+            for (int32_t i = 0; i < AttentionScheduler::MaxQTileIterNum; ++i) {
+              first_iter_flag[i] = true;
             }
-            const int32_t curr_q_heads_per_kv =
-                curr_use_gqa ? q_heads_per_kv : 1;
-            const int32_t curr_max_q_token_num_per_iter =
-                max_q_head_num_per_iter / curr_q_heads_per_kv;
-            const int32_t curr_default_q_tile_token_num =
-                default_tile_size / curr_q_heads_per_kv;
-            const int32_t q_head_start_idx =
-                use_gqa_fast_path ? (kv_head_idx * q_heads_per_kv)
-                                  : kv_head_idx;
 
-            // taskgroup general information
-            const int32_t q_end = input->query_start_loc[current_group_idx + 1];
-            const int32_t q_start = input->query_start_loc[current_group_idx];
-            const int32_t seq_len = input->seq_lens[current_group_idx];
-            const int32_t q_start_pos = seq_len - (q_end - q_start);
-            const int32_t block_num = (seq_len + block_size - 1) / block_size;
-            // Only apply sink for the first KV split
-            bool use_sink = (s_aux != nullptr &&
-                             current_workitem_group->local_split_id == 0);
+            const int32_t q_token_start_idx =
+                q_start + q_token_offset + q_token_id_start;
+            const int32_t actual_q_token_num = std::min(
+                curr_default_q_tile_token_num, q_token_num - q_token_offset);
+            const int32_t q_head_tile_size =
+                actual_q_token_num * curr_q_heads_per_kv;
+            const int32_t rounded_q_head_tile_size =
+                ((q_head_tile_size + max_q_head_num_per_iter - 1) /
+                 max_q_head_num_per_iter) *
+                max_q_head_num_per_iter;
+            const int32_t kv_tile_size =
+                AttentionScheduler::calcu_tile_size_with_constant_q(
+                    available_cache_size, head_dim, sizeof(kv_cache_t),
+                    sizeof(q_buffer_t), sizeof(logits_buffer_t),
+                    sizeof(partial_output_buffer_t), max_q_head_num_per_iter,
+                    blocksize_alignment, rounded_q_head_tile_size,
+                    rounded_q_head_tile_size <= max_q_head_num_per_iter);
 
-            for (int32_t q_token_offset = 0; q_token_offset < q_token_num;
-                 q_token_offset += curr_default_q_tile_token_num) {
-              bool first_iter_flag[AttentionScheduler::MaxQTileIterNum];
-              for (int32_t i = 0; i < AttentionScheduler::MaxQTileIterNum;
-                   ++i) {
-                first_iter_flag[i] = true;
-              }
+            // update buffers
+            buffer_manager.update(
+                head_dim, sizeof(q_buffer_t), sizeof(logits_buffer_t),
+                sizeof(partial_output_buffer_t), max_q_head_num_per_iter,
+                rounded_q_head_tile_size, kv_tile_size);
+            q_buffer_t* q_buffer = buffer_manager.get_q_buffer<q_buffer_t>();
+            float* logits_buffer = buffer_manager.get_logits_buffer();
+            float* partial_q_buffer = buffer_manager.get_output_buffer();
+            float* max_buffer = buffer_manager.get_max_buffer();
+            float* sum_buffer = buffer_manager.get_sum_buffer();
 
-              const int32_t q_token_start_idx =
-                  q_start + q_token_offset + q_token_id_start;
-              const int32_t actual_q_token_num = std::min(
-                  curr_default_q_tile_token_num, q_token_num - q_token_offset);
-              const int32_t q_head_tile_size =
-                  actual_q_token_num * curr_q_heads_per_kv;
-              const int32_t rounded_q_head_tile_size =
-                  ((q_head_tile_size + max_q_head_num_per_iter - 1) /
-                   max_q_head_num_per_iter) *
-                  max_q_head_num_per_iter;
-              const int32_t kv_tile_size =
-                  AttentionScheduler::calcu_tile_size_with_constant_q(
-                      available_cache_size, head_dim, sizeof(kv_cache_t),
-                      sizeof(q_buffer_t), sizeof(logits_buffer_t),
-                      sizeof(partial_output_buffer_t), max_q_head_num_per_iter,
-                      blocksize_alignment, rounded_q_head_tile_size,
-                      rounded_q_head_tile_size <= max_q_head_num_per_iter);
+            const int32_t q_tile_start_pos =
+                q_start_pos + q_token_offset + q_token_id_start;
+            const int32_t q_tile_end_pos =
+                q_tile_start_pos + actual_q_token_num;
+            const auto [kv_tile_start_pos, kv_tile_end_pos] =
+                AttentionScheduler::calcu_kv_tile_pos(
+                    kv_start_pos, kv_end_pos, q_tile_start_pos, q_tile_end_pos,
+                    sliding_window_size, current_group_causal);
+            const auto [rounded_kv_tile_start_pos, rounded_kv_tile_end_pos] =
+                AttentionScheduler::align_kv_tile_pos(
+                    kv_tile_start_pos, kv_tile_end_pos, blocksize_alignment);
 
-              // update buffers
-              buffer_manager.update(
-                  head_dim, sizeof(q_buffer_t), sizeof(logits_buffer_t),
-                  sizeof(partial_output_buffer_t), max_q_head_num_per_iter,
-                  rounded_q_head_tile_size, kv_tile_size);
-              q_buffer_t* q_buffer = buffer_manager.get_q_buffer<q_buffer_t>();
-              float* logits_buffer = buffer_manager.get_logits_buffer();
-              float* partial_q_buffer = buffer_manager.get_output_buffer();
-              float* max_buffer = buffer_manager.get_max_buffer();
-              float* sum_buffer = buffer_manager.get_sum_buffer();
+            // std::printf("thread_id: %d, req_id: %d, q_token_start: %d,
+            // q_token_end: %d, q_head_start: %d, q_head_end: %d, kv_head_idx:
+            // %d, kv_pos_start: %d, kv_pos_end: %d\n",
+            //                 thread_id, current_group_idx,
+            //                 q_token_start_idx, q_token_start_idx +
+            //                 actual_q_token_num, q_head_start_idx,
+            //                 q_head_start_idx + actual_q_heads_per_kv,
+            //                 curr_kv_head_idx, kv_tile_start_pos,
+            //                 kv_tile_end_pos);
 
-              const int32_t q_tile_start_pos =
-                  q_start_pos + q_token_offset + q_token_id_start;
-              const int32_t q_tile_end_pos =
-                  q_tile_start_pos + actual_q_token_num;
-              const auto [kv_tile_start_pos, kv_tile_end_pos] =
-                  AttentionScheduler::calcu_kv_tile_pos(
-                      kv_start_pos, kv_end_pos, q_tile_start_pos,
-                      q_tile_end_pos, sliding_window_size,
-                      current_group_causal);
-              const auto [rounded_kv_tile_start_pos, rounded_kv_tile_end_pos] =
-                  AttentionScheduler::align_kv_tile_pos(
-                      kv_tile_start_pos, kv_tile_end_pos, blocksize_alignment);
+            // move buffers
+            kv_cache_t* curr_k_cache =
+                reinterpret_cast<kv_cache_t*>(input->key_cache) +
+                kv_head_idx * kv_cache_head_num_stride;
+            kv_cache_t* curr_v_cache =
+                reinterpret_cast<kv_cache_t*>(input->value_cache) +
+                kv_head_idx * kv_cache_head_num_stride;
+            query_t* const q_tile_ptr =
+                reinterpret_cast<query_t*>(input->query) +
+                q_token_start_idx * q_token_num_stride +
+                q_head_start_idx * q_head_num_stride;
+            size_t output_buffer_offset =
+                q_token_start_idx * q_head_num * head_dim +
+                q_head_start_idx * head_dim;
+            int32_t* curr_block_table =
+                block_table + current_group_idx * block_table_stride;
+            const float* curr_alibi_slopes =
+                (alibi_slopes != nullptr ? alibi_slopes + q_head_start_idx
+                                         : nullptr);
+            // copy the Q tile to q_buffer, the logical layout of q_buffer is
+            // [actual_q_token_num, curr_q_heads_per_kv, head_dim]
+            {
+              attn_impl.copy_q_heads_tile(
+                  q_tile_ptr, q_buffer, actual_q_token_num, curr_q_heads_per_kv,
+                  q_token_num_stride, q_head_num_stride, scale);
+            }
 
-              const int32_t curr_kv_head_idx =
-                  use_gqa_fast_path ? kv_head_idx
-                                    : (kv_head_idx / q_heads_per_kv);
-
-              // std::printf("thread_id: %d, req_id: %d, q_token_start: %d,
-              // q_token_end: %d, q_head_start: %d, q_head_end: %d, kv_head_idx:
-              // %d, kv_pos_start: %d, kv_pos_end: %d\n",
-              //                 thread_id, current_group_idx,
-              //                 q_token_start_idx, q_token_start_idx +
-              //                 actual_q_token_num, q_head_start_idx,
-              //                 q_head_start_idx + actual_q_heads_per_kv,
-              //                 curr_kv_head_idx, kv_tile_start_pos,
-              //                 kv_tile_end_pos);
-
-              // move buffers
-              kv_cache_t* curr_k_cache =
-                  reinterpret_cast<kv_cache_t*>(input->key_cache) +
-                  curr_kv_head_idx * kv_cache_head_num_stride;
-              kv_cache_t* curr_v_cache =
-                  reinterpret_cast<kv_cache_t*>(input->value_cache) +
-                  curr_kv_head_idx * kv_cache_head_num_stride;
-              query_t* const q_tile_ptr =
-                  reinterpret_cast<query_t*>(input->query) +
-                  q_token_start_idx * q_token_num_stride +
-                  q_head_start_idx * q_head_num_stride;
-              size_t output_buffer_offset =
-                  q_token_start_idx * q_head_num * head_dim +
-                  q_head_start_idx * head_dim;
-              int32_t* curr_block_table =
-                  block_table + current_group_idx * block_table_stride;
-              const float* curr_alibi_slopes =
-                  (alibi_slopes != nullptr ? alibi_slopes + q_head_start_idx
-                                           : nullptr);
-              // copy the Q tile to q_buffer, the logical layout of q_buffer is
-              // [actual_q_token_num, curr_q_heads_per_kv, head_dim]
-              {
-                attn_impl.copy_q_heads_tile(
-                    q_tile_ptr, q_buffer, actual_q_token_num,
-                    curr_q_heads_per_kv, q_token_num_stride, q_head_num_stride,
-                    scale);
-              }
-
-              if (use_sink) {
-                alignas(64) float s_aux_fp32[16];
-                // Sinks may be provided as bf16 or fp32. Either way they are
-                // loaded into fp32: bf16 sinks are up-converted (native
-                // BF16Vec16 path, available on all platforms), while fp32
-                // sinks are loaded directly and executed in full precision.
-                if (s_aux_is_bf16) {
-                  const c10::BFloat16* curr_s_aux =
-                      static_cast<const c10::BFloat16*>(s_aux) +
-                      q_head_start_idx;
-                  vec_op::BF16Vec16 vec_bf16(curr_s_aux);
-                  vec_op::FP32Vec16 vec_fp32(vec_bf16);
-                  vec_fp32.save(s_aux_fp32);
-                } else {
-                  const float* curr_s_aux =
-                      static_cast<const float*>(s_aux) + q_head_start_idx;
-                  vec_op::FP32Vec16 vec_fp32(curr_s_aux);
-                  vec_fp32.save(s_aux_fp32);
-                }
-
-                float* __restrict__ curr_sum_buffer = sum_buffer;
-                float* __restrict__ curr_max_buffer = max_buffer;
-                for (int32_t token_idx = 0; token_idx < actual_q_token_num;
-                     ++token_idx) {
-                  for (int32_t head_idx = 0; head_idx < curr_q_heads_per_kv;
-                       ++head_idx) {
-                    curr_sum_buffer[head_idx] = 1.0f;
-                    curr_max_buffer[head_idx] = s_aux_fp32[head_idx];
-                  }
-
-                  curr_sum_buffer += curr_q_heads_per_kv;
-                  curr_max_buffer += curr_q_heads_per_kv;
+            if (use_sink) {
+              alignas(64) float s_aux_fp32[max_q_head_num_per_iter];
+              if (s_aux_is_bf16) {
+                const c10::BFloat16* curr_s_aux =
+                    static_cast<const c10::BFloat16*>(s_aux) + q_head_start_idx;
+                for (int32_t head_idx = 0; head_idx < curr_q_heads_per_kv;
+                     ++head_idx) {
+                  s_aux_fp32[head_idx] =
+                      static_cast<float>(curr_s_aux[head_idx]);
                 }
               } else {
-                float* __restrict__ curr_sum_buffer = sum_buffer;
-                float* __restrict__ curr_max_buffer = max_buffer;
-                for (int32_t token_idx = 0; token_idx < actual_q_token_num;
-                     ++token_idx) {
-                  for (int32_t head_idx = 0; head_idx < curr_q_heads_per_kv;
-                       ++head_idx) {
-                    curr_sum_buffer[head_idx] = 0.0f;
-                    curr_max_buffer[head_idx] =
-                        std::numeric_limits<float>::lowest();
-                  }
-
-                  curr_sum_buffer += curr_q_heads_per_kv;
-                  curr_max_buffer += curr_q_heads_per_kv;
-                }
+                const float* curr_s_aux =
+                    static_cast<const float*>(s_aux) + q_head_start_idx;
+                std::copy_n(curr_s_aux, curr_q_heads_per_kv, s_aux_fp32);
               }
 
-              // compute loop
-              for (int32_t kv_tile_pos = rounded_kv_tile_start_pos;
-                   kv_tile_pos < rounded_kv_tile_end_pos;
-                   kv_tile_pos += kv_tile_size) {
-                const int32_t kv_tile_pos_left = kv_tile_pos;
-                const int32_t kv_tile_pos_right = std::min(
-                    kv_tile_pos_left + kv_tile_size, rounded_kv_tile_end_pos);
-                for (int32_t q_head_tile_token_offset = 0;
-                     q_head_tile_token_offset < actual_q_token_num;
-                     q_head_tile_token_offset +=
-                     curr_max_q_token_num_per_iter) {
-                  const int32_t q_tile_pos_left =
-                      q_tile_start_pos + q_head_tile_token_offset;
-                  const int32_t q_tile_token_num =
-                      std::min(curr_max_q_token_num_per_iter,
-                               actual_q_token_num - q_head_tile_token_offset);
-                  const int32_t q_tile_head_offset =
-                      q_head_tile_token_offset * curr_q_heads_per_kv;
-                  const int32_t q_tile_head_num =
-                      q_tile_token_num * curr_q_heads_per_kv;
-                  const int32_t q_tile_pos_right =
-                      q_tile_pos_left + q_tile_token_num;
-                  const auto [actual_kv_tile_pos_left,
-                              actual_kv_tile_pos_right] =
-                      AttentionScheduler::calcu_kv_tile_pos(
-                          kv_tile_pos_left, kv_tile_pos_right, q_tile_pos_left,
-                          q_tile_pos_right, sliding_window_size,
-                          current_group_causal);
-                  const int32_t q_iter_idx =
-                      q_head_tile_token_offset / curr_max_q_token_num_per_iter;
-
-                  if (actual_kv_tile_pos_right <= actual_kv_tile_pos_left) {
-                    continue;
-                  }
-
-                  // align kv_pos to blocksize_alignment
-                  const auto [aligned_actual_kv_tile_pos_left,
-                              aligned_actual_kv_tile_pos_right] =
-                      AttentionScheduler::align_kv_tile_pos(
-                          actual_kv_tile_pos_left, actual_kv_tile_pos_right,
-                          blocksize_alignment);
-                  const int32_t actual_kv_token_num =
-                      aligned_actual_kv_tile_pos_right -
-                      aligned_actual_kv_tile_pos_left;
-
-                  //   std::printf("\tq_iter_idx: %d, q_token_start: %d,
-                  //   q_token_end: %d, q_token_num: %d, q_head_num: %d,
-                  //   q_pos_start: %d, q_pos_end: %d, kv_pos_start: %d,
-                  //   kv_pos_end: %d\n",
-                  //             q_iter_idx, q_token_start_idx +
-                  //             q_head_tile_token_offset,  q_token_start_idx +
-                  //             q_head_tile_token_offset + q_tile_token_num,
-                  //             q_tile_token_num, q_tile_head_num,
-                  //             q_tile_pos_left, q_tile_pos_right,
-                  //             aligned_actual_kv_tile_pos_left,
-                  //             aligned_actual_kv_tile_pos_right);
-
-                  // Move buffers
-                  q_buffer_t* curr_q_heads_buffer =
-                      q_buffer + q_tile_head_offset * head_dim;
-                  float* curr_partial_q_buffer =
-                      partial_q_buffer + q_tile_head_offset * head_dim;
-                  float* curr_max_buffer = max_buffer + q_tile_head_offset;
-                  float* curr_sum_buffer = sum_buffer + q_tile_head_offset;
-
-                  bool debug_info = false;
-                  // if (debug_info) {
-                  //   std::printf("\tq_iter_idx: %d, q_token_start: %d,"
-                  //   "q_token_end: %d, q_token_num: %d, q_head_num: %d,"
-                  //   "q_pos_start: %d, q_pos_end: %d, kv_pos_start: %d,"
-                  //   "kv_pos_end: %d\n",
-                  //             q_iter_idx, q_token_start_idx +
-                  //             q_head_tile_token_offset,  q_token_start_idx
-                  //             + q_head_tile_token_offset +
-                  //             q_tile_token_num, q_tile_token_num,
-                  //             q_tile_head_num, q_tile_pos_left,
-                  //             q_tile_pos_right,
-                  //             aligned_actual_kv_tile_pos_left,
-                  //             aligned_actual_kv_tile_pos_right);
-                  // }
-
-                  attn_impl.template execute_attention<Attention>(
-                      curr_q_heads_buffer, curr_k_cache, curr_v_cache,
-                      logits_buffer, curr_partial_q_buffer, curr_max_buffer,
-                      curr_sum_buffer, curr_block_table, kv_end_pos,
-                      aligned_actual_kv_tile_pos_left,
-                      aligned_actual_kv_tile_pos_right, actual_kv_token_num,
-                      kv_cache_block_num_stride, q_tile_head_num,
-                      q_tile_token_num, q_tile_pos_left, curr_q_heads_per_kv,
-                      block_size, sliding_window_left, sliding_window_right,
-                      scale, softcap_scale, curr_alibi_slopes,
-                      first_iter_flag[q_iter_idx], use_sink, debug_info);
-                  first_iter_flag[q_iter_idx] = false;
+              float* __restrict__ curr_sum_buffer = sum_buffer;
+              float* __restrict__ curr_max_buffer = max_buffer;
+              for (int32_t token_idx = 0; token_idx < actual_q_token_num;
+                   ++token_idx) {
+                for (int32_t head_idx = 0; head_idx < curr_q_heads_per_kv;
+                     ++head_idx) {
+                  curr_sum_buffer[head_idx] = 1.0f;
+                  curr_max_buffer[head_idx] = s_aux_fp32[head_idx];
                 }
+
+                curr_sum_buffer += curr_q_heads_per_kv;
+                curr_max_buffer += curr_q_heads_per_kv;
               }
-
-              // write back partial results to output buffer or reduction buffer
-              {
-                if (curr_spilt_id == -1) {
-                  final_output(partial_q_buffer,
-                               reinterpret_cast<query_t*>(input->output) +
-                                   output_buffer_offset,
-                               sum_buffer, curr_q_heads_per_kv,
-                               actual_q_token_num, q_head_num, output_v_scale);
-                } else {
-                  const int32_t stride =
-                      curr_q_heads_per_kv * split_kv_q_token_num_threshold;
-                  buffer_manager.update(kv_head_idx, total_reduction_split_num,
-                                        head_dim, stride, sizeof(float));
-                  volatile bool* split_flag_buffer =
-                      buffer_manager.get_reduce_flag_buffer() + curr_spilt_id;
-                  float* split_output_buffer =
-                      buffer_manager.get_reduce_output_buffer() +
-                      curr_spilt_id * stride * head_dim;
-                  float* split_max_buffer =
-                      buffer_manager.get_reduce_max_buffer() +
-                      curr_spilt_id * stride;
-                  float* split_sum_buffer =
-                      buffer_manager.get_reduce_sum_buffer() +
-                      curr_spilt_id * stride;
-
-                  partial_output(partial_q_buffer, max_buffer, sum_buffer,
-                                 q_head_tile_size, split_output_buffer,
-                                 split_max_buffer, split_sum_buffer,
-                                 split_flag_buffer);
+            } else {
+              float* __restrict__ curr_sum_buffer = sum_buffer;
+              float* __restrict__ curr_max_buffer = max_buffer;
+              for (int32_t token_idx = 0; token_idx < actual_q_token_num;
+                   ++token_idx) {
+                for (int32_t head_idx = 0; head_idx < curr_q_heads_per_kv;
+                     ++head_idx) {
+                  curr_sum_buffer[head_idx] = 0.0f;
+                  curr_max_buffer[head_idx] =
+                      std::numeric_limits<float>::lowest();
                 }
+
+                curr_sum_buffer += curr_q_heads_per_kv;
+                curr_max_buffer += curr_q_heads_per_kv;
+              }
+            }
+
+            // compute loop
+            for (int32_t kv_tile_pos = rounded_kv_tile_start_pos;
+                 kv_tile_pos < rounded_kv_tile_end_pos;
+                 kv_tile_pos += kv_tile_size) {
+              const int32_t kv_tile_pos_left = kv_tile_pos;
+              const int32_t kv_tile_pos_right = std::min(
+                  kv_tile_pos_left + kv_tile_size, rounded_kv_tile_end_pos);
+              for (int32_t q_head_tile_token_offset = 0;
+                   q_head_tile_token_offset < actual_q_token_num;
+                   q_head_tile_token_offset += curr_max_q_token_num_per_iter) {
+                const int32_t q_tile_pos_left =
+                    q_tile_start_pos + q_head_tile_token_offset;
+                const int32_t q_tile_token_num =
+                    std::min(curr_max_q_token_num_per_iter,
+                             actual_q_token_num - q_head_tile_token_offset);
+                const int32_t q_tile_head_offset =
+                    q_head_tile_token_offset * curr_q_heads_per_kv;
+                const int32_t q_tile_head_num =
+                    q_tile_token_num * curr_q_heads_per_kv;
+                const int32_t q_tile_pos_right =
+                    q_tile_pos_left + q_tile_token_num;
+                const auto [actual_kv_tile_pos_left, actual_kv_tile_pos_right] =
+                    AttentionScheduler::calcu_kv_tile_pos(
+                        kv_tile_pos_left, kv_tile_pos_right, q_tile_pos_left,
+                        q_tile_pos_right, sliding_window_size,
+                        current_group_causal);
+                const int32_t q_iter_idx =
+                    q_head_tile_token_offset / curr_max_q_token_num_per_iter;
+
+                if (actual_kv_tile_pos_right <= actual_kv_tile_pos_left) {
+                  continue;
+                }
+
+                // align kv_pos to blocksize_alignment
+                const auto [aligned_actual_kv_tile_pos_left,
+                            aligned_actual_kv_tile_pos_right] =
+                    AttentionScheduler::align_kv_tile_pos(
+                        actual_kv_tile_pos_left, actual_kv_tile_pos_right,
+                        blocksize_alignment);
+                const int32_t actual_kv_token_num =
+                    aligned_actual_kv_tile_pos_right -
+                    aligned_actual_kv_tile_pos_left;
+
+                //   std::printf("\tq_iter_idx: %d, q_token_start: %d,
+                //   q_token_end: %d, q_token_num: %d, q_head_num: %d,
+                //   q_pos_start: %d, q_pos_end: %d, kv_pos_start: %d,
+                //   kv_pos_end: %d\n",
+                //             q_iter_idx, q_token_start_idx +
+                //             q_head_tile_token_offset,  q_token_start_idx +
+                //             q_head_tile_token_offset + q_tile_token_num,
+                //             q_tile_token_num, q_tile_head_num,
+                //             q_tile_pos_left, q_tile_pos_right,
+                //             aligned_actual_kv_tile_pos_left,
+                //             aligned_actual_kv_tile_pos_right);
+
+                // Move buffers
+                q_buffer_t* curr_q_heads_buffer =
+                    q_buffer + q_tile_head_offset * head_dim;
+                float* curr_partial_q_buffer =
+                    partial_q_buffer + q_tile_head_offset * head_dim;
+                float* curr_max_buffer = max_buffer + q_tile_head_offset;
+                float* curr_sum_buffer = sum_buffer + q_tile_head_offset;
+
+                bool debug_info = false;
+                // if (debug_info) {
+                //   std::printf("\tq_iter_idx: %d, q_token_start: %d,"
+                //   "q_token_end: %d, q_token_num: %d, q_head_num: %d,"
+                //   "q_pos_start: %d, q_pos_end: %d, kv_pos_start: %d,"
+                //   "kv_pos_end: %d\n",
+                //             q_iter_idx, q_token_start_idx +
+                //             q_head_tile_token_offset,  q_token_start_idx
+                //             + q_head_tile_token_offset +
+                //             q_tile_token_num, q_tile_token_num,
+                //             q_tile_head_num, q_tile_pos_left,
+                //             q_tile_pos_right,
+                //             aligned_actual_kv_tile_pos_left,
+                //             aligned_actual_kv_tile_pos_right);
+                // }
+
+                attn_impl.template execute_attention<Attention>(
+                    curr_q_heads_buffer, curr_k_cache, curr_v_cache,
+                    logits_buffer, curr_partial_q_buffer, curr_max_buffer,
+                    curr_sum_buffer, curr_block_table, kv_end_pos,
+                    aligned_actual_kv_tile_pos_left,
+                    aligned_actual_kv_tile_pos_right, actual_kv_token_num,
+                    kv_cache_block_num_stride, q_tile_head_num,
+                    q_tile_token_num, q_tile_pos_left, curr_q_heads_per_kv,
+                    block_size, sliding_window_left, sliding_window_right,
+                    scale, softcap_scale, curr_alibi_slopes,
+                    first_iter_flag[q_iter_idx], use_sink, debug_info);
+                first_iter_flag[q_iter_idx] = false;
+              }
+            }
+
+            // write back partial results to output buffer or reduction buffer
+            {
+              if (curr_spilt_id == -1) {
+                final_output(partial_q_buffer,
+                             reinterpret_cast<query_t*>(input->output) +
+                                 output_buffer_offset,
+                             sum_buffer, curr_q_heads_per_kv,
+                             actual_q_token_num, q_head_num, output_v_scale);
+              } else {
+                const ReductionWorkItemGroup& reduction_item =
+                    reduction_items[current_workitem_group->reduction_id];
+                const int32_t stride =
+                    reduction_item.q_token_id_num * reduction_item.q_head_num;
+                buffer_manager.update(reduction_item.scratch_offset,
+                                      reduction_item.split_num, head_dim,
+                                      stride, sizeof(float));
+                volatile bool* split_flag_buffer =
+                    buffer_manager.get_reduce_flag_buffer() + curr_spilt_id;
+                float* split_output_buffer =
+                    buffer_manager.get_reduce_output_buffer() +
+                    curr_spilt_id * stride * head_dim;
+                float* split_max_buffer =
+                    buffer_manager.get_reduce_max_buffer() +
+                    curr_spilt_id * stride;
+                float* split_sum_buffer =
+                    buffer_manager.get_reduce_sum_buffer() +
+                    curr_spilt_id * stride;
+
+                partial_output(partial_q_buffer, max_buffer, sum_buffer,
+                               q_head_tile_size, split_output_buffer,
+                               split_max_buffer, split_sum_buffer,
+                               split_flag_buffer);
               }
             }
           }
         } else {
           task_idx -= workitem_groups_counter_num;
-          const int32_t kv_head_idx = task_idx / reduction_item_num;
-          const int32_t item_offset = task_idx % reduction_item_num;
           ReductionWorkItemGroup* const curr_workitem_groups =
-              reduction_items + item_offset;
+              reduction_items + task_idx;
           const int32_t curr_output_token_idx =
               curr_workitem_groups->q_token_id_start;
           const int32_t curr_output_token_num =
               curr_workitem_groups->q_token_id_num;
-          const int32_t curr_split_id = curr_workitem_groups->split_start_id;
+          const int32_t curr_split_id = 0;
           const int32_t curr_split_num = curr_workitem_groups->split_num;
           const int32_t current_group_idx = curr_workitem_groups->req_id;
-          const bool curr_use_gqa =
-              use_gqa_fast_path || (supports_gqa && curr_output_token_num == 1);
-          if (!use_gqa_fast_path && curr_use_gqa &&
-              kv_head_idx % q_heads_per_kv != 0) {
-            continue;
-          }
-          const int32_t curr_q_heads_per_kv = curr_use_gqa ? q_heads_per_kv : 1;
+          const int32_t curr_q_heads_per_kv = curr_workitem_groups->q_head_num;
           const int32_t curr_output_head_num =
               curr_output_token_num * curr_q_heads_per_kv;
 
           const int32_t q_start = input->query_start_loc[current_group_idx];
           const int32_t q_token_start_idx = q_start + curr_output_token_idx;
-          const int32_t q_head_start_idx =
-              use_gqa_fast_path ? (kv_head_idx * q_heads_per_kv) : kv_head_idx;
+          const int32_t q_head_start_idx = curr_workitem_groups->q_head_start;
           size_t output_buffer_offset =
               q_token_start_idx * q_head_num * head_dim +
               q_head_start_idx * head_dim;
 
-          const int32_t stride =
-              curr_q_heads_per_kv * split_kv_q_token_num_threshold;
-          buffer_manager.update(kv_head_idx, total_reduction_split_num,
-                                head_dim, stride, sizeof(float));
+          const int32_t stride = curr_output_token_num * curr_q_heads_per_kv;
+          buffer_manager.update(curr_workitem_groups->scratch_offset,
+                                curr_split_num, head_dim, stride,
+                                sizeof(float));
           volatile bool* split_flag_buffer =
               buffer_manager.get_reduce_flag_buffer() + curr_split_id;
           float* split_output_buffer =
@@ -2035,11 +2177,10 @@ class AttentionMainLoop {
 #ifdef DEFINE_FAST_EXP
     DEFINE_FAST_EXP
 #endif
-    // restrict curr_head_num <= 16 in the scheduler
     // elems in split_max_buffer, split_sum_buffer are not cache alignment, use
     // local buffers to reduce false-sharing
-    alignas(64) float local_max[16];
-    alignas(64) float local_sum[16];
+    alignas(64) float local_max[max_q_head_num_per_iter];
+    alignas(64) float local_sum[max_q_head_num_per_iter];
 
     float* __restrict__ curr_split_output_buffer = split_output_buffer;
     float* __restrict__ curr_split_max_buffer = split_max_buffer;
@@ -2095,10 +2236,8 @@ class AttentionMainLoop {
           curr_split_output_buffer_iter += head_dim;
         }
       } else {
-        vec_op::FP32Vec16 final_max(split_max_buffer);
-        final_max.save(local_max);
-        vec_op::FP32Vec16 final_sum(split_sum_buffer);
-        final_sum.save(local_sum);
+        std::copy_n(split_max_buffer, curr_head_num, local_max);
+        std::copy_n(split_sum_buffer, curr_head_num, local_sum);
       }
 
       curr_split_output_buffer += head_num_per_split * head_dim;

@@ -82,6 +82,111 @@ def test_mixed_head_counts_in_one_group_are_rejected():
         _build([MODEL_WIDE_NUM_HEADS, 64])
 
 
+@pytest.mark.parametrize(
+    "query_lens,is_prefilling,expected",
+    [
+        ([4, 17, 0, 1], [False, True, False, False], [True, False, False, True]),
+        ([5, 1], [False, True], [False, False]),
+    ],
+)
+def test_cpu_decode_mask_uses_request_state_and_verification_limit(
+    query_lens, is_prefilling, expected
+):
+    """Short prefill rows and padding must not become grouped decode work."""
+    builder = SimpleNamespace(
+        vllm_config=SimpleNamespace(
+            uniform_decode_query_len=4,
+            speculative_config=None,
+        )
+    )
+    common = SimpleNamespace(
+        query_start_loc=torch.tensor([0] + query_lens, dtype=torch.int32).cumsum(0),
+        is_prefilling=torch.tensor(is_prefilling),
+    )
+
+    actual = CPUAttentionMetadataBuilder._build_decode_mask(
+        builder, common, causal=True
+    )
+
+    assert actual.tolist() == expected
+
+
+def test_cpu_decode_mask_keeps_medusa_layout_unchanged():
+    builder = SimpleNamespace(
+        vllm_config=SimpleNamespace(
+            uniform_decode_query_len=4,
+            speculative_config=SimpleNamespace(method="medusa"),
+        )
+    )
+    common = SimpleNamespace(
+        query_start_loc=torch.tensor([0, 4], dtype=torch.int32),
+        is_prefilling=torch.tensor([False]),
+    )
+
+    actual = CPUAttentionMetadataBuilder._build_decode_mask(
+        builder, common, causal=True
+    )
+
+    assert not actual.any()
+
+
+@pytest.mark.parametrize(
+    "causal,expected",
+    [
+        (torch.tensor([True, False]), [True, False]),
+        (False, [False, False]),
+    ],
+)
+def test_cpu_decode_mask_uses_request_causality(causal, expected):
+    builder = SimpleNamespace(
+        is_cross_attention=False,
+        vllm_config=SimpleNamespace(
+            uniform_decode_query_len=4,
+            speculative_config=None,
+        ),
+    )
+    common = SimpleNamespace(
+        query_start_loc=torch.tensor([0, 4, 8], dtype=torch.int32),
+        is_prefilling=torch.tensor([False, False]),
+    )
+
+    actual = CPUAttentionMetadataBuilder._build_decode_mask(
+        builder, common, causal=causal
+    )
+
+    assert actual.tolist() == expected
+
+
+@pytest.mark.parametrize(
+    "is_prefilling,is_cross_attention,causal",
+    [
+        (None, False, True),
+        (torch.tensor([False]), True, True),
+        (torch.tensor([False]), False, None),
+    ],
+)
+def test_cpu_decode_mask_fails_closed_without_request_state(
+    is_prefilling, is_cross_attention, causal
+):
+    builder = SimpleNamespace(
+        is_cross_attention=is_cross_attention,
+        vllm_config=SimpleNamespace(
+            uniform_decode_query_len=4,
+            speculative_config=None,
+        ),
+    )
+    common = SimpleNamespace(
+        query_start_loc=torch.tensor([0, 4], dtype=torch.int32),
+        is_prefilling=is_prefilling,
+    )
+
+    actual = CPUAttentionMetadataBuilder._build_decode_mask(
+        builder, common, causal=causal
+    )
+
+    assert not actual.any()
+
+
 def test_flash_attention_geometry_comes_from_the_group():
     """FA3 must use group geometry for layers without an ``impl`` wrapper."""
     layers = {f"layer_{i}": SimpleNamespace(num_heads=16) for i in range(2)}

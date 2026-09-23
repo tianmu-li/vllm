@@ -263,6 +263,10 @@ class CPUAttentionMetadataBuilder(AttentionMetadataBuilder[CPUAttentionMetadata]
             enable_kv_split=envs.VLLM_CPU_ATTN_SPLIT_KV,
             dynamic_causal=dynamic_casual,
             kv_cache_dtype=self.kv_cache_dtype,
+            decode_mask=self._build_decode_mask(
+                common_attn_metadata,
+                dynamic_casual if dynamic_casual is not None else causal,
+            ),
         )
 
         attn_metadata = CPUAttentionMetadata(
@@ -280,6 +284,39 @@ class CPUAttentionMetadataBuilder(AttentionMetadataBuilder[CPUAttentionMetadata]
         )
 
         return attn_metadata
+
+    def _build_decode_mask(
+        self,
+        common_attn_metadata: CommonAttentionMetadata,
+        causal: bool | torch.Tensor | None,
+    ) -> torch.Tensor:
+        query_lens = (
+            common_attn_metadata.query_start_loc[1:]
+            - common_attn_metadata.query_start_loc[:-1]
+        )
+        max_verification_len = self.vllm_config.uniform_decode_query_len
+        is_prefilling = common_attn_metadata.is_prefilling
+        speculative_config = self.vllm_config.speculative_config
+        is_medusa = (
+            speculative_config is not None and speculative_config.method == "medusa"
+        )
+        if (
+            is_prefilling is None
+            or causal is None
+            or getattr(self, "is_cross_attention", False)
+            or is_medusa
+            or max_verification_len is None
+        ):
+            return torch.zeros_like(query_lens, dtype=torch.bool)
+        request_causal = torch.as_tensor(causal, dtype=torch.bool, device="cpu")
+        if request_causal.ndim == 0:
+            request_causal = request_causal.expand_as(query_lens)
+        return (
+            request_causal
+            & (~is_prefilling)
+            & (query_lens > 0)
+            & (query_lens <= max_verification_len)
+        ).contiguous()
 
 
 class CPUAttentionBackendImpl(AttentionImpl):

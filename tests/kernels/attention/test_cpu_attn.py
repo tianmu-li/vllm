@@ -16,6 +16,7 @@ if not current_platform.is_cpu():
 
 from vllm._custom_ops import (
     cpu_attention_with_kv_cache,
+    cpu_attn_get_scheduler_diagnostics,
     cpu_attn_get_scheduler_metadata,
     cpu_attn_reshape_and_cache,
 )
@@ -42,6 +43,7 @@ SEQ_LENS = [  # (q_len, kv_len)
     [(2345, 2345), (5, 5), (3, 16), (134, 5131)],  # prefill batch
     [(992, 2456), (1, 1234), (98, 1145), (1, 4162), (2345, 2345)],  # mixed batch
 ]
+DECODE_MASK_SEQ_LENS = [[(2, 97), (4, 193), (8, 385), (17, 577)]]
 _FP8_ATOL = {"fp8_e4m3": 0.2, "fp8_e5m2": 0.3}
 _FP8_RTOL = 0.1
 ENCODER_SEQ_LENS = [
@@ -429,6 +431,9 @@ def varlen_with_paged_kv(
     v_scale: float = 1.0,
     dynamic_causal: list[bool] | None = None,
     s_aux_dtype: torch.dtype = torch.bfloat16,
+    decode_mask: list[bool] | None = None,
+    forced_q_head_group: int = 0,
+    forced_kv_split_count: int = 0,
 ) -> None:
     set_random_seed(0)
     num_seqs = len(seq_lens)
@@ -444,6 +449,9 @@ def varlen_with_paged_kv(
         torch.tensor(dynamic_causal, dtype=torch.bool)
         if dynamic_causal is not None
         else None
+    )
+    decode_mask_tensor = (
+        torch.tensor(decode_mask, dtype=torch.bool) if decode_mask is not None else None
     )
 
     # for n heads the set of slopes is the geometric sequence that starts
@@ -534,6 +542,9 @@ def varlen_with_paged_kv(
         enable_kv_split=False,
         dynamic_causal=dynamic_causal_tensor,
         kv_cache_dtype=kv_cache_dtype,
+        decode_mask=decode_mask_tensor,
+        forced_q_head_group=forced_q_head_group,
+        forced_kv_split_count=forced_kv_split_count,
     )
 
     out_without_split = torch.empty_like(query)
@@ -572,6 +583,9 @@ def varlen_with_paged_kv(
         enable_kv_split=True,
         dynamic_causal=dynamic_causal_tensor,
         kv_cache_dtype=kv_cache_dtype,
+        decode_mask=decode_mask_tensor,
+        forced_q_head_group=forced_q_head_group,
+        forced_kv_split_count=forced_kv_split_count,
     )
 
     out_with_split = torch.empty_like(query)
@@ -623,6 +637,9 @@ def varlen_with_paged_kv(
             enable_kv_split=True,
             dynamic_causal=dynamic_causal_tensor,
             kv_cache_dtype="auto",
+            decode_mask=decode_mask_tensor,
+            forced_q_head_group=forced_q_head_group,
+            forced_kv_split_count=forced_kv_split_count,
         )
         ref_output = torch.empty_like(query)
         cpu_attention_with_kv_cache(
@@ -1226,6 +1243,252 @@ def test_varlen_with_paged_kv_dynamic_causal(
         isa=isa,
         kv_cache_dtype=kv_cache_dtype,
         dynamic_causal=dynamic_causal,
+    )
+
+
+@pytest.mark.parametrize("kv_cache_dtype", ["auto", "fp8_e4m3"])
+@pytest.mark.parametrize("num_heads", [(9, 3), (8, 1)])
+@pytest.mark.parametrize("seq_lens", DECODE_MASK_SEQ_LENS)
+@pytest.mark.parametrize(
+    ("forced_q_head_group", "forced_kv_split_count"),
+    [(0, 0), (1, 1), (2, 1), (4, 2)],
+)
+def test_varlen_with_paged_kv_decode_mask_gqa(
+    kv_cache_dtype: str,
+    num_heads: tuple[int, int],
+    seq_lens: list[tuple[int, int]],
+    forced_q_head_group: int,
+    forced_kv_split_count: int,
+) -> None:
+    if forced_q_head_group > 0 and num_heads[0] // num_heads[1] % forced_q_head_group:
+        pytest.skip("forced group must divide the GQA ratio")
+    varlen_with_paged_kv(
+        seq_lens=seq_lens,
+        num_heads=num_heads,
+        head_size=96,
+        sliding_window=128,
+        dtype=torch.bfloat16,
+        block_size=96,
+        soft_cap=None,
+        num_blocks=NUM_BLOCKS[0],
+        use_alibi=False,
+        use_sink=False,
+        isa="vec",
+        kv_cache_dtype=kv_cache_dtype,
+        # The prefill request's one-token tail must remain outside GQA.
+        decode_mask=[True, True, True, False],
+        forced_q_head_group=forced_q_head_group,
+        forced_kv_split_count=forced_kv_split_count,
+    )
+
+
+@pytest.mark.parametrize(
+    ("forced_q_head_group", "forced_kv_split_count"),
+    [(1, 1), (2, 1), (4, 2), (8, 1)],
+)
+def test_varlen_with_paged_kv_forced_schedules(
+    forced_q_head_group: int,
+    forced_kv_split_count: int,
+) -> None:
+    varlen_with_paged_kv(
+        seq_lens=[(4, 193), (5, 257), (0, 128), (1, 129)],
+        num_heads=(8, 1),
+        head_size=96,
+        sliding_window=None,
+        dtype=torch.bfloat16,
+        block_size=32,
+        soft_cap=None,
+        num_blocks=NUM_BLOCKS[0],
+        use_alibi=False,
+        use_sink=False,
+        isa="vec",
+        kv_cache_dtype="auto",
+        decode_mask=[True, True, False, False],
+        forced_q_head_group=forced_q_head_group,
+        forced_kv_split_count=forced_kv_split_count,
+    )
+
+
+@pytest.mark.parametrize("num_heads", [(16, 1), (32, 8)])
+@pytest.mark.parametrize(
+    ("forced_q_head_group", "forced_kv_split_count"),
+    [(0, 0), (1, 1), (4, 1), (4, 2)],
+)
+@pytest.mark.skipif(not torch.cpu._is_amx_tile_supported(), reason="no AMX support.")
+def test_amx_spec_decode_schedules(
+    num_heads: tuple[int, int],
+    forced_q_head_group: int,
+    forced_kv_split_count: int,
+) -> None:
+    if forced_q_head_group > 0 and num_heads[0] // num_heads[1] % forced_q_head_group:
+        pytest.skip("forced group must divide the GQA ratio")
+    varlen_with_paged_kv(
+        seq_lens=[(4, 1024), (4, 1024)],
+        num_heads=num_heads,
+        head_size=128,
+        sliding_window=None,
+        dtype=torch.bfloat16,
+        block_size=32,
+        soft_cap=None,
+        num_blocks=NUM_BLOCKS[0],
+        use_alibi=False,
+        use_sink=False,
+        isa="amx",
+        kv_cache_dtype="auto",
+        decode_mask=[True, True],
+        forced_q_head_group=forced_q_head_group,
+        forced_kv_split_count=forced_kv_split_count,
+    )
+
+
+def _scheduler_metadata(**overrides) -> torch.Tensor:
+    kwargs = dict(
+        num_reqs=2,
+        num_heads=8,
+        num_kv_heads=1,
+        head_dim=128,
+        seq_lens=torch.tensor([8192, 8192], dtype=torch.int32),
+        dtype=torch.bfloat16,
+        query_start_loc=torch.tensor([0, 4, 5], dtype=torch.int32),
+        causal=True,
+        sliding_window_size=-1,
+        isa="amx",
+        enable_kv_split=False,
+        decode_mask=torch.tensor([True, False]),
+    )
+    kwargs.update(overrides)
+    return cpu_attn_get_scheduler_metadata(**kwargs)
+
+
+@pytest.mark.skipif(not torch.cpu._is_amx_tile_supported(), reason="no AMX support.")
+def test_scheduler_reports_semantic_request_eligibility() -> None:
+    diagnostics = cpu_attn_get_scheduler_diagnostics(_scheduler_metadata())
+    mha_diagnostics = cpu_attn_get_scheduler_diagnostics(
+        _scheduler_metadata(num_heads=1, num_kv_heads=1)
+    )
+
+    assert diagnostics["eligible_requests"] == 1
+    assert mha_diagnostics["eligible_requests"] == 1
+
+
+@pytest.mark.skipif(not torch.cpu._is_amx_tile_supported(), reason="no AMX support.")
+def test_forced_split_is_an_explicit_override() -> None:
+    forced = cpu_attn_get_scheduler_diagnostics(
+        _scheduler_metadata(forced_q_head_group=4, forced_kv_split_count=2)
+    )
+
+    assert forced["q_head_group"] == 4
+    assert forced["kv_split_count"] == 2
+
+
+@pytest.mark.parametrize(
+    "decode_mask",
+    [
+        torch.tensor([1, 0], dtype=torch.int32),
+        torch.tensor([[True, False]]),
+        torch.tensor([True]),
+        torch.tensor([True, False, True]),
+        torch.tensor([True, False, True, False])[::2],
+    ],
+)
+def test_scheduler_rejects_invalid_decode_masks(decode_mask: torch.Tensor) -> None:
+    with pytest.raises(RuntimeError, match="decode_mask"):
+        _scheduler_metadata(decode_mask=decode_mask)
+
+
+@pytest.mark.parametrize(
+    "overrides",
+    [
+        {"forced_q_head_group": -1},
+        {"forced_kv_split_count": -1},
+        {"forced_q_head_group": 3},
+        {"forced_q_head_group": 1, "forced_kv_split_count": 2},
+        {"decode_mask": torch.tensor([False, False]), "forced_q_head_group": 2},
+        {
+            "seq_lens": torch.tensor([64, 64], dtype=torch.int32),
+            "forced_q_head_group": 4,
+            "forced_kv_split_count": 2,
+        },
+    ],
+)
+def test_scheduler_rejects_invalid_forced_plans(overrides: dict) -> None:
+    with pytest.raises(RuntimeError):
+        _scheduler_metadata(**overrides)
+
+
+def test_fp8_sliding_window_falls_back_without_error() -> None:
+    metadata = cpu_attn_get_scheduler_metadata(
+        num_reqs=1,
+        num_heads=8,
+        num_kv_heads=1,
+        dtype=torch.bfloat16,
+        head_dim=128,
+        seq_lens=torch.tensor([193], dtype=torch.int32),
+        query_start_loc=torch.tensor([0, 4], dtype=torch.int32),
+        causal=True,
+        sliding_window_size=64,
+        isa="amx",
+        enable_kv_split=True,
+        kv_cache_dtype="fp8_e4m3",
+        decode_mask=torch.tensor([True]),
+    )
+    diagnostics = cpu_attn_get_scheduler_diagnostics(metadata)
+
+    assert diagnostics["eligible_requests"] == 1
+    assert diagnostics["q_head_group"] > 0
+    assert diagnostics["kv_split_count"] > 0
+
+
+@pytest.mark.parametrize(
+    "num_heads",
+    [(16, 4), (16, 1), (32, 8)],
+    ids=["gqa4", "gqa16", "gqa4_wide"],
+)
+@pytest.mark.parametrize(
+    "seq_lens",
+    [[(1, 193), (1, 257)], [(1, 193), (4, 257)]],
+    ids=["single_token", "mixed"],
+)
+@pytest.mark.skipif(not torch.cpu._is_amx_tile_supported(), reason="no AMX support.")
+def test_amx_head_dim_256_auto_correctness(
+    num_heads: tuple[int, int],
+    seq_lens: list[tuple[int, int]],
+) -> None:
+    varlen_with_paged_kv(
+        seq_lens=seq_lens,
+        num_heads=num_heads,
+        head_size=256,
+        sliding_window=None,
+        dtype=torch.bfloat16,
+        block_size=32,
+        soft_cap=None,
+        num_blocks=NUM_BLOCKS[0],
+        use_alibi=False,
+        use_sink=False,
+        isa="amx",
+        kv_cache_dtype="auto",
+        decode_mask=[True, True],
+    )
+
+
+@pytest.mark.skipif(not torch.cpu._is_amx_tile_supported(), reason="no AMX support.")
+def test_amx_spec_decode_group_32_with_sinks() -> None:
+    varlen_with_paged_kv(
+        seq_lens=[(2, 193), (3, 257)],
+        num_heads=(32, 1),
+        head_size=128,
+        sliding_window=None,
+        dtype=torch.bfloat16,
+        block_size=32,
+        soft_cap=None,
+        num_blocks=NUM_BLOCKS[0],
+        use_alibi=True,
+        use_sink=True,
+        isa="amx",
+        kv_cache_dtype="auto",
+        decode_mask=[True, True],
+        forced_q_head_group=32,
+        forced_kv_split_count=1,
     )
 
 
