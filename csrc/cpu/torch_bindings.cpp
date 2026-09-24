@@ -300,15 +300,13 @@ torch::Tensor get_scheduler_metadata(
     const int64_t num_req, const int64_t num_heads_q,
     const int64_t num_heads_kv, const int64_t head_dim,
     const torch::Tensor& seq_lens, at::ScalarType dtype,
-    const torch::Tensor& query_start_loc, const bool casual,
+    const torch::Tensor& query_start_loc, const bool causal,
     const int64_t window_size, const std::string& isa_hint,
     const bool enable_kv_split,
     const std::optional<torch::Tensor>& dynamic_causal,
     const std::string& kv_cache_dtype,
     const std::optional<torch::Tensor>& decode_mask,
     const int64_t forced_q_head_group, const int64_t forced_kv_split_count);
-torch::Tensor get_scheduler_diagnostics(
-    const torch::Tensor& scheduler_metadata);
 
 void cpu_attn_reshape_and_cache(const torch::Tensor& key,
                                 const torch::Tensor& value,
@@ -874,13 +872,11 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, ops) {
   ops.def(
       "get_scheduler_metadata(int num_req, int num_heads_q, int num_heads_kv, "
       "int head_dim, Tensor seq_lens, ScalarType dtype, Tensor "
-      "query_start_loc, bool casual, int window_size, str isa_hint, bool "
+      "query_start_loc, bool causal, int window_size, str isa_hint, bool "
       "enable_kv_split, Tensor? dynamic_causal, "
       "str kv_cache_dtype=\"auto\", Tensor? decode_mask=None, "
       "int forced_q_head_group=0, int forced_kv_split_count=0) -> Tensor",
       &get_scheduler_metadata);
-  ops.def("get_scheduler_diagnostics(Tensor scheduler_metadata) -> Tensor",
-          &get_scheduler_diagnostics);
   ops.def(
       "cpu_attn_reshape_and_cache(Tensor key, Tensor value, Tensor(a2!) "
       "key_cache, Tensor(a3!) value_cache, Tensor slot_mapping, str isa, "

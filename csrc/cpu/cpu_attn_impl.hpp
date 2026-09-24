@@ -64,24 +64,6 @@ struct AttentionWorkItemGroup {
         split_id(-1),
         local_split_id(0),
         _padding(0) {}
-
-  std::string to_string() const {
-    std::stringstream ss;
-    ss << '[' << "req_id: " << req_id << ",\n";
-    ss << "kv_head_idx: " << kv_head_idx << ",\n";
-    ss << "q_head_start: " << q_head_start << ",\n";
-    ss << "q_head_num: " << q_head_num << ",\n";
-    ss << "q_token_id_start: " << q_token_id_start << ",\n";
-    ss << "q_token_num: " << q_token_num << ",\n";
-    ss << "kv_split_pos_start: " << kv_split_pos_start << ",\n";
-    ss << "kv_split_pos_end: " << kv_split_pos_end << ",\n";
-    ss << "reduction_id: " << reduction_id << ",\n";
-    ss << "split_id: " << split_id << ",\n";
-    ss << "local_split_id: " << local_split_id << ",\n";
-    ss << ']';
-
-    return ss.str();
-  }
 };
 
 struct ReductionWorkItemGroup {
@@ -102,25 +84,24 @@ struct ReductionWorkItemGroup {
         q_token_id_num(q_token_id_num),
         split_num(0),
         scratch_offset(0) {}
-
-  std::string to_string() const {
-    std::stringstream ss;
-    ss << '[' << "req_id: " << req_id << ",\n";
-    ss << "q_head_start: " << q_head_start << ",\n";
-    ss << "q_head_num: " << q_head_num << ",\n";
-    ss << "q_token_id_start: " << q_token_id_start << ",\n";
-    ss << "q_token_id_num: " << q_token_id_num << ",\n";
-    ss << "split_num: " << split_num << ",\n";
-    ss << "scratch_offset: " << scratch_offset << ",\n";
-    ss << ']';
-
-    return ss.str();
-  }
 };
 
 struct AttentionMetadata {
+  static constexpr uint64_t kMagic = 0x4350554154544e31ULL;
+  static constexpr uint32_t kVersion = 1;
+
+  uint64_t magic;
+  uint32_t version;
+  uint32_t metadata_size;
+  uint64_t contract_fingerprint;
+  int32_t num_reqs;
+  int32_t num_tokens;
+  int32_t num_heads_q;
+  int32_t num_heads_kv;
+  int32_t head_dim;
+  int32_t dtype;
+  int32_t kv_cache_dtype;
   std::atomic_int64_t counter;
-  char _padding1[56];
   ISA isa;
   int32_t workitem_group_num;
   int32_t reduction_item_num;
@@ -130,14 +111,44 @@ struct AttentionMetadata {
   int64_t reduction_scratchpad_size;
   AttentionWorkItemGroup* workitem_groups_ptr;
   ReductionWorkItemGroup* reduction_items_ptr;
-  int32_t selected_q_head_group;
-  int32_t selected_kv_split_count;
-  int32_t eligible_request_num;
-  char _padding2[60];
+  char _padding[72];
+
+  static uint64_t make_contract_fingerprint(int32_t num_reqs,
+                                            int32_t num_tokens,
+                                            int32_t num_heads_q,
+                                            int32_t num_heads_kv,
+                                            int32_t head_dim, int32_t dtype,
+                                            int32_t kv_cache_dtype, ISA isa) {
+    uint64_t hash = 1469598103934665603ULL;
+    const int32_t values[] = {
+        num_reqs, num_tokens, num_heads_q,    num_heads_kv,
+        head_dim, dtype,      kv_cache_dtype, static_cast<int32_t>(isa)};
+    for (const int32_t value : values) {
+      hash ^= static_cast<uint32_t>(value);
+      hash *= 1099511628211ULL;
+    }
+    return hash;
+  }
 
   AttentionMetadata(ISA isa, int32_t workitem_group_num,
-                    int32_t reduction_item_num, int32_t reduction_split_num)
-      : counter(0),
+                    int32_t reduction_item_num, int32_t reduction_split_num,
+                    int32_t num_reqs, int32_t num_tokens, int32_t num_heads_q,
+                    int32_t num_heads_kv, int32_t head_dim, int32_t dtype,
+                    int32_t kv_cache_dtype)
+      : magic(kMagic),
+        version(kVersion),
+        metadata_size(sizeof(AttentionMetadata)),
+        contract_fingerprint(make_contract_fingerprint(
+            num_reqs, num_tokens, num_heads_q, num_heads_kv, head_dim, dtype,
+            kv_cache_dtype, isa)),
+        num_reqs(num_reqs),
+        num_tokens(num_tokens),
+        num_heads_q(num_heads_q),
+        num_heads_kv(num_heads_kv),
+        head_dim(head_dim),
+        dtype(dtype),
+        kv_cache_dtype(kv_cache_dtype),
+        counter(0),
         isa(isa),
         workitem_group_num(workitem_group_num),
         reduction_item_num(reduction_item_num),
@@ -151,9 +162,7 @@ struct AttentionMetadata {
             (ReductionWorkItemGroup*)((char*)this + sizeof(AttentionMetadata) +
                                       workitem_group_num *
                                           sizeof(AttentionWorkItemGroup))),
-        selected_q_head_group(1),
-        selected_kv_split_count(1),
-        eligible_request_num(0) {
+        _padding{} {
     TORCH_CHECK_LE(thread_num, 1024);
     static_assert(sizeof(AttentionMetadata) % 64 == 0);
     TORCH_CHECK(reinterpret_cast<size_t>(this) % 64 == 0);
@@ -162,56 +171,6 @@ struct AttentionMetadata {
   void reset_counter() { counter.store(0); }
 
   int64_t acquire_counter() { return counter++; }
-
-  void print() const {
-    std::stringstream ss;
-    ss << "ISA: ";
-    switch (isa) {
-      case ISA::AMX:
-        ss << "AMX, ";
-        break;
-      case ISA::AMX_FP8:
-        ss << "AMX_FP8, ";
-        break;
-      case ISA::VEC:
-        ss << "VEC, ";
-        break;
-      case ISA::VEC16:
-        ss << "VEC16, ";
-        break;
-      case ISA::NEON:
-        ss << "NEON, ";
-        break;
-      case ISA::VXE:
-        ss << "VXE, ";
-        break;
-      case ISA::RVV:
-        ss << "RVV, ";
-        break;
-      case ISA::VSX:
-        ss << "VSX, ";
-        break;
-    }
-    ss << "workitem_group_num: " << workitem_group_num
-       << ", reduction_item_num: " << reduction_item_num
-       << ", reduction_split_num: " << reduction_split_num
-       << ", thread_num: " << thread_num
-       << ", attention_scratchpad_size_per_thread: "
-       << attention_scratchpad_size_per_thread
-       << ", reduction_scratchpad_size: " << reduction_scratchpad_size
-       << ", workitem groups:\n";
-    for (int32_t i = 0; i < workitem_group_num; ++i) {
-      ss << (workitem_groups_ptr + i)->to_string() << ",\n";
-    }
-
-    ss << "reduction items: \n";
-
-    for (int32_t i = 0; i < reduction_item_num; ++i) {
-      ss << (reduction_items_ptr + i)->to_string() << ",\n";
-    }
-
-    std::printf("%s", ss.str().c_str());
-  }
 };
 
 // Thread attention scratchpad contains:
@@ -408,14 +367,15 @@ class AttentionScheduler {
     bool* dynamic_causal;
     bool* decode_mask;
     bool fp8_kv_cache;
+    int32_t dtype;
+    int32_t kv_cache_dtype;
     int32_t forced_q_head_group;
     int32_t forced_kv_split_count;
   };
 
   static constexpr int32_t MaxQTileIterNum = 128;
 
-  AttentionScheduler()
-      : available_cache_size_(cpu_utils::get_available_l2_size()) {}
+  AttentionScheduler() = default;
 
   torch::Tensor schedule(const ScheduleInput& input) const {
     const bool causal = input.causal;
@@ -424,6 +384,13 @@ class AttentionScheduler {
     const int64_t cache_size = cpu_utils::get_available_l2_size();
     const int32_t max_num_q_per_iter = input.max_num_q_per_iter;
     const int32_t kv_len_alignment = input.kv_block_alignment;
+    TORCH_CHECK(input.num_heads_q > 0, "num_heads_q must be positive");
+    TORCH_CHECK(input.num_heads_kv > 0, "num_heads_kv must be positive");
+    TORCH_CHECK(input.num_heads_q % input.num_heads_kv == 0,
+                "num_heads_q must be divisible by num_heads_kv");
+    TORCH_CHECK(input.head_dim > 0, "head_dim must be positive");
+    TORCH_CHECK(max_num_q_per_iter > 0, "max_num_q_per_iter must be positive");
+    TORCH_CHECK(kv_len_alignment > 0, "kv_block_alignment must be positive");
     const auto request_q_token_num = [&](const int32_t req_id) {
       return input.query_start_loc[req_id + 1] - input.query_start_loc[req_id];
     };
@@ -434,6 +401,9 @@ class AttentionScheduler {
         input.num_heads_q / input.num_heads_kv;
     const bool supports_gqa = original_q_head_per_kv <= max_num_q_per_iter;
     const bool uses_amx = input.isa == ISA::AMX || input.isa == ISA::AMX_FP8;
+    const bool supported_amx_geometry =
+        uses_amx && input.head_dim > 0 &&
+        input.head_dim % (input.isa == ISA::AMX_FP8 ? 64 : 32) == 0;
     const int32_t min_split_kv_len =
         ((max_num_q_per_iter * 4 + kv_len_alignment - 1) / kv_len_alignment) *
         kv_len_alignment;
@@ -450,9 +420,6 @@ class AttentionScheduler {
       bool grouped;
     };
     struct ScheduleMetrics {
-      int64_t amx_tile_passes = 0;
-      int64_t useful_rows = 0;
-      int64_t allocated_rows = 0;
       int64_t aligned_kv_bytes = 0;
       int64_t fp8_conversion_bytes = 0;
       int64_t runnable_tasks = 0;
@@ -477,16 +444,16 @@ class AttentionScheduler {
     const auto request_adaptive_eligible = [&](const int32_t req_id) {
       return request_semantic_eligible(req_id) && supports_gqa &&
              original_q_head_per_kv > 1 && request_q_token_num(req_id) > 1 &&
-             uses_amx;
+             supported_amx_geometry && input.enable_kv_split;
     };
     struct RequestClassification {
-      int32_t eligible_request_num;
+      int32_t semantic_request_num;
       bool has_multi_token_request;
     };
     const auto classify_requests = [&]() {
       RequestClassification classification{0, false};
       for (int32_t req_id = 0; req_id < input.num_reqs; ++req_id) {
-        classification.eligible_request_num +=
+        classification.semantic_request_num +=
             request_semantic_eligible(req_id);
         classification.has_multi_token_request |=
             request_adaptive_eligible(req_id);
@@ -494,23 +461,27 @@ class AttentionScheduler {
       return classification;
     };
     const RequestClassification classification = classify_requests();
-    const int32_t eligible_request_num = classification.eligible_request_num;
+    const int32_t semantic_request_num = classification.semantic_request_num;
     const bool has_multi_token_request = classification.has_multi_token_request;
 
     TORCH_CHECK(input.forced_q_head_group >= 0,
                 "forced_q_head_group must be nonnegative");
     TORCH_CHECK(input.forced_kv_split_count >= 0,
                 "forced_kv_split_count must be nonnegative");
+    TORCH_CHECK(input.forced_kv_split_count <= thread_num,
+                "forced_kv_split_count exceeds thread capacity");
     if (input.forced_q_head_group > 0) {
-      TORCH_CHECK_LE(input.forced_q_head_group, max_num_q_per_iter);
-      TORCH_CHECK_EQ(original_q_head_per_kv % input.forced_q_head_group, 0);
+      TORCH_CHECK(input.forced_q_head_group <= max_num_q_per_iter,
+                  "forced_q_head_group exceeds the ISA limit");
+      TORCH_CHECK(original_q_head_per_kv % input.forced_q_head_group == 0,
+                  "forced_q_head_group must divide the GQA ratio");
       TORCH_CHECK(input.forced_q_head_group == 1 || supports_gqa,
                   "The forced Q-head group is unsupported by this ISA");
     }
     TORCH_CHECK(
         input.forced_q_head_group != 1 || input.forced_kv_split_count <= 1,
         "The MHA fallback does not support forced KV splitting");
-    TORCH_CHECK(!has_forced_plan || eligible_request_num > 0,
+    TORCH_CHECK(!has_forced_plan || semantic_request_num > 0,
                 "Forced CPU attention overrides require an eligible request");
 
     const auto for_each_query_tile =
@@ -614,10 +585,7 @@ class AttentionScheduler {
                       input.elem_size +
                   fp8_conversion_bytes / (instances * req_plan.kv_split_num) +
                   tile_operations * 64 / (instances * req_plan.kv_split_num);
-              metrics.amx_tile_passes += instances * row_tiles;
               metrics.amx_tile_operations += tile_operations;
-              metrics.useful_rows += instances * useful_rows;
-              metrics.allocated_rows += instances * row_tiles * 16;
               metrics.aligned_kv_bytes += kv_bytes;
               metrics.fp8_conversion_bytes += fp8_conversion_bytes;
               metrics.runnable_tasks += instances * req_plan.kv_split_num;
@@ -666,7 +634,7 @@ class AttentionScheduler {
           metrics.runnable_tasks + metrics.reduction_items + thread_num +
           (metrics.reduction_items > 0 ? thread_num : 0);
       if (!has_forced_plan && has_multi_token_request && plan.grouped &&
-          input.isa == ISA::AMX && metrics.runnable_tasks < thread_num) {
+          uses_amx && metrics.runnable_tasks < thread_num) {
         return metrics;
       }
       const double effective_bytes =
@@ -691,7 +659,7 @@ class AttentionScheduler {
     ScheduleMetrics batch_metrics =
         !has_forced_plan || input.forced_q_head_group == 1 ? mha_metrics
                                                            : ScheduleMetrics{};
-    if ((has_forced_plan && eligible_request_num > 0) ||
+    if ((has_forced_plan && semantic_request_num > 0) ||
         (!has_forced_plan && has_multi_token_request)) {
       double best_score = batch_metrics.score;
       for (int32_t group = 2; group <= original_q_head_per_kv; ++group) {
@@ -863,10 +831,10 @@ class AttentionScheduler {
         });
     AttentionMetadata* metadata_ptr = new (metadata_tensor.data_ptr())
         AttentionMetadata(input.isa, workitems.size(), reduce_workitems.size(),
-                          total_reduction_split_num);
-    metadata_ptr->selected_q_head_group = batch_plan.q_head_num;
-    metadata_ptr->selected_kv_split_count = batch_plan.kv_split_num;
-    metadata_ptr->eligible_request_num = eligible_request_num;
+                          total_reduction_split_num, input.num_reqs,
+                          input.query_start_loc[input.num_reqs],
+                          input.num_heads_q, input.num_heads_kv, input.head_dim,
+                          input.dtype, input.kv_cache_dtype);
     AttentionWorkItemGroup* workitem_groups_ptr =
         metadata_ptr->workitem_groups_ptr;
     ReductionWorkItemGroup* reduction_items_ptr =
@@ -942,15 +910,6 @@ class AttentionScheduler {
         metadata_ptr->reduction_scratchpad_size;
     cpu_utils::ScratchPadManager::get_scratchpad_manager()->realloc(
         scratchpad_size);
-
-    // test out of boundary access
-    // {
-    //     float* cache_ptr =
-    //     cpu_utils::ScratchPadManager::getl_scratchpad_manager()->get_data<float>();
-    //     for (int64_t i = 0; i < scratchpad_size / sizeof(float); ++i) {
-    //         cache_ptr[i] = std::numeric_limits<float>::quiet_NaN();
-    //     }
-    // }
 
     return metadata_tensor;
   }
@@ -1053,9 +1012,6 @@ class AttentionScheduler {
     int64_t rounded_tile_size = (tile_size / round_size) * round_size;
     return std::max(rounded_tile_size, round_size);
   }
-
- private:
-  int64_t available_cache_size_;
 };
 
 struct AttentionInput {
@@ -1109,7 +1065,7 @@ struct AttentionInput {
       const int32_t left_window_size, const int32_t right_window_size,      \
       float scale, const float softcap_scale,                               \
       const float *__restrict__ alibi_slopes, const bool is_first_iter,     \
-      const bool use_sink, const bool debug_info
+      const bool use_sink
 
 #define CPU_ATTENTION_PARAMS                                                  \
   q_heads_buffer, k_head_cache_ptr, v_head_cache_ptr, logits_buffer,          \
@@ -1117,7 +1073,7 @@ struct AttentionInput {
       kv_tile_start_pos, kv_tile_end_pos, kv_tile_token_num,                  \
       kv_cache_num_blocks_stride, q_head_num, q_token_num, q_tile_start_pos,  \
       q_heads_per_kv, block_size, left_window_size, right_window_size, scale, \
-      softcap_scale, alibi_slopes, is_first_iter, use_sink, debug_info
+      softcap_scale, alibi_slopes, is_first_iter, use_sink
 
 enum class AttentionGemmPhase { QK, PV };
 
@@ -1140,23 +1096,6 @@ template <>
 struct VecTypeTrait<c10::Half> {
   using vec_t = vec_op::FP16Vec16;
 };
-
-template <typename T>
-void print_logits(const char* name, T* ptr, int32_t row, int32_t col,
-                  int32_t stride) {
-  std::stringstream ss;
-  ss << std::fixed << std::setprecision(5) << name << ": [\n";
-  auto* curr_logits_buffer = ptr;
-  for (int32_t m = 0; m < row; ++m) {
-    for (int32_t n = 0; n < col; ++n) {
-      ss << curr_logits_buffer[n] << ", ";
-    }
-    ss << "\n";
-    curr_logits_buffer += stride;
-  }
-  ss << "]\n";
-  std::printf("%s", ss.str().c_str());
-}
 
 // This allows us to store probabilities in a packed format
 // for GEMM implementations that need packed A.
@@ -1239,7 +1178,6 @@ class AttentionMainLoop {
     //  - alibi_slopes
     //  - is_first_iter
     //  - use_sink
-    //  - debug_info
     void operator()(DEFINE_CPU_ATTENTION_PARAMS) {
       // k_cache_token_group_stride: stride of K cache when move to next
       // BlockSizeAlignment tokens in a block
@@ -1327,29 +1265,17 @@ class AttentionMainLoop {
         if (softcap_scale != 0.0f) {
           apply_softcap(logits_buffer, kv_tile_token_num, q_head_num,
                         kv_tile_token_num, softcap_scale);
-          // print_logits("softcap raw logits", logits_buffer, q_head_num,
-          // kv_tile_token_num, kv_tile_token_num);
         }
 
         if (alibi_slopes != nullptr) {
           apply_alibi_slopes(logits_buffer, alibi_slopes, kv_tile_token_num,
                              q_tile_start_pos, kv_tile_start_pos, q_token_num,
                              kv_tile_token_num, q_heads_per_kv);
-
-          // print_logits("alibi raw logits", logits_buffer, q_head_num,
-          // kv_tile_token_num, kv_tile_token_num);
         }
 
         apply_mask(logits_buffer, kv_tile_token_num, q_tile_start_pos,
                    kv_end_pos, kv_tile_start_pos, kv_tile_end_pos, q_token_num,
                    q_heads_per_kv, left_window_size, right_window_size);
-
-        // if (debug_info){
-        // print_logits("masked logits", logits_buffer, q_head_num,
-        // kv_tile_token_num, kv_tile_token_num);
-        // print_logits("old_max", max_buffer, 1, q_head_num, q_head_num);
-        // print_logits("old_sum", sum_buffer, 1, q_head_num, q_head_num);
-        // }
 
         apply_softmax(logits_buffer, partial_q_buffer, max_buffer, sum_buffer,
                       kv_tile_token_num, q_head_num, kv_tile_token_num,
@@ -1852,7 +1778,6 @@ class AttentionMainLoop {
           const int32_t q_start = input->query_start_loc[current_group_idx];
           const int32_t seq_len = input->seq_lens[current_group_idx];
           const int32_t q_start_pos = seq_len - (q_end - q_start);
-          const int32_t block_num = (seq_len + block_size - 1) / block_size;
           // Only apply sink for the first KV split
           bool use_sink =
               (s_aux != nullptr && current_workitem_group->local_split_id == 0);
@@ -1904,16 +1829,6 @@ class AttentionMainLoop {
             const auto [rounded_kv_tile_start_pos, rounded_kv_tile_end_pos] =
                 AttentionScheduler::align_kv_tile_pos(
                     kv_tile_start_pos, kv_tile_end_pos, blocksize_alignment);
-
-            // std::printf("thread_id: %d, req_id: %d, q_token_start: %d,
-            // q_token_end: %d, q_head_start: %d, q_head_end: %d, kv_head_idx:
-            // %d, kv_pos_start: %d, kv_pos_end: %d\n",
-            //                 thread_id, current_group_idx,
-            //                 q_token_start_idx, q_token_start_idx +
-            //                 actual_q_token_num, q_head_start_idx,
-            //                 q_head_start_idx + actual_q_heads_per_kv,
-            //                 curr_kv_head_idx, kv_tile_start_pos,
-            //                 kv_tile_end_pos);
 
             // move buffers
             kv_cache_t* curr_k_cache =
@@ -2031,18 +1946,6 @@ class AttentionMainLoop {
                     aligned_actual_kv_tile_pos_right -
                     aligned_actual_kv_tile_pos_left;
 
-                //   std::printf("\tq_iter_idx: %d, q_token_start: %d,
-                //   q_token_end: %d, q_token_num: %d, q_head_num: %d,
-                //   q_pos_start: %d, q_pos_end: %d, kv_pos_start: %d,
-                //   kv_pos_end: %d\n",
-                //             q_iter_idx, q_token_start_idx +
-                //             q_head_tile_token_offset,  q_token_start_idx +
-                //             q_head_tile_token_offset + q_tile_token_num,
-                //             q_tile_token_num, q_tile_head_num,
-                //             q_tile_pos_left, q_tile_pos_right,
-                //             aligned_actual_kv_tile_pos_left,
-                //             aligned_actual_kv_tile_pos_right);
-
                 // Move buffers
                 q_buffer_t* curr_q_heads_buffer =
                     q_buffer + q_tile_head_offset * head_dim;
@@ -2050,22 +1953,6 @@ class AttentionMainLoop {
                     partial_q_buffer + q_tile_head_offset * head_dim;
                 float* curr_max_buffer = max_buffer + q_tile_head_offset;
                 float* curr_sum_buffer = sum_buffer + q_tile_head_offset;
-
-                bool debug_info = false;
-                // if (debug_info) {
-                //   std::printf("\tq_iter_idx: %d, q_token_start: %d,"
-                //   "q_token_end: %d, q_token_num: %d, q_head_num: %d,"
-                //   "q_pos_start: %d, q_pos_end: %d, kv_pos_start: %d,"
-                //   "kv_pos_end: %d\n",
-                //             q_iter_idx, q_token_start_idx +
-                //             q_head_tile_token_offset,  q_token_start_idx
-                //             + q_head_tile_token_offset +
-                //             q_tile_token_num, q_tile_token_num,
-                //             q_tile_head_num, q_tile_pos_left,
-                //             q_tile_pos_right,
-                //             aligned_actual_kv_tile_pos_left,
-                //             aligned_actual_kv_tile_pos_right);
-                // }
 
                 attn_impl.template execute_attention<Attention>(
                     curr_q_heads_buffer, curr_k_cache, curr_v_cache,
@@ -2077,7 +1964,7 @@ class AttentionMainLoop {
                     q_tile_token_num, q_tile_pos_left, curr_q_heads_per_kv,
                     block_size, sliding_window_left, sliding_window_right,
                     scale, softcap_scale, curr_alibi_slopes,
-                    first_iter_flag[q_iter_idx], use_sink, debug_info);
+                    first_iter_flag[q_iter_idx], use_sink);
                 first_iter_flag[q_iter_idx] = false;
               }
             }

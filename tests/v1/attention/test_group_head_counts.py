@@ -45,6 +45,8 @@ def _build(layer_num_heads: list[int]) -> CPUAttentionMetadataBuilder:
     vllm_config.model_config.dtype = torch.bfloat16
     vllm_config.model_config.get_num_attention_heads.return_value = MODEL_WIDE_NUM_HEADS
     vllm_config.cache_config.cache_dtype = "auto"
+    vllm_config.uniform_decode_query_len = 4
+    vllm_config.speculative_config = None
     kv_cache_spec = SimpleNamespace(
         num_kv_heads=NUM_KV_HEADS, head_size=64, block_size=16
     )
@@ -185,6 +187,35 @@ def test_cpu_decode_mask_fails_closed_without_request_state(
     )
 
     assert not actual.any()
+
+
+@requires_cpu
+def test_cpu_builder_forwards_decode_mask_to_scheduler():
+    builder = _build([8, 8])
+    common = SimpleNamespace(
+        num_reqs=2,
+        num_actual_tokens=5,
+        max_query_len=4,
+        max_seq_len=100,
+        query_start_loc=torch.tensor([0, 4, 5], dtype=torch.int32),
+        seq_lens=torch.tensor([100, 101], dtype=torch.int32),
+        block_table_tensor=torch.zeros((2, 4), dtype=torch.int32),
+        slot_mapping=torch.arange(5, dtype=torch.int64),
+        causal=True,
+        is_prefilling=torch.tensor([False, True]),
+    )
+
+    with patch(
+        "vllm.v1.attention.backends.cpu_attn.ops.cpu_attn_get_scheduler_metadata",
+        return_value=torch.zeros(1, dtype=torch.int8),
+    ) as scheduler:
+        builder.build(0, common)
+
+    decode_mask = scheduler.call_args.kwargs["decode_mask"]
+    assert decode_mask.dtype == torch.bool
+    assert decode_mask.device.type == "cpu"
+    assert decode_mask.is_contiguous()
+    assert decode_mask.tolist() == [True, False]
 
 
 def test_flash_attention_geometry_comes_from_the_group():
