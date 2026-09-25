@@ -488,7 +488,6 @@ void cpu_attention_with_kv_cache(
   TORCH_CHECK(block_table.size(1) > 0,
               "block_table must contain at least one block column");
   const auto* seq_values = seq_lens.data_ptr<int32_t>();
-  const auto* block_values = block_table.data_ptr<int32_t>();
   const int64_t block_size = key_cache.size(2);
   for (int64_t req_id = 0; req_id < num_reqs; ++req_id) {
     const int64_t required_blocks =
@@ -496,12 +495,6 @@ void cpu_attention_with_kv_cache(
         block_size;
     TORCH_CHECK(required_blocks <= block_table.size(1),
                 "block_table is too short for seq_lens");
-    for (int64_t block_idx = 0; block_idx < required_blocks; ++block_idx) {
-      const int64_t table_idx = req_id * block_table.size(1) + block_idx;
-      TORCH_CHECK(block_values[table_idx] >= 0 &&
-                      block_values[table_idx] < key_cache.size(0),
-                  "block_table contains an out-of-range block index");
-    }
   }
   if (alibi_slopes.has_value()) {
     check_contiguous_1d(*alibi_slopes, at::ScalarType::Float, query.size(1),
