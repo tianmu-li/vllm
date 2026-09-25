@@ -218,6 +218,7 @@ def test_cpu_builder_forwards_decode_mask_to_scheduler():
     assert decode_mask.device.type == "cpu"
     assert decode_mask.is_contiguous()
     assert decode_mask.tolist() == [True, False]
+    assert scheduler.call_args.kwargs["_scheduler_policy"] == "per-request"
     assert metadata.scheduler_metadata is not None
     assert metadata.scheduler_metadata.numel() > 0
 

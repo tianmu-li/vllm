@@ -160,7 +160,9 @@ def main(
         torch.ones(num_seqs, dtype=torch.bool) if all_requests_decode_mask else None
     )
 
-    def build_scheduler_metadata() -> torch.Tensor:
+    def build_scheduler_metadata(
+        policy: str = scheduler_policy,
+    ) -> torch.Tensor:
         return cpu_attn_get_scheduler_metadata(
             num_reqs=num_seqs,
             num_heads=num_query_heads,
@@ -177,7 +179,7 @@ def main(
             decode_mask=decode_mask,
             forced_q_head_group=forced_q_head_group,
             forced_kv_split_count=forced_kv_split_count,
-            _scheduler_policy=scheduler_policy,
+            _scheduler_policy=policy,
         )
 
     def run_scheduler_metadata_benchmark(
@@ -190,16 +192,6 @@ def main(
             end_time = time.perf_counter_ns()
             times.append((end_time - start_time) / 1e6)
         return metadata, times
-
-    run_scheduler_metadata_benchmark(5)
-    metadata, scheduler_metadata_times = run_scheduler_metadata_benchmark(iters)
-    scheduler_summary = cpu_attn_get_scheduler_summary(metadata)
-    print(f"scheduler policy: {scheduler_policy}")
-    print(
-        "request plan "
-        "(q_heads_per_kv, work_items, reduction_splits): "
-        f"{scheduler_summary.tolist()}"
-    )
 
     out_with_split = torch.empty_like(query)
 
@@ -228,21 +220,116 @@ def main(
             times.append((end_time - start_time) / 1e6)
         return times
 
-    # warmup
-    run_benchmark(5)
-    # benchmark
-    times = run_benchmark(iters)
+    if scheduler_policy != "both":
+        run_scheduler_metadata_benchmark(5)
+        metadata, scheduler_metadata_times = run_scheduler_metadata_benchmark(iters)
+        scheduler_summary = cpu_attn_get_scheduler_summary(metadata)
+        print(f"scheduler policy: {scheduler_policy}")
+        print(
+            "request plan "
+            "(q_heads_per_kv, work_items, reduction_splits): "
+            f"{scheduler_summary.tolist()}"
+        )
 
-    for name, timing_samples in (
-        ("scheduler metadata construction", scheduler_metadata_times),
-        ("attention kernel", times),
-    ):
-        print(f"{name}:")
-        print("\tmin (ms) = ", min(timing_samples))
-        print("\tmax (ms) = ", max(timing_samples))
-        print("\tmean (ms) = ", np.mean(timing_samples))
-        print("\tstd (ms) = ", np.std(timing_samples))
-        print("\tmedian (ms) = ", np.median(timing_samples))
+        # Warmup, then benchmark the attention kernel.
+        run_benchmark(5)
+        times = run_benchmark(iters)
+
+        for name, timing_samples in (
+            ("scheduler metadata construction", scheduler_metadata_times),
+            ("attention kernel", times),
+        ):
+            print(f"{name}:")
+            print("\tmin (ms) = ", min(timing_samples))
+            print("\tmax (ms) = ", max(timing_samples))
+            print("\tmean (ms) = ", np.mean(timing_samples))
+            print("\tstd (ms) = ", np.std(timing_samples))
+            print("\tmedian (ms) = ", np.median(timing_samples))
+        return
+
+    policies = ("batch", "per-request")
+    metrics = ("combined", "scheduler", "kernel")
+    timing_samples = {policy: {metric: [] for metric in metrics} for policy in policies}
+    last_metadata: dict[str, torch.Tensor] = {}
+
+    def run_paired_iteration(pair_index: int, record: bool) -> None:
+        order = policies if pair_index % 2 == 0 else policies[::-1]
+        for policy in order:
+            combined_start = time.perf_counter_ns()
+            scheduler_start = time.perf_counter_ns()
+            metadata = build_scheduler_metadata(policy)
+            scheduler_end = time.perf_counter_ns()
+            kernel_start = time.perf_counter_ns()
+            cpu_attention_with_kv_cache(
+                query=query,
+                key_cache=packed_key_cache,
+                value_cache=packed_value_cache,
+                output=out_with_split,
+                query_start_loc=cu_query_lens,
+                seq_lens=kv_lens_tensor,
+                scale=scale,
+                causal=True,
+                alibi_slopes=None,
+                sliding_window=window_size,
+                block_table=block_tables,
+                softcap=0,
+                scheduler_metadata=metadata,
+                s_aux=s_aux,
+                kv_cache_dtype=kv_cache_dtype,
+            )
+            kernel_end = time.perf_counter_ns()
+            combined_end = time.perf_counter_ns()
+            last_metadata[policy] = metadata
+
+            if record:
+                timing_samples[policy]["combined"].append(
+                    (combined_end - combined_start) / 1e6
+                )
+                timing_samples[policy]["scheduler"].append(
+                    (scheduler_end - scheduler_start) / 1e6
+                )
+                timing_samples[policy]["kernel"].append(
+                    (kernel_end - kernel_start) / 1e6
+                )
+
+    for pair_index in range(5):
+        run_paired_iteration(pair_index, record=False)
+    for pair_index in range(iters):
+        run_paired_iteration(pair_index, record=True)
+
+    print("scheduler policy: both")
+    for policy in policies:
+        scheduler_summary = cpu_attn_get_scheduler_summary(last_metadata[policy])
+        print(
+            f"{policy} request plan "
+            "(q_heads_per_kv, work_items, reduction_splits): "
+            f"{scheduler_summary.tolist()}"
+        )
+
+    print("paired benchmark medians:")
+    for metric in metrics:
+        batch_samples = np.asarray(timing_samples["batch"][metric])
+        per_request_samples = np.asarray(timing_samples["per-request"][metric])
+        paired_delta = per_request_samples - batch_samples
+        paired_percent = paired_delta / batch_samples * 100
+
+        metric_name = {
+            "combined": "combined wall time",
+            "scheduler": "scheduler-only time",
+            "kernel": "kernel-only time",
+        }[metric]
+        print(f"{metric_name}:")
+        for policy in policies:
+            median = np.median(timing_samples[policy][metric])
+            print(f"\t{policy} median (ms) = {median}")
+        print(
+            "\tpaired per-request - batch delta median (ms) = ",
+            np.median(paired_delta),
+        )
+        print(
+            "\tpaired per-request - batch percent median (% vs batch) = ",
+            np.median(paired_percent),
+        )
 
 
 def generate_seq_lens(
@@ -293,9 +380,12 @@ if __name__ == "__main__":
     parser.add_argument("--enable-kv-split", action="store_true")
     parser.add_argument(
         "--scheduler-policy",
-        choices=["batch", "per-request"],
+        choices=["batch", "per-request", "both"],
         default="batch",
-        help="Use the legacy batch-wide plan or choose plans per request.",
+        help=(
+            "Use the batch-wide plan, choose plans per request, or benchmark "
+            "both policies in alternating pairs."
+        ),
     )
     parser.add_argument("--block-size", type=int, choices=[32, 64, 128], default=128)
     parser.add_argument(

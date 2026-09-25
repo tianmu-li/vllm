@@ -1513,6 +1513,45 @@ def test_per_request_scheduler_is_invariant_to_request_order() -> None:
 
 
 @pytest.mark.skipif(not torch.cpu._is_amx_tile_supported(), reason="no AMX support.")
+def test_per_request_scheduler_parallel_loop_is_order_invariant() -> None:
+    num_reqs = max(32, torch.get_num_threads())
+    query_lens = torch.tensor(([2, 4, 8] * num_reqs)[:num_reqs], dtype=torch.int32)
+    seq_lens = torch.tensor(([128, 256, 512] * num_reqs)[:num_reqs], dtype=torch.int32)
+    decode_mask = torch.ones(num_reqs, dtype=torch.bool)
+
+    def build_summary(order: torch.Tensor) -> torch.Tensor:
+        ordered_query_lens = query_lens[order]
+        query_start_loc = torch.cat(
+            [
+                torch.zeros(1, dtype=torch.int32),
+                ordered_query_lens.cumsum(dim=0, dtype=torch.int32),
+            ]
+        )
+        metadata = cpu_attn_get_scheduler_metadata(
+            num_reqs=order.numel(),
+            num_heads=64,
+            num_kv_heads=2,
+            head_dim=128,
+            seq_lens=seq_lens[order],
+            dtype=torch.bfloat16,
+            query_start_loc=query_start_loc,
+            causal=True,
+            sliding_window_size=-1,
+            isa="amx",
+            enable_kv_split=True,
+            decode_mask=decode_mask[order],
+            _scheduler_policy="per-request",
+        )
+        return cpu_attn_get_scheduler_summary(metadata)
+
+    identity = torch.arange(num_reqs)
+    permutation = torch.arange(num_reqs - 1, -1, -1)
+    reference = build_summary(identity)
+
+    torch.testing.assert_close(build_summary(permutation), reference[permutation])
+
+
+@pytest.mark.skipif(not torch.cpu._is_amx_tile_supported(), reason="no AMX support.")
 def test_per_request_scheduler_matches_batch_for_identical_requests() -> None:
     def build_summary(policy: str) -> torch.Tensor:
         metadata = cpu_attn_get_scheduler_metadata(
@@ -1722,6 +1761,30 @@ def test_amx_spec_decode_per_request_mixed_groups_correctness() -> None:
         isa="amx",
         kv_cache_dtype="auto",
         decode_mask=[True, True],
+        scheduler_policy="per-request",
+    )
+
+
+@pytest.mark.skipif(not torch.cpu._is_amx_tile_supported(), reason="no AMX support.")
+@pytest.mark.parametrize(("query_len", "kv_len"), [(2, 128), (32, 256)])
+def test_amx_spec_decode_per_request_parallel_batch_correctness(
+    query_len: int, kv_len: int
+) -> None:
+    num_reqs = max(32, torch.get_num_threads())
+    varlen_with_paged_kv(
+        seq_lens=[(query_len, kv_len)] * num_reqs,
+        num_heads=(64, 2),
+        head_size=128,
+        sliding_window=None,
+        dtype=torch.bfloat16,
+        block_size=32,
+        soft_cap=None,
+        num_blocks=NUM_BLOCKS[0],
+        use_alibi=False,
+        use_sink=False,
+        isa="amx",
+        kv_cache_dtype="auto",
+        decode_mask=[True] * num_reqs,
         scheduler_policy="per-request",
     )
 

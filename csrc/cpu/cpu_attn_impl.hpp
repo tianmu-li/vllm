@@ -790,6 +790,7 @@ class AttentionScheduler {
           legacy_kv_len_per_thread(mha_plan, false, &selected_request_plans);
       const int64_t verification_kv_len_per_thread =
           legacy_kv_len_per_thread(mha_plan, true, &selected_request_plans);
+#pragma omp parallel for schedule(static, 1)
       for (int32_t req_id = 0; req_id < input.num_reqs; ++req_id) {
         if (!request_adaptive_eligible(req_id)) {
           continue;

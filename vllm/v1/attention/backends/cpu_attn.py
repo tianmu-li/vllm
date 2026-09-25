@@ -267,6 +267,7 @@ class CPUAttentionMetadataBuilder(AttentionMetadataBuilder[CPUAttentionMetadata]
                 common_attn_metadata,
                 dynamic_casual if dynamic_casual is not None else causal,
             ),
+            _scheduler_policy="per-request",
         )
 
         attn_metadata = CPUAttentionMetadata(
