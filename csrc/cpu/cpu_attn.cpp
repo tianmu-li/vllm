@@ -345,7 +345,7 @@ void cpu_attention_with_kv_cache(
   check_cpu_tensor(block_table, "block_table");
   check_cpu_tensor(scheduler_metadata, "scheduler_metadata");
   TORCH_CHECK(query.dim() == 3, "query must be rank 3");
-  TORCH_CHECK(query.is_contiguous(), "query must be contiguous");
+  TORCH_CHECK(query.stride(2) == 1, "query head dimension must be contiguous");
   TORCH_CHECK(query.scalar_type() == at::ScalarType::Float ||
                   query.scalar_type() == at::ScalarType::Half ||
                   query.scalar_type() == at::ScalarType::BFloat16,
