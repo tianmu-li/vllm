@@ -42,7 +42,7 @@ SEQ_LENS = [  # (q_len, kv_len)
     [(2345, 2345), (5, 5), (3, 16), (134, 5131)],  # prefill batch
     [(992, 2456), (1, 1234), (98, 1145), (1, 4162), (2345, 2345)],  # mixed batch
 ]
-DECODE_MASK_SEQ_LENS = [[(2, 97), (4, 193), (8, 385), (17, 577)]]
+DECODE_MASK_SEQ_LENS = [[(1, 65), (2, 97), (4, 193), (8, 385), (17, 577)]]
 _FP8_ATOL = {"fp8_e4m3": 0.2, "fp8_e5m2": 0.3}
 _FP8_RTOL = 0.1
 ENCODER_SEQ_LENS = [
@@ -1275,7 +1275,7 @@ def test_varlen_with_paged_kv_decode_mask_gqa(
         isa="vec",
         kv_cache_dtype=kv_cache_dtype,
         # The prefill request's one-token tail must remain outside GQA.
-        decode_mask=[True, True, True, False],
+        decode_mask=[True, True, True, True, False],
         forced_q_head_group=forced_q_head_group,
         forced_kv_split_count=forced_kv_split_count,
     )
