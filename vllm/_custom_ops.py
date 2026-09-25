@@ -3833,6 +3833,7 @@ def cpu_attn_get_scheduler_metadata(
     decode_mask: torch.Tensor | None = None,
     forced_q_head_group: int = 0,
     forced_kv_split_count: int = 0,
+    _scheduler_policy: str = "batch",
 ) -> torch.Tensor:
     scheduler_metadata = torch.ops._C.get_scheduler_metadata(
         num_reqs,
@@ -3851,8 +3852,14 @@ def cpu_attn_get_scheduler_metadata(
         decode_mask,
         forced_q_head_group,
         forced_kv_split_count,
+        _scheduler_policy,
     )
     return scheduler_metadata
+
+
+def cpu_attn_get_scheduler_summary(scheduler_metadata: torch.Tensor) -> torch.Tensor:
+    """Return per-request Q-head groups and scheduled work counts."""
+    return torch.ops._C.cpu_attn_get_scheduler_summary(scheduler_metadata)
 
 
 def cpu_attn_reshape_and_cache(

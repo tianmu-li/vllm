@@ -17,6 +17,7 @@ if not current_platform.is_cpu():
 from vllm._custom_ops import (
     cpu_attention_with_kv_cache,
     cpu_attn_get_scheduler_metadata,
+    cpu_attn_get_scheduler_summary,
     cpu_attn_reshape_and_cache,
 )
 
@@ -433,6 +434,7 @@ def varlen_with_paged_kv(
     decode_mask: list[bool] | None = None,
     forced_q_head_group: int = 0,
     forced_kv_split_count: int = 0,
+    scheduler_policy: str = "batch",
 ) -> None:
     set_random_seed(0)
     num_seqs = len(seq_lens)
@@ -544,6 +546,7 @@ def varlen_with_paged_kv(
         decode_mask=decode_mask_tensor,
         forced_q_head_group=forced_q_head_group,
         forced_kv_split_count=forced_kv_split_count,
+        _scheduler_policy=scheduler_policy,
     )
 
     out_without_split = torch.empty_like(query)
@@ -585,6 +588,7 @@ def varlen_with_paged_kv(
         decode_mask=decode_mask_tensor,
         forced_q_head_group=forced_q_head_group,
         forced_kv_split_count=forced_kv_split_count,
+        _scheduler_policy=scheduler_policy,
     )
 
     out_with_split = torch.empty_like(query)
@@ -639,6 +643,7 @@ def varlen_with_paged_kv(
             decode_mask=decode_mask_tensor,
             forced_q_head_group=forced_q_head_group,
             forced_kv_split_count=forced_kv_split_count,
+            _scheduler_policy=scheduler_policy,
         )
         ref_output = torch.empty_like(query)
         cpu_attention_with_kv_cache(
@@ -785,6 +790,18 @@ def test_varlen_encoder_attention_amx(
         dtype=dtype,
         block_size=block_size,
         isa=isa,
+    )
+
+
+def test_encoder_attention_ignores_padded_block_table_entries() -> None:
+    varlen_encoder_attention(
+        seq_lens=[256, 128],
+        num_heads=(8, 2),
+        head_size=128,
+        sliding_window=None,
+        dtype=torch.bfloat16,
+        block_size=128,
+        isa="vec",
     )
 
 
@@ -1393,6 +1410,7 @@ def test_scheduler_rejects_invalid_decode_masks(decode_mask: torch.Tensor) -> No
             {"num_heads": 10, "num_kv_heads": 3},
             "divisible",
         ),
+        ({"_scheduler_policy": "unknown"}, "scheduler_policy"),
     ],
 )
 def test_scheduler_rejects_invalid_tensor_contracts(
@@ -1427,6 +1445,121 @@ def test_scheduler_rejects_invalid_tensor_contracts(
 def test_scheduler_rejects_invalid_forced_plans(overrides: dict, message: str) -> None:
     with pytest.raises(RuntimeError, match=message):
         _scheduler_metadata(**overrides)
+
+
+@pytest.mark.skipif(not torch.cpu._is_amx_tile_supported(), reason="no AMX support.")
+def test_scheduler_summary_reports_mixed_decode_request_plans() -> None:
+    metadata = cpu_attn_get_scheduler_metadata(
+        num_reqs=3,
+        num_heads=16,
+        num_kv_heads=4,
+        head_dim=128,
+        seq_lens=torch.tensor([193, 257, 257], dtype=torch.int32),
+        dtype=torch.bfloat16,
+        query_start_loc=torch.tensor([0, 1, 5, 9], dtype=torch.int32),
+        causal=True,
+        sliding_window_size=-1,
+        isa="amx",
+        enable_kv_split=True,
+        decode_mask=torch.tensor([True, True, False]),
+        _scheduler_policy="per-request",
+    )
+
+    summary = cpu_attn_get_scheduler_summary(metadata)
+
+    assert summary.shape == (3, 3)
+    assert summary[0, 0].item() == 4
+    assert 1 <= summary[1, 0].item() <= 4
+    assert summary[2, 0].item() == 1
+    assert summary[:, 1].gt(0).all()
+
+
+@pytest.mark.skipif(not torch.cpu._is_amx_tile_supported(), reason="no AMX support.")
+def test_per_request_scheduler_is_invariant_to_request_order() -> None:
+    query_lens = torch.tensor([1, 4, 4], dtype=torch.int32)
+    seq_lens = torch.tensor([193, 257, 257], dtype=torch.int32)
+    decode_mask = torch.tensor([True, True, False])
+
+    def build_summary(order: torch.Tensor) -> torch.Tensor:
+        ordered_query_lens = query_lens[order]
+        query_start_loc = torch.cat(
+            [
+                torch.zeros(1, dtype=torch.int32),
+                ordered_query_lens.cumsum(dim=0, dtype=torch.int32),
+            ]
+        )
+        metadata = cpu_attn_get_scheduler_metadata(
+            num_reqs=order.numel(),
+            num_heads=16,
+            num_kv_heads=4,
+            head_dim=128,
+            seq_lens=seq_lens[order],
+            dtype=torch.bfloat16,
+            query_start_loc=query_start_loc,
+            causal=True,
+            sliding_window_size=-1,
+            isa="amx",
+            enable_kv_split=True,
+            decode_mask=decode_mask[order],
+            _scheduler_policy="per-request",
+        )
+        return cpu_attn_get_scheduler_summary(metadata)
+
+    identity = torch.arange(3)
+    permutation = torch.tensor([2, 0, 1])
+    reference = build_summary(identity)
+
+    torch.testing.assert_close(build_summary(permutation), reference[permutation])
+
+
+@pytest.mark.skipif(not torch.cpu._is_amx_tile_supported(), reason="no AMX support.")
+def test_per_request_scheduler_matches_batch_for_identical_requests() -> None:
+    def build_summary(policy: str) -> torch.Tensor:
+        metadata = cpu_attn_get_scheduler_metadata(
+            num_reqs=2,
+            num_heads=16,
+            num_kv_heads=4,
+            head_dim=128,
+            seq_lens=torch.tensor([257, 257], dtype=torch.int32),
+            dtype=torch.bfloat16,
+            query_start_loc=torch.tensor([0, 4, 8], dtype=torch.int32),
+            causal=True,
+            sliding_window_size=-1,
+            isa="amx",
+            enable_kv_split=True,
+            decode_mask=torch.tensor([True, True]),
+            _scheduler_policy=policy,
+        )
+        return cpu_attn_get_scheduler_summary(metadata)
+
+    torch.testing.assert_close(
+        build_summary("per-request"),
+        build_summary("batch"),
+    )
+
+
+@pytest.mark.skipif(not torch.cpu._is_amx_tile_supported(), reason="no AMX support.")
+def test_per_request_scheduler_keeps_distinct_winning_groups() -> None:
+    metadata = cpu_attn_get_scheduler_metadata(
+        num_reqs=2,
+        num_heads=64,
+        num_kv_heads=4,
+        head_dim=128,
+        seq_lens=torch.tensor([8192, 8192], dtype=torch.int32),
+        dtype=torch.bfloat16,
+        query_start_loc=torch.tensor([0, 4, 12], dtype=torch.int32),
+        causal=True,
+        sliding_window_size=-1,
+        isa="amx",
+        enable_kv_split=True,
+        decode_mask=torch.tensor([True, True]),
+        _scheduler_policy="per-request",
+    )
+
+    summary = cpu_attn_get_scheduler_summary(metadata)
+
+    assert summary[:, 0].tolist() == [8, 4]
+    assert summary[:, 1].gt(0).all()
 
 
 def test_fp8_sliding_window_falls_back_without_error() -> None:
@@ -1530,6 +1663,66 @@ def test_amx_head_dim_256_auto_correctness(
         isa="amx",
         kv_cache_dtype="auto",
         decode_mask=[True, True],
+    )
+
+
+@pytest.mark.skipif(not torch.cpu._is_amx_tile_supported(), reason="no AMX support.")
+def test_amx_head_dim_256_per_request_mixed_decode_correctness() -> None:
+    varlen_with_paged_kv(
+        seq_lens=[(1, 193), (4, 257)],
+        num_heads=(16, 4),
+        head_size=256,
+        sliding_window=None,
+        dtype=torch.bfloat16,
+        block_size=32,
+        soft_cap=None,
+        num_blocks=NUM_BLOCKS[0],
+        use_alibi=False,
+        use_sink=False,
+        isa="amx",
+        kv_cache_dtype="auto",
+        decode_mask=[True, True],
+        scheduler_policy="per-request",
+    )
+
+
+@pytest.mark.skipif(not torch.cpu._is_amx_tile_supported(), reason="no AMX support.")
+def test_amx_spec_decode_per_request_mixed_contexts() -> None:
+    varlen_with_paged_kv(
+        seq_lens=[(4, 1024), (4, 4096)],
+        num_heads=(32, 8),
+        head_size=128,
+        sliding_window=None,
+        dtype=torch.bfloat16,
+        block_size=32,
+        soft_cap=None,
+        num_blocks=NUM_BLOCKS[0],
+        use_alibi=False,
+        use_sink=False,
+        isa="amx",
+        kv_cache_dtype="auto",
+        decode_mask=[True, True],
+        scheduler_policy="per-request",
+    )
+
+
+@pytest.mark.skipif(not torch.cpu._is_amx_tile_supported(), reason="no AMX support.")
+def test_amx_spec_decode_per_request_mixed_groups_correctness() -> None:
+    varlen_with_paged_kv(
+        seq_lens=[(4, 8192), (8, 8192)],
+        num_heads=(64, 4),
+        head_size=128,
+        sliding_window=None,
+        dtype=torch.bfloat16,
+        block_size=32,
+        soft_cap=None,
+        num_blocks=NUM_BLOCKS[0],
+        use_alibi=False,
+        use_sink=False,
+        isa="amx",
+        kv_cache_dtype="auto",
+        decode_mask=[True, True],
+        scheduler_policy="per-request",
     )
 
 

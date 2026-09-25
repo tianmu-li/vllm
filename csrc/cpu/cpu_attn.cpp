@@ -96,7 +96,8 @@ torch::Tensor get_scheduler_metadata(
     const std::optional<torch::Tensor>& dynamic_causal,
     const std::string& kv_cache_dtype,
     const std::optional<torch::Tensor>& decode_mask,
-    const int64_t forced_q_head_group, const int64_t forced_kv_split_count) {
+    const int64_t forced_q_head_group, const int64_t forced_kv_split_count,
+    const std::string& scheduler_policy) {
   TORCH_CHECK(num_req >= 0, "num_req must be nonnegative");
   TORCH_CHECK(num_req <= std::numeric_limits<int32_t>::max(),
               "num_req is too large");
@@ -121,6 +122,8 @@ torch::Tensor get_scheduler_metadata(
   TORCH_CHECK(forced_kv_split_count >= 0 &&
                   forced_kv_split_count <= std::numeric_limits<int32_t>::max(),
               "forced_kv_split_count must be nonnegative and fit int32");
+  TORCH_CHECK(scheduler_policy == "batch" || scheduler_policy == "per-request",
+              "scheduler_policy must be 'batch' or 'per-request'");
   TORCH_CHECK(dtype == at::ScalarType::Float || dtype == at::ScalarType::Half ||
                   dtype == at::ScalarType::BFloat16,
               "Unsupported CPU attention dtype: ", dtype);
@@ -176,6 +179,10 @@ torch::Tensor get_scheduler_metadata(
   input.kv_cache_dtype = static_cast<int32_t>(kv_cache_idx);
   input.forced_q_head_group = forced_q_head_group;
   input.forced_kv_split_count = forced_kv_split_count;
+  input.scheduler_policy =
+      scheduler_policy == "per-request"
+          ? cpu_attention::AttentionScheduler::Policy::PerRequest
+          : cpu_attention::AttentionScheduler::Policy::Batch;
   VLLM_DISPATCH_FLOATING_TYPES(dtype, "get_scheduler_metadata", [&]() {
     CPU_ATTN_DISPATCH(head_dim, isa, kv_cache_idx, [&]() {
       input.elem_size = sizeof(attn_impl::kv_cache_t);
@@ -191,6 +198,80 @@ torch::Tensor get_scheduler_metadata(
   cpu_attention::AttentionScheduler scheduler;
   torch::Tensor metadata = scheduler.schedule(input);
   return metadata;
+}
+
+torch::Tensor cpu_attn_get_scheduler_summary(
+    const torch::Tensor& scheduler_metadata) {
+  check_cpu_tensor(scheduler_metadata, "scheduler_metadata");
+  TORCH_CHECK(scheduler_metadata.scalar_type() == at::ScalarType::Char,
+              "scheduler_metadata must be int8");
+  TORCH_CHECK(scheduler_metadata.dim() == 1,
+              "scheduler_metadata must be one-dimensional");
+  TORCH_CHECK(scheduler_metadata.is_contiguous(),
+              "scheduler_metadata must be contiguous");
+  TORCH_CHECK(
+      scheduler_metadata.numel() >=
+          static_cast<int64_t>(sizeof(cpu_attention::AttentionMetadata)),
+      "scheduler_metadata is truncated");
+  const auto* metadata =
+      reinterpret_cast<const cpu_attention::AttentionMetadata*>(
+          scheduler_metadata.data_ptr());
+  TORCH_CHECK(metadata->magic == cpu_attention::AttentionMetadata::kMagic,
+              "scheduler_metadata has an invalid magic");
+  TORCH_CHECK(metadata->version == cpu_attention::AttentionMetadata::kVersion,
+              "scheduler_metadata has an unsupported version");
+  TORCH_CHECK(
+      metadata->metadata_size == sizeof(cpu_attention::AttentionMetadata),
+      "scheduler_metadata has an incompatible layout");
+  TORCH_CHECK(metadata->num_reqs >= 0 && metadata->workitem_group_num >= 0 &&
+                  metadata->reduction_item_num >= 0,
+              "scheduler_metadata has invalid item counts");
+  const int64_t required_size =
+      sizeof(cpu_attention::AttentionMetadata) +
+      static_cast<int64_t>(metadata->workitem_group_num) *
+          sizeof(cpu_attention::AttentionWorkItemGroup) +
+      static_cast<int64_t>(metadata->reduction_item_num) *
+          sizeof(cpu_attention::ReductionWorkItemGroup);
+  TORCH_CHECK(required_size == scheduler_metadata.numel(),
+              "scheduler_metadata has an invalid size");
+
+  auto summary = torch::zeros(
+      {metadata->num_reqs, 3},
+      torch::TensorOptions().dtype(torch::kInt64).device(torch::kCPU));
+  auto* summary_values = summary.data_ptr<int64_t>();
+  const auto* metadata_bytes =
+      static_cast<const char*>(scheduler_metadata.data_ptr());
+  const auto* workitems =
+      reinterpret_cast<const cpu_attention::AttentionWorkItemGroup*>(
+          metadata_bytes + sizeof(*metadata));
+  const auto* reduction_items =
+      reinterpret_cast<const cpu_attention::ReductionWorkItemGroup*>(
+          workitems + metadata->workitem_group_num);
+  for (int32_t item_idx = 0; item_idx < metadata->workitem_group_num;
+       ++item_idx) {
+    const auto& item = workitems[item_idx];
+    TORCH_CHECK(item.req_id >= 0 && item.req_id < metadata->num_reqs,
+                "scheduler_metadata has an invalid work item request id");
+    TORCH_CHECK(item.q_head_num > 0,
+                "scheduler_metadata has an invalid Q-head group");
+    int64_t* request_summary =
+        summary_values + static_cast<int64_t>(item.req_id) * 3;
+    TORCH_CHECK(
+        request_summary[0] == 0 || request_summary[0] == item.q_head_num,
+        "scheduler_metadata has inconsistent Q-head groups");
+    request_summary[0] = item.q_head_num;
+    ++request_summary[1];
+  }
+  for (int32_t item_idx = 0; item_idx < metadata->reduction_item_num;
+       ++item_idx) {
+    const auto& item = reduction_items[item_idx];
+    TORCH_CHECK(item.req_id >= 0 && item.req_id < metadata->num_reqs,
+                "scheduler_metadata has an invalid reduction request id");
+    TORCH_CHECK(item.split_num > 1,
+                "scheduler_metadata has an invalid reduction split count");
+    summary_values[static_cast<int64_t>(item.req_id) * 3 + 2] += item.split_num;
+  }
+  return summary;
 }
 
 void cpu_attn_reshape_and_cache(
@@ -407,6 +488,7 @@ void cpu_attention_with_kv_cache(
   TORCH_CHECK(block_table.size(1) > 0,
               "block_table must contain at least one block column");
   const auto* seq_values = seq_lens.data_ptr<int32_t>();
+  const auto* block_values = block_table.data_ptr<int32_t>();
   const int64_t block_size = key_cache.size(2);
   for (int64_t req_id = 0; req_id < num_reqs; ++req_id) {
     const int64_t required_blocks =
@@ -414,11 +496,12 @@ void cpu_attention_with_kv_cache(
         block_size;
     TORCH_CHECK(required_blocks <= block_table.size(1),
                 "block_table is too short for seq_lens");
-  }
-  const auto* block_values = block_table.data_ptr<int32_t>();
-  for (int64_t i = 0; i < block_table.numel(); ++i) {
-    TORCH_CHECK(block_values[i] >= 0 && block_values[i] < key_cache.size(0),
-                "block_table contains an out-of-range block index");
+    for (int64_t block_idx = 0; block_idx < required_blocks; ++block_idx) {
+      const int64_t table_idx = req_id * block_table.size(1) + block_idx;
+      TORCH_CHECK(block_values[table_idx] >= 0 &&
+                      block_values[table_idx] < key_cache.size(0),
+                  "block_table contains an out-of-range block index");
+    }
   }
   if (alibi_slopes.has_value()) {
     check_contiguous_1d(*alibi_slopes, at::ScalarType::Float, query.size(1),

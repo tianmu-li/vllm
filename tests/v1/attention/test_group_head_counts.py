@@ -8,6 +8,7 @@ from unittest.mock import MagicMock, patch
 import pytest
 import torch
 
+from vllm import _custom_ops as ops
 from vllm.platforms import current_platform
 from vllm.v1.attention.backends.cpu_attn import (
     CPUAttentionBackendImpl,
@@ -190,6 +191,7 @@ def test_cpu_decode_mask_fails_closed_without_request_state(
 
 
 @requires_cpu
+@requires_cpu
 def test_cpu_builder_forwards_decode_mask_to_scheduler():
     builder = _build([8, 8])
     common = SimpleNamespace(
@@ -207,15 +209,17 @@ def test_cpu_builder_forwards_decode_mask_to_scheduler():
 
     with patch(
         "vllm.v1.attention.backends.cpu_attn.ops.cpu_attn_get_scheduler_metadata",
-        return_value=torch.zeros(1, dtype=torch.int8),
+        wraps=ops.cpu_attn_get_scheduler_metadata,
     ) as scheduler:
-        builder.build(0, common)
+        metadata = builder.build(0, common)
 
     decode_mask = scheduler.call_args.kwargs["decode_mask"]
     assert decode_mask.dtype == torch.bool
     assert decode_mask.device.type == "cpu"
     assert decode_mask.is_contiguous()
     assert decode_mask.tolist() == [True, False]
+    assert metadata.scheduler_metadata is not None
+    assert metadata.scheduler_metadata.numel() > 0
 
 
 def test_flash_attention_geometry_comes_from_the_group():

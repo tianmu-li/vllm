@@ -10,6 +10,7 @@ import torch
 from vllm._custom_ops import (
     cpu_attention_with_kv_cache,
     cpu_attn_get_scheduler_metadata,
+    cpu_attn_get_scheduler_summary,
     cpu_attn_reshape_and_cache,
 )
 from vllm.utils.argparse_utils import FlexibleArgumentParser
@@ -73,7 +74,8 @@ def main(
     kv_cache_dtype: str = "auto",
     seed: int = 0,
     iters: int = 20,
-    verification_only: bool = False,
+    all_requests_decode_mask: bool = False,
+    scheduler_policy: str = "batch",
 ) -> None:
     set_random_seed(seed)
     num_seqs = len(seq_lens)
@@ -154,24 +156,49 @@ def main(
         kv_cache_dtype=kv_cache_dtype,
     )
 
-    metadata = cpu_attn_get_scheduler_metadata(
-        num_reqs=num_seqs,
-        num_heads=num_query_heads,
-        num_kv_heads=num_kv_heads,
-        head_dim=head_size,
-        seq_lens=kv_lens_tensor,
-        dtype=dtype,
-        query_start_loc=cu_query_lens,
-        causal=True,
-        sliding_window_size=sliding_window if sliding_window is not None else -1,
-        isa=isa,
-        enable_kv_split=enable_kv_split,
-        kv_cache_dtype=kv_cache_dtype,
-        decode_mask=(
-            torch.ones(num_seqs, dtype=torch.bool) if verification_only else None
-        ),
-        forced_q_head_group=forced_q_head_group,
-        forced_kv_split_count=forced_kv_split_count,
+    decode_mask = (
+        torch.ones(num_seqs, dtype=torch.bool) if all_requests_decode_mask else None
+    )
+
+    def build_scheduler_metadata() -> torch.Tensor:
+        return cpu_attn_get_scheduler_metadata(
+            num_reqs=num_seqs,
+            num_heads=num_query_heads,
+            num_kv_heads=num_kv_heads,
+            head_dim=head_size,
+            seq_lens=kv_lens_tensor,
+            dtype=dtype,
+            query_start_loc=cu_query_lens,
+            causal=True,
+            sliding_window_size=sliding_window if sliding_window is not None else -1,
+            isa=isa,
+            enable_kv_split=enable_kv_split,
+            kv_cache_dtype=kv_cache_dtype,
+            decode_mask=decode_mask,
+            forced_q_head_group=forced_q_head_group,
+            forced_kv_split_count=forced_kv_split_count,
+            _scheduler_policy=scheduler_policy,
+        )
+
+    def run_scheduler_metadata_benchmark(
+        iters: int,
+    ) -> tuple[torch.Tensor, list[float]]:
+        times = []
+        for _ in range(iters):
+            start_time = time.perf_counter_ns()
+            metadata = build_scheduler_metadata()
+            end_time = time.perf_counter_ns()
+            times.append((end_time - start_time) / 1e6)
+        return metadata, times
+
+    run_scheduler_metadata_benchmark(5)
+    metadata, scheduler_metadata_times = run_scheduler_metadata_benchmark(iters)
+    scheduler_summary = cpu_attn_get_scheduler_summary(metadata)
+    print(f"scheduler policy: {scheduler_policy}")
+    print(
+        "request plan "
+        "(q_heads_per_kv, work_items, reduction_splits): "
+        f"{scheduler_summary.tolist()}"
     )
 
     out_with_split = torch.empty_like(query)
@@ -206,16 +233,16 @@ def main(
     # benchmark
     times = run_benchmark(iters)
 
-    time_min = min(times)
-    time_max = max(times)
-    time_mean = np.mean(times)
-    time_std = np.std(times)
-
-    print("\tmin (ms) = ", time_min)
-    print("\tmax (ms) = ", time_max)
-    print("\tmean (ms) = ", time_mean)
-    print("\tstd = ", time_std)
-    print("\tmedian (ms) = ", np.median(times))
+    for name, timing_samples in (
+        ("scheduler metadata construction", scheduler_metadata_times),
+        ("attention kernel", times),
+    ):
+        print(f"{name}:")
+        print("\tmin (ms) = ", min(timing_samples))
+        print("\tmax (ms) = ", max(timing_samples))
+        print("\tmean (ms) = ", np.mean(timing_samples))
+        print("\tstd (ms) = ", np.std(timing_samples))
+        print("\tmedian (ms) = ", np.median(timing_samples))
 
 
 def generate_seq_lens(
@@ -264,6 +291,12 @@ if __name__ == "__main__":
         default=128,
     )
     parser.add_argument("--enable-kv-split", action="store_true")
+    parser.add_argument(
+        "--scheduler-policy",
+        choices=["batch", "per-request"],
+        default="batch",
+        help="Use the legacy batch-wide plan or choose plans per request.",
+    )
     parser.add_argument("--block-size", type=int, choices=[32, 64, 128], default=128)
     parser.add_argument(
         "--dtype", type=str, choices=["half", "bfloat16", "float"], default="bfloat16"
@@ -299,10 +332,9 @@ if __name__ == "__main__":
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--iters", type=int, default=20)
     parser.add_argument(
-        "--verification-only",
+        "--all-requests-decode-mask",
         action="store_true",
-        help="Treat every synthetic request as verification work. "
-        "This is not serving-faithful evidence.",
+        help="Set the scheduler decode mask for every synthetic request.",
     )
 
     args = parser.parse_args()
@@ -342,5 +374,6 @@ if __name__ == "__main__":
         kv_cache_dtype=args.kv_cache_dtype,
         seed=args.seed,
         iters=args.iters,
-        verification_only=args.verification_only,
+        all_requests_decode_mask=args.all_requests_decode_mask,
+        scheduler_policy=args.scheduler_policy,
     )
