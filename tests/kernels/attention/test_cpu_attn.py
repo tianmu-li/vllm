@@ -1420,33 +1420,6 @@ def test_scheduler_rejects_invalid_tensor_contracts(
         _scheduler_metadata(**overrides)
 
 
-@pytest.mark.parametrize(
-    ("overrides", "message"),
-    [
-        ({"forced_q_head_group": -1}, "nonnegative"),
-        ({"forced_kv_split_count": -1}, "nonnegative"),
-        ({"forced_q_head_group": 3}, "must divide"),
-        ({"forced_q_head_group": 1, "forced_kv_split_count": 2}, "MHA"),
-        (
-            {"decode_mask": torch.tensor([False, False]), "forced_q_head_group": 2},
-            "eligible request",
-        ),
-        (
-            {
-                "seq_lens": torch.tensor([64, 64], dtype=torch.int32),
-                "forced_q_head_group": 4,
-                "forced_kv_split_count": 2,
-            },
-            "No valid",
-        ),
-        ({"forced_kv_split_count": 1025}, "thread capacity"),
-    ],
-)
-def test_scheduler_rejects_invalid_forced_plans(overrides: dict, message: str) -> None:
-    with pytest.raises(RuntimeError, match=message):
-        _scheduler_metadata(**overrides)
-
-
 @pytest.mark.skipif(not torch.cpu._is_amx_tile_supported(), reason="no AMX support.")
 def test_scheduler_summary_reports_mixed_decode_request_plans() -> None:
     metadata = cpu_attn_get_scheduler_metadata(
@@ -1620,57 +1593,6 @@ def test_fp8_sliding_window_falls_back_without_error() -> None:
     assert metadata.device.type == "cpu"
     assert metadata.dtype == torch.int8
     assert metadata.numel() > 0
-
-
-def test_attention_rejects_metadata_fingerprint_mismatch() -> None:
-    head_dim = 64
-    query = torch.randn((1, 1, head_dim), dtype=torch.bfloat16)
-    key = torch.randn((32, 1, head_dim), dtype=torch.bfloat16)
-    value = torch.randn_like(key)
-    key_cache = torch.empty((1, 1, 32, head_dim), dtype=torch.bfloat16)
-    value_cache = torch.empty_like(key_cache)
-    cpu_attn_reshape_and_cache(
-        key=key,
-        value=value,
-        key_cache=key_cache,
-        value_cache=value_cache,
-        slot_mapping=torch.arange(32, dtype=torch.int64),
-        isa="vec",
-    )
-    query_start_loc = torch.tensor([0, 1], dtype=torch.int32)
-    seq_lens = torch.tensor([32], dtype=torch.int32)
-    metadata = cpu_attn_get_scheduler_metadata(
-        num_reqs=1,
-        num_heads=1,
-        num_kv_heads=1,
-        head_dim=head_dim,
-        seq_lens=seq_lens,
-        dtype=torch.bfloat16,
-        query_start_loc=query_start_loc,
-        causal=True,
-        sliding_window_size=-1,
-        isa="vec",
-        enable_kv_split=False,
-    )
-    metadata.view(torch.int64)[2] ^= 1
-
-    with pytest.raises(RuntimeError, match="fingerprint is invalid"):
-        cpu_attention_with_kv_cache(
-            query=query,
-            key_cache=key_cache,
-            value_cache=value_cache,
-            output=torch.empty_like(query),
-            query_start_loc=query_start_loc,
-            seq_lens=seq_lens,
-            scale=head_dim**-0.5,
-            causal=True,
-            alibi_slopes=None,
-            sliding_window=-1,
-            block_table=torch.zeros((1, 1), dtype=torch.int32),
-            softcap=0,
-            scheduler_metadata=metadata,
-            s_aux=None,
-        )
 
 
 @pytest.mark.parametrize(

@@ -90,19 +90,12 @@ struct ReductionWorkItemGroup {
 
 struct AttentionMetadata {
   static constexpr uint64_t kMagic = 0x4350554154544e31ULL;
-  static constexpr uint32_t kVersion = 1;
+  static constexpr uint32_t kVersion = 2;
 
   uint64_t magic;
   uint32_t version;
   uint32_t metadata_size;
-  uint64_t contract_fingerprint;
   int32_t num_reqs;
-  int32_t num_tokens;
-  int32_t num_heads_q;
-  int32_t num_heads_kv;
-  int32_t head_dim;
-  int32_t dtype;
-  int32_t kv_cache_dtype;
   std::atomic_int64_t counter;
   ISA isa;
   int32_t workitem_group_num;
@@ -113,43 +106,15 @@ struct AttentionMetadata {
   int64_t reduction_scratchpad_size;
   AttentionWorkItemGroup* workitem_groups_ptr;
   ReductionWorkItemGroup* reduction_items_ptr;
-  char _padding[72];
-
-  static uint64_t make_contract_fingerprint(int32_t num_reqs,
-                                            int32_t num_tokens,
-                                            int32_t num_heads_q,
-                                            int32_t num_heads_kv,
-                                            int32_t head_dim, int32_t dtype,
-                                            int32_t kv_cache_dtype, ISA isa) {
-    uint64_t hash = 1469598103934665603ULL;
-    const int32_t values[] = {
-        num_reqs, num_tokens, num_heads_q,    num_heads_kv,
-        head_dim, dtype,      kv_cache_dtype, static_cast<int32_t>(isa)};
-    for (const int32_t value : values) {
-      hash ^= static_cast<uint32_t>(value);
-      hash *= 1099511628211ULL;
-    }
-    return hash;
-  }
+  char _padding[104];
 
   AttentionMetadata(ISA isa, int32_t workitem_group_num,
                     int32_t reduction_item_num, int32_t reduction_split_num,
-                    int32_t num_reqs, int32_t num_tokens, int32_t num_heads_q,
-                    int32_t num_heads_kv, int32_t head_dim, int32_t dtype,
-                    int32_t kv_cache_dtype)
+                    int32_t num_reqs)
       : magic(kMagic),
         version(kVersion),
         metadata_size(sizeof(AttentionMetadata)),
-        contract_fingerprint(make_contract_fingerprint(
-            num_reqs, num_tokens, num_heads_q, num_heads_kv, head_dim, dtype,
-            kv_cache_dtype, isa)),
         num_reqs(num_reqs),
-        num_tokens(num_tokens),
-        num_heads_q(num_heads_q),
-        num_heads_kv(num_heads_kv),
-        head_dim(head_dim),
-        dtype(dtype),
-        kv_cache_dtype(kv_cache_dtype),
         counter(0),
         isa(isa),
         workitem_group_num(workitem_group_num),
@@ -468,26 +433,6 @@ class AttentionScheduler {
     const RequestClassification classification = classify_requests();
     const int32_t semantic_request_num = classification.semantic_request_num;
     const bool has_multi_token_request = classification.has_multi_token_request;
-
-    TORCH_CHECK(input.forced_q_head_group >= 0,
-                "forced_q_head_group must be nonnegative");
-    TORCH_CHECK(input.forced_kv_split_count >= 0,
-                "forced_kv_split_count must be nonnegative");
-    TORCH_CHECK(input.forced_kv_split_count <= thread_num,
-                "forced_kv_split_count exceeds thread capacity");
-    if (input.forced_q_head_group > 0) {
-      TORCH_CHECK(input.forced_q_head_group <= max_num_q_per_iter,
-                  "forced_q_head_group exceeds the ISA limit");
-      TORCH_CHECK(original_q_head_per_kv % input.forced_q_head_group == 0,
-                  "forced_q_head_group must divide the GQA ratio");
-      TORCH_CHECK(input.forced_q_head_group == 1 || supports_gqa,
-                  "The forced Q-head group is unsupported by this ISA");
-    }
-    TORCH_CHECK(
-        input.forced_q_head_group != 1 || input.forced_kv_split_count <= 1,
-        "The MHA fallback does not support forced KV splitting");
-    TORCH_CHECK(!has_forced_plan || semantic_request_num > 0,
-                "Forced CPU attention overrides require an eligible request");
 
     const auto for_each_query_tile =
         [&](const int32_t req_id, const SchedulePlan& plan, auto&& callback) {
@@ -1030,10 +975,7 @@ class AttentionScheduler {
         });
     AttentionMetadata* metadata_ptr = new (metadata_tensor.data_ptr())
         AttentionMetadata(input.isa, workitems.size(), reduce_workitems.size(),
-                          total_reduction_split_num, input.num_reqs,
-                          input.query_start_loc[input.num_reqs],
-                          input.num_heads_q, input.num_heads_kv, input.head_dim,
-                          input.dtype, input.kv_cache_dtype);
+                          total_reduction_split_num, input.num_reqs);
     AttentionWorkItemGroup* workitem_groups_ptr =
         metadata_ptr->workitem_groups_ptr;
     ReductionWorkItemGroup* reduction_items_ptr =

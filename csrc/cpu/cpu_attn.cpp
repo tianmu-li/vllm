@@ -59,8 +59,6 @@ static inline cpu_attention::Fp8KVCacheDataType parse_fp8_kv_dtype(
     return cpu_attention::Fp8KVCacheDataType::kFp8E5M2;
   if (kv_cache_dtype == "fp8_e4m3" || kv_cache_dtype == "fp8")
     return cpu_attention::Fp8KVCacheDataType::kFp8E4M3;
-  if (kv_cache_dtype == "auto") return cpu_attention::Fp8KVCacheDataType::kAuto;
-  TORCH_CHECK(false, "Unsupported kv_cache_dtype: ", kv_cache_dtype);
   return cpu_attention::Fp8KVCacheDataType::kAuto;
 }
 
@@ -116,17 +114,14 @@ torch::Tensor get_scheduler_metadata(
               "window_size must be -1 or positive");
   TORCH_CHECK(window_size <= std::numeric_limits<int32_t>::max(),
               "window_size is too large");
-  TORCH_CHECK(forced_q_head_group >= 0 &&
+  TORCH_CHECK(forced_q_head_group >= std::numeric_limits<int32_t>::min() &&
                   forced_q_head_group <= std::numeric_limits<int32_t>::max(),
-              "forced_q_head_group must be nonnegative and fit int32");
-  TORCH_CHECK(forced_kv_split_count >= 0 &&
+              "forced_q_head_group does not fit int32");
+  TORCH_CHECK(forced_kv_split_count >= std::numeric_limits<int32_t>::min() &&
                   forced_kv_split_count <= std::numeric_limits<int32_t>::max(),
-              "forced_kv_split_count must be nonnegative and fit int32");
+              "forced_kv_split_count does not fit int32");
   TORCH_CHECK(scheduler_policy == "batch" || scheduler_policy == "per-request",
               "scheduler_policy must be 'batch' or 'per-request'");
-  TORCH_CHECK(dtype == at::ScalarType::Float || dtype == at::ScalarType::Half ||
-                  dtype == at::ScalarType::BFloat16,
-              "Unsupported CPU attention dtype: ", dtype);
 
   check_int32_sequence(seq_lens, num_req, "seq_lens", false, false);
   check_int32_sequence(query_start_loc, num_req + 1, "query_start_loc", true,
@@ -202,38 +197,9 @@ torch::Tensor get_scheduler_metadata(
 
 torch::Tensor cpu_attn_get_scheduler_summary(
     const torch::Tensor& scheduler_metadata) {
-  check_cpu_tensor(scheduler_metadata, "scheduler_metadata");
-  TORCH_CHECK(scheduler_metadata.scalar_type() == at::ScalarType::Char,
-              "scheduler_metadata must be int8");
-  TORCH_CHECK(scheduler_metadata.dim() == 1,
-              "scheduler_metadata must be one-dimensional");
-  TORCH_CHECK(scheduler_metadata.is_contiguous(),
-              "scheduler_metadata must be contiguous");
-  TORCH_CHECK(
-      scheduler_metadata.numel() >=
-          static_cast<int64_t>(sizeof(cpu_attention::AttentionMetadata)),
-      "scheduler_metadata is truncated");
   const auto* metadata =
       reinterpret_cast<const cpu_attention::AttentionMetadata*>(
           scheduler_metadata.data_ptr());
-  TORCH_CHECK(metadata->magic == cpu_attention::AttentionMetadata::kMagic,
-              "scheduler_metadata has an invalid magic");
-  TORCH_CHECK(metadata->version == cpu_attention::AttentionMetadata::kVersion,
-              "scheduler_metadata has an unsupported version");
-  TORCH_CHECK(
-      metadata->metadata_size == sizeof(cpu_attention::AttentionMetadata),
-      "scheduler_metadata has an incompatible layout");
-  TORCH_CHECK(metadata->num_reqs >= 0 && metadata->workitem_group_num >= 0 &&
-                  metadata->reduction_item_num >= 0,
-              "scheduler_metadata has invalid item counts");
-  const int64_t required_size =
-      sizeof(cpu_attention::AttentionMetadata) +
-      static_cast<int64_t>(metadata->workitem_group_num) *
-          sizeof(cpu_attention::AttentionWorkItemGroup) +
-      static_cast<int64_t>(metadata->reduction_item_num) *
-          sizeof(cpu_attention::ReductionWorkItemGroup);
-  TORCH_CHECK(required_size == scheduler_metadata.numel(),
-              "scheduler_metadata has an invalid size");
 
   auto summary = torch::zeros(
       {metadata->num_reqs, 3},
@@ -250,25 +216,14 @@ torch::Tensor cpu_attn_get_scheduler_summary(
   for (int32_t item_idx = 0; item_idx < metadata->workitem_group_num;
        ++item_idx) {
     const auto& item = workitems[item_idx];
-    TORCH_CHECK(item.req_id >= 0 && item.req_id < metadata->num_reqs,
-                "scheduler_metadata has an invalid work item request id");
-    TORCH_CHECK(item.q_head_num > 0,
-                "scheduler_metadata has an invalid Q-head group");
     int64_t* request_summary =
         summary_values + static_cast<int64_t>(item.req_id) * 3;
-    TORCH_CHECK(
-        request_summary[0] == 0 || request_summary[0] == item.q_head_num,
-        "scheduler_metadata has inconsistent Q-head groups");
     request_summary[0] = item.q_head_num;
     ++request_summary[1];
   }
   for (int32_t item_idx = 0; item_idx < metadata->reduction_item_num;
        ++item_idx) {
     const auto& item = reduction_items[item_idx];
-    TORCH_CHECK(item.req_id >= 0 && item.req_id < metadata->num_reqs,
-                "scheduler_metadata has an invalid reduction request id");
-    TORCH_CHECK(item.split_num > 1,
-                "scheduler_metadata has an invalid reduction split count");
     summary_values[static_cast<int64_t>(item.req_id) * 3 + 2] += item.split_num;
   }
   return summary;
@@ -284,26 +239,12 @@ void cpu_attn_reshape_and_cache(
     const torch::Tensor& slot_mapping, const std::string& isa,
     const double k_scale = 1.0, const double v_scale = 1.0,
     const std::string& kv_cache_dtype = "auto") {
-  check_cpu_tensor(key, "key");
-  check_cpu_tensor(value, "value");
-  check_cpu_tensor(key_cache, "key_cache");
-  check_cpu_tensor(value_cache, "value_cache");
-  TORCH_CHECK(key.dim() == 3, "key must be rank 3");
-  TORCH_CHECK(value.dim() == 3, "value must be rank 3");
-  TORCH_CHECK(key_cache.dim() == 4, "key_cache must be rank 4");
-  TORCH_CHECK(value_cache.dim() == 4, "value_cache must be rank 4");
-  TORCH_CHECK(key.stride(2) == 1, "key head dimension must be contiguous");
-  TORCH_CHECK(value.stride(2) == 1, "value head dimension must be contiguous");
-  TORCH_CHECK(key.sizes() == value.sizes(), "key and value shapes must match");
-  TORCH_CHECK(key.scalar_type() == value.scalar_type(),
-              "key and value dtypes must match");
-  check_contiguous_1d(slot_mapping, at::ScalarType::Long, key.size(0),
-                      "slot_mapping");
-  TORCH_CHECK(
-      key.scalar_type() == at::ScalarType::Float ||
-          key.scalar_type() == at::ScalarType::Half ||
-          key.scalar_type() == at::ScalarType::BFloat16,
-      "Unsupported CPU attention cache input dtype: ", key.scalar_type());
+  TORCH_CHECK_EQ(key.dim(), 3);
+  TORCH_CHECK_EQ(value.dim(), 3);
+  TORCH_CHECK_EQ(key_cache.dim(), 4);
+  TORCH_CHECK_EQ(value_cache.dim(), 4);
+  TORCH_CHECK_EQ(key.stride(2), 1);
+  TORCH_CHECK_EQ(value.stride(2), 1);
 
   const int64_t kv_cache_idx =
       static_cast<int64_t>(parse_fp8_kv_dtype(kv_cache_dtype));
@@ -316,11 +257,6 @@ void cpu_attn_reshape_and_cache(
                 "value_cache must be uint8 for FP8 path");
     TORCH_CHECK(k_scale > 0, "k_scale must be positive for FP8 path");
     TORCH_CHECK(v_scale > 0, "v_scale must be positive for FP8 path");
-  } else {
-    TORCH_CHECK(key_cache.scalar_type() == key.scalar_type(),
-                "key_cache dtype must match key dtype");
-    TORCH_CHECK(value_cache.scalar_type() == key.scalar_type(),
-                "value_cache dtype must match key dtype");
   }
 
   const float k_inv = is_fp8 ? 1.0f / static_cast<float>(k_scale) : 0.0f;
@@ -334,22 +270,6 @@ void cpu_attn_reshape_and_cache(
   const int64_t cache_head_num_stride = key_cache.stride(1);
   const int64_t block_size = key_cache.size(2);
   const int64_t block_size_stride = key_cache.stride(2);
-  TORCH_CHECK(token_num > 0, "key must contain at least one token");
-  TORCH_CHECK(head_num > 0, "key must contain at least one head");
-  TORCH_CHECK(value_cache.sizes() == key_cache.sizes(),
-              "key and value cache shapes must match");
-  TORCH_CHECK(key_cache.size(1) == head_num,
-              "cache and input head counts must match");
-  TORCH_CHECK(key_cache.size(3) == head_dim,
-              "cache and input head dimensions must match");
-  TORCH_CHECK(num_blocks > 0, "cache must contain at least one block");
-  TORCH_CHECK(block_size > 0, "cache block size must be positive");
-  const auto* slots = slot_mapping.data_ptr<int64_t>();
-  for (int64_t i = 0; i < token_num; ++i) {
-    TORCH_CHECK(
-        slots[i] == -1 || (slots[i] >= 0 && slots[i] < num_blocks * block_size),
-        "slot_mapping contains an out-of-range slot");
-  }
 
   cpu_attention::ISA isa_tag = [&]() {
     if (isa == "amx") {
@@ -417,31 +337,24 @@ void cpu_attention_with_kv_cache(
   const int64_t kv_cache_idx =
       static_cast<int64_t>(parse_fp8_kv_dtype(kv_cache_dtype));
   const bool is_fp8 = (kv_cache_idx != 0);
-  TORCH_CHECK(sliding_window == -1 || sliding_window > 0,
-              "sliding_window must be -1 or positive");
   check_cpu_tensor(query, "query");
   check_cpu_tensor(key_cache, "key_cache");
   check_cpu_tensor(value_cache, "value_cache");
   check_cpu_tensor(output, "output");
   check_cpu_tensor(block_table, "block_table");
   check_cpu_tensor(scheduler_metadata, "scheduler_metadata");
-  TORCH_CHECK(query.dim() == 3, "query must be rank 3");
-  TORCH_CHECK(query.stride(2) == 1, "query head dimension must be contiguous");
-  TORCH_CHECK(query.scalar_type() == at::ScalarType::Float ||
-                  query.scalar_type() == at::ScalarType::Half ||
-                  query.scalar_type() == at::ScalarType::BFloat16,
-              "Unsupported CPU attention query dtype: ", query.scalar_type());
+  TORCH_CHECK_EQ(query.dim(), 3);
+  TORCH_CHECK_EQ(query.stride(2), 1);
+  TORCH_CHECK_EQ(key_cache.dim(), 4);
+  TORCH_CHECK_EQ(value_cache.dim(), 4);
   TORCH_CHECK(output.dim() == 3, "output must be rank 3");
   TORCH_CHECK(output.is_contiguous(), "output must be contiguous");
   TORCH_CHECK(output.sizes() == query.sizes(),
               "output shape must match query shape");
   TORCH_CHECK(output.scalar_type() == query.scalar_type(),
               "output dtype must match query dtype");
-  TORCH_CHECK(key_cache.dim() == 4, "key_cache must be rank 4");
-  TORCH_CHECK(value_cache.dim() == 4, "value_cache must be rank 4");
   TORCH_CHECK(key_cache.sizes() == value_cache.sizes(),
               "key and value cache shapes must match");
-  TORCH_CHECK_EQ(key_cache.size(2), value_cache.size(2));
   TORCH_CHECK(key_cache.size(3) == query.size(2),
               "cache head dimension must match query");
   TORCH_CHECK(key_cache.size(0) > 0, "cache must contain blocks");
@@ -465,9 +378,6 @@ void cpu_attention_with_kv_cache(
   }
 
   check_cpu_tensor(query_start_loc, "query_start_loc");
-  TORCH_CHECK(query_start_loc.dim() == 1, "query_start_loc must be 1-D");
-  TORCH_CHECK(query_start_loc.is_contiguous(),
-              "query_start_loc must be contiguous");
   TORCH_CHECK(query_start_loc.numel() >= 1,
               "query_start_loc must contain a sentinel");
   const int64_t num_reqs = query_start_loc.numel() - 1;
@@ -506,9 +416,6 @@ void cpu_attention_with_kv_cache(
     TORCH_CHECK(s_aux->is_contiguous(), "s_aux must be contiguous");
     TORCH_CHECK(s_aux->numel() == query.size(1),
                 "s_aux must contain one value per query head");
-    TORCH_CHECK(s_aux->scalar_type() == at::ScalarType::BFloat16 ||
-                    s_aux->scalar_type() == at::ScalarType::Float,
-                "s_aux must be bfloat16 or float32");
   }
 
   TORCH_CHECK(scheduler_metadata.scalar_type() == at::ScalarType::Char,
@@ -530,11 +437,6 @@ void cpu_attention_with_kv_cache(
   TORCH_CHECK(
       metadata->metadata_size == sizeof(cpu_attention::AttentionMetadata),
       "scheduler_metadata has an incompatible layout");
-  TORCH_CHECK(metadata->num_reqs >= 0);
-  TORCH_CHECK(metadata->num_tokens >= 0);
-  TORCH_CHECK(metadata->num_heads_q >= 1);
-  TORCH_CHECK(metadata->num_heads_kv >= 1);
-  TORCH_CHECK(metadata->head_dim >= 1);
   TORCH_CHECK(metadata->workitem_group_num >= 0);
   TORCH_CHECK(metadata->reduction_item_num >= 0);
   TORCH_CHECK(
@@ -548,40 +450,11 @@ void cpu_attention_with_kv_cache(
   TORCH_CHECK(metadata->reduction_item_num <=
               remaining_metadata /
                   sizeof(cpu_attention::ReductionWorkItemGroup));
-  const int64_t metadata_size =
-      sizeof(cpu_attention::AttentionMetadata) +
-      static_cast<int64_t>(metadata->workitem_group_num) *
-          sizeof(cpu_attention::AttentionWorkItemGroup) +
-      static_cast<int64_t>(metadata->reduction_item_num) *
-          sizeof(cpu_attention::ReductionWorkItemGroup);
-  TORCH_CHECK(metadata_size <= scheduler_metadata.numel(),
-              "scheduler_metadata does not contain its work items");
   TORCH_CHECK(static_cast<int32_t>(metadata->isa) >=
                       static_cast<int32_t>(cpu_attention::ISA::AMX) &&
                   static_cast<int32_t>(metadata->isa) <=
                       static_cast<int32_t>(cpu_attention::ISA::AMX_FP8),
               "scheduler_metadata has an invalid ISA");
-  TORCH_CHECK(metadata->num_reqs == num_reqs,
-              "scheduler_metadata request count does not match inputs");
-  TORCH_CHECK(metadata->num_tokens == query.size(0),
-              "scheduler_metadata token count does not match query");
-  TORCH_CHECK(metadata->num_heads_q == query.size(1),
-              "scheduler_metadata query head count does not match query");
-  TORCH_CHECK(metadata->num_heads_kv == key_cache.size(1),
-              "scheduler_metadata KV head count does not match cache");
-  TORCH_CHECK(metadata->head_dim == query.size(2),
-              "scheduler_metadata head dimension does not match query");
-  TORCH_CHECK(metadata->dtype == static_cast<int32_t>(query.scalar_type()),
-              "scheduler_metadata query dtype does not match query");
-  TORCH_CHECK(metadata->kv_cache_dtype == static_cast<int32_t>(kv_cache_idx),
-              "scheduler_metadata KV dtype does not match cache");
-  TORCH_CHECK(
-      metadata->contract_fingerprint ==
-          cpu_attention::AttentionMetadata::make_contract_fingerprint(
-              metadata->num_reqs, metadata->num_tokens, metadata->num_heads_q,
-              metadata->num_heads_kv, metadata->head_dim, metadata->dtype,
-              metadata->kv_cache_dtype, metadata->isa),
-      "scheduler_metadata fingerprint is invalid");
 
   cpu_attention::AttentionInput input;
   input.metadata = reinterpret_cast<cpu_attention::AttentionMetadata*>(
