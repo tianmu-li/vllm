@@ -114,6 +114,22 @@ to 1.954×, but remained below 2×; split's aggregate paired speedup over static
 was 0.95465× [0.94901, 0.96118]. The original calibration table remains unchanged.
 This single-seed diagnostic passed correctness and did not qualify broad speedups.
 
+Two coordinator-placement diagnostics also failed to close the remaining gaps.
+The [CPU31 trial](../../../build-numa-broad/campaign_20261011_broad/shared_staged_ranges_admin31_seed0.json)
+used an extra physical core on node 0 while retaining all 96 expert workers on
+nodes 1,2,3. Static replay increased to 877.64 ms and passed only 3/28 small and
+16/24 large cells. This configuration used 97 physical cores in total; caller
+placement and calibration changed, so it does not isolate CPU sharing alone.
+The [CPU63 trial](../../../build-numa-broad/campaign_20261011_broad/shared_staged_ranges_controller63_seed0.json)
+kept the original 96-core budget and shared the last node-1 worker CPU instead
+of its first. Static replay measured 759.37 ms, with 23/28 small and 20/24 large
+cells passing. Its weakest small cell was M3 changing at 1.813×; M256/M512/M1024
+changing remained below 2×. Balanced and split replay measured 784.20/783.97 ms,
+with paired speedups over static of 0.96834× [0.96478, 0.97198] and
+0.96862× [0.96577, 0.97136]. Both trials passed synthetic correctness on the
+unchanged retained binary. These separate single-seed measurements do not
+establish a significant gain from CPU63. Caller CPU32 remains the configuration.
+
 The separate [counter run](../../../build-numa-broad/campaign_20261011_broad/shared_staged_ranges_counters_seed0.json)
 collected cycles, instructions, generic cache references and cache misses over
 CPUs 32–127, with 100% event running time. Its enabled windows exclude creation,
