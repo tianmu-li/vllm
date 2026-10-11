@@ -190,11 +190,51 @@ serving throughput. The current binary has no new primary timing qualification.
 
 ## Preserved rejected experiments
 
-Earlier artifacts and committed reports retain the detailed trial evidence.
-Follow-up active waits, expert-aligned gangs, padded input rows, a 16-worker
-sparse path and caller-last dispatch did not meet the broad target. Unrestricted
-weighted column scheduling regressed larger queues; expanding its down cache
-alone did not resolve that regression. The five-block bound retains larger
-rectangles. Delegated and combined wake protocols were also rejected; their
-cold-call and lifecycle evidence remains in the previous report revision and
-fresh campaign artifacts. No historical artifacts were overwritten.
+The following trials used the same 80-record full-sequence replay and
+10-round/10-repeat timing configuration, but were separate launches. Their
+source and extension identities are recorded in each linked result. The
+measurements are descriptive, not paired causal comparisons.
+
+| Trial | Static replay | M<8 passes | M>128 passes |
+| --- | ---: | ---: | ---: |
+| [Tree arrival barrier, seed 0](../../../build-numa-broad/campaign_20261011_broad/tree_arrival_barrier_full64_seed0.json) | 761.84 ms | 24/28 | 20/24 |
+| [Route-group views, seed 0](../../../build-numa-broad/campaign_20261011_broad/route_group_views_full64_seed0.json) | 758.87 ms | 23/28 | 20/24 |
+| [Route-group views, seed 1](../../../build-numa-broad/campaign_20261011_broad/route_group_views_full64_seed1.json) | 790.91 ms | 6/28 | 21/24 |
+| [Retained-binary control, seed 1](../../../build-numa-broad/campaign_20261011_broad/shared_staged_ranges_recheck_seed1.json) | 762.85 ms | 25/28 | 21/24 |
+| [Common-launch clock, seed 0](../../../build-numa-broad/campaign_20261011_broad/node_launch_completion_full64_seed0.json) | 760.60 ms | 23/28 | 21/24 |
+| [Tiny shared-input staging, seed 0](../../../build-numa-broad/campaign_20261011_broad/tiny_shared_stage_full64_seed0.json) | 764.97 ms | 24/28 | 21/24 |
+| [Hierarchical counter, seed 0](../../../build-numa-broad/campaign_20261011_broad/hierarchical_counter_full64_seed0.json) | 762.18 ms | 24/28 | 20/24 |
+| [Whole-expert columns through 32 row blocks, both projections, seed 0](../../../build-numa-broad/campaign_20261011_broad/shared_input_columns_bounded32_full64_seed0.json) | 768.50 ms | 26/28 | 21/24 |
+| [Whole-expert columns through 32 row blocks, gate/up only, seed 0](../../../build-numa-broad/campaign_20261011_broad/shared_input_columns_up_only_full64_seed0.json) | 765.75 ms | 24/28 | 21/24 |
+
+The seed-1 route-view result and same-seed retained control show why separate-run
+differences are not causal evidence: the static small-cell pass count was 6/28
+for route views and 25/28 for the control, while both had 21/24 large-cell
+passes. The bounded whole-expert column trial let balanced and split reach
+22/24 large cells, but only 20/28 small cells. Their replay means
+(786.59/787.19 ms) exceeded static. Tiny shared staging still measured
+M4-changing at 1.862×.
+The up-only run also missed its target: M512-changing was 1.86268× and
+M1024-changing was 1.80176×. Its 11 NUMA tests and 320 synthetic correctness
+checks passed. After rejecting the two column trials, source, test and binary
+were restored to the exact retained identities recorded in the
+[restoration record](../../../build-numa-broad/campaign_20261011_broad/shared_input_columns_trials_rejection_restored.json).
+
+Earlier rejected experiments remain in their original artifacts. Active waits,
+expert-aligned gangs, padded input rows, sparse-16 scheduling and caller-last
+dispatch did not meet the broad target. Unrestricted weighted columns regressed
+larger queues; expanding only the down cache did not resolve that regression.
+The five-block bound retains larger rectangles. Delegated and combined wake
+protocols were also rejected.
+
+No single policy passed every requested cell, so these trials do not establish
+broad 2× performance.
+
+The [GC-overlap diagnostic](../../../build-numa-broad/campaign_20261011_broad/route_group_views_gc_overlap_summary.json)
+found zero recorded GC overlap across its native call windows. A separate
+[rusage trace](../../../build-numa-broad/campaign_20261011_broad/route_group_views_rusage_trace_seed1.rusage_trace.json)
+did not reproduce the roughly 100 ms stalls; its 3.23 ms outlier coincided
+with involuntary context switches and zero page faults. The cause remains
+unresolved because thread-level trace access was unavailable. These diagnostic
+captures are not promotion timing, and no historical artifacts were
+overwritten.
