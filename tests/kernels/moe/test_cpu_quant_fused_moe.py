@@ -545,6 +545,18 @@ def test_cpu_numa_fp8_moe_runtime_replays_routes_and_recreates(
                 torch.arange(num_experts, dtype=torch.int32).repeat(513, 1),
                 torch.full((513, num_experts), 1 / num_experts),
             ),
+            # Equal nine-block groups exercise column ranges and partial tails.
+            (
+                hot_hidden[:257],
+                torch.arange(num_experts, dtype=torch.int32).repeat(257, 1),
+                torch.full((257, num_experts), 1 / num_experts),
+            ),
+            # A split tail can move combine ownership out of node order.
+            (
+                hot_hidden[:289],
+                torch.arange(num_experts, dtype=torch.int32).repeat(289, 1),
+                torch.full((289, num_experts), 1 / num_experts),
+            ),
         )
         references = []
         for hidden, ids, weights in cases:
@@ -593,7 +605,7 @@ def test_cpu_numa_fp8_moe_runtime_replays_routes_and_recreates(
                         input_rows * hidden_size * 2 + ids.numel() * 4
                     )
 
-            for index in (2, 3, 4, 5, 6, 1):
+            for index in (2, 3, 4, 5, 6, 8, 1):
                 hidden, ids, weights = cases[index]
                 aliased = hidden.clone()
                 runtime.cpu_numa_moe_execute(

@@ -316,6 +316,20 @@ struct Executor : CpuMoeExecutor {
       for (size_t group = 0; group + 1 < tiles->block_offsets.size(); ++group)
         short_groups &=
             tiles->block_offsets[group + 1] - tiles->block_offsets[group] <= 5;
+    if (grouped && tiles && !short_groups && tiles->work_prefix.size() > 1 &&
+        tiles->work_prefix.size() - 1 <= 8 &&
+        ((tiles->work_prefix.size() - 1) * n) % team.size() == 0) {
+      const int blocks = tiles->block_offsets[1];
+      const int64_t work = tiles->work_prefix[1];
+      bool equal_groups = blocks >= 6 && blocks <= 9;
+      for (size_t group = 0;
+           equal_groups && group + 1 < tiles->block_offsets.size(); ++group)
+        equal_groups =
+            tiles->block_offsets[group + 1] - tiles->block_offsets[group] ==
+                blocks &&
+            tiles->work_prefix[group + 1] - tiles->work_prefix[group] == work;
+      short_groups = equal_groups;
+    }
     if (tiles && n >= team.size() &&
         tiles->work_prefix.size() - 1 <= team.size() &&
         (m == static_cast<int>(tiles->work_prefix.size()) - 1 ||
@@ -478,6 +492,7 @@ struct Runtime {
   std::vector<int64_t> expert_order;
   std::vector<double> expert_estimates;
   std::vector<const BF16*> contribution_rows;
+  std::array<std::pair<int64_t, int64_t>, 3> combine_ranges{};
   std::atomic<int> completed_nodes{0};
   std::atomic<bool> combine_ready{false}, combine_failed{false};
   Clock::time_point combine_start;
@@ -857,12 +872,7 @@ struct Runtime {
           }
           if (combine_output) {
             int node = &local - replicas.data();
-            int64_t begin = hidden.size(0) <= 32
-                                ? (node == 0 ? 0 : hidden.size(0))
-                                : hidden.size(0) * node / 3;
-            int64_t end = hidden.size(0) <= 32
-                              ? hidden.size(0)
-                              : hidden.size(0) * (node + 1) / 3;
+            auto [begin, end] = combine_ranges[node];
             if (tid != 0 && begin + tid >= end) return;
             // Publish only after every node has finished reading its inputs.
             if (tid == 0 &&
@@ -1004,6 +1014,9 @@ struct Runtime {
         "Calibrate before dynamic scheduling");
     int64_t M = hidden.size(0), topk = ids.size(1), slots = M * topk;
     TORCH_CHECK(slots <= INT32_MAX, "Too many routed slots");
+    for (int node = 0; node < 3; ++node)
+      combine_ranges[node] = {M <= 32 ? (node == 0 ? 0 : M) : M * node / 3,
+                              M <= 32 ? M : M * (node + 1) / 3};
     auto& working = working_call_stats;
     for (int expert : active_experts) {
       logical[expert].clear();
@@ -1098,23 +1111,29 @@ struct Runtime {
         groups[chosen][expert] = tokens;
       }
     }
-    bool shared_split = false;
+    bool shared_schedule = false;
     if (policy == "split" && M > 128 && order.size() >= 2 &&
         order.size() <= 8) {
       const auto& first = logical[order[0]];
       bool shared = first.size() > 32;
+      for (size_t expert = 1; shared && expert < order.size(); ++expert)
+        shared = logical[order[expert]].size() == first.size();
+      int previous_base = -1;
       for (size_t row = 0; shared && row < first.size(); ++row) {
-        int token = first[row] / topk;
-        if (row && token <= first[row - 1] / topk) shared = false;
+        int base = (first[row] / topk) * topk;
+        if (base <= previous_base) shared = false;
+        previous_base = base;
         for (size_t expert = 1; shared && expert < order.size(); ++expert) {
-          const auto& slots = logical[order[expert]];
-          shared = slots.size() == first.size() && slots[row] / topk == token;
+          int slot = logical[order[expert]][row];
+          shared = slot >= base && slot < base + topk;
         }
       }
       if (shared) {
         std::array<double, 3> unsplit_load{};
         for (int n = 0; n < 3; ++n)
           unsplit_load[n] = shared_cost(n, group_counts[n], first.size());
+        shared_schedule = true;
+        load = unsplit_load;
         double best =
             *std::max_element(unsplit_load.begin(), unsplit_load.end());
         const double unsplit = best;
@@ -1165,6 +1184,14 @@ struct Runtime {
                            b_tail = best_rows[b] % 32;
                       return a_tail != b_tail ? a_tail < b_tail : a < b;
                     });
+          // Complete common routes can combine every contribution locally.
+          if (first.size() == M && order.size() == topk) {
+            int64_t begin = 0;
+            for (int node : placement_order) {
+              combine_ranges[node] = {begin, begin + best_rows[node]};
+              begin += best_rows[node];
+            }
+          }
           for (int expert : order) {
             const auto& tokens = logical[expert];
             size_t begin = 0;
@@ -1178,11 +1205,10 @@ struct Runtime {
           }
           load = best_load;
           splits = order.size();
-          shared_split = true;
         }
       }
     }
-    if (policy == "split" && !shared_split) {
+    if (policy == "split" && !shared_schedule) {
       for (int expert : order) {
         const auto& tokens = logical[expert];
         if (tokens.size() <= 32) continue;

@@ -836,3 +836,104 @@ candidate without a retest or captured-validation claim. The
 [restore journal](../../../build-numa-broad/campaign_20261011_broad/consumer_activation_rejected_restored.json)
 confirms committed source and retained extension identities. The broad target
 remains unmet.
+
+## Equal groups across row-block transitions
+
+Extend whole-group column scheduling to equal groups of six through nine
+32-row blocks when their column tasks divide evenly across the team.
+This retains full-width kernels while avoiding repeated weight unpacking at
+rectangle boundaries. Other queues retain their existing decomposition.
+Recognized common routes now retain the calibrated whole-group alternative
+when coordinated splitting is rejected, rather than falling back to independent
+cuts that lose input reuse. Common-route checks also compare slot ranges after
+one token division per row.
+
+The benchmark freezes 26 calibration row counts, adding 96, 160, 161, 192,
+224, 225, 255, 257, 288 and 289. Calibration is untimed. The intermediate
+[eight-block run](../../../build-numa-broad/campaign_20261011_broad/equal_divisible_columns_fixed_node1_seed0.json),
+[shared-choice seed 0](../../../build-numa-broad/campaign_20261011_broad/shared_choice_columns_fixed_node1_seed0.json),
+[seed 1](../../../build-numa-broad/campaign_20261011_broad/shared_choice_columns_fixed_node1_seed1.json),
+[transition retry](../../../build-numa-broad/campaign_20261011_broad/shared_choice_transition_fixed_edges_node1_seed0_retry1.json)
+and [nine-block edges](../../../build-numa-broad/campaign_20261011_broad/nine_block_shared_choice_fixed_edges_node1_seed0.json)
+remain preserved. The transition launch first rejected stale oracle identity
+before timing; its failed artifact is retained.
+
+After the slot-range simplification, split replay measured
+[742.25 ms in seed 0](../../../build-numa-broad/campaign_20261011_broad/shared_slot_ranges_transition_fixed_node1_seed0.json)
+and [745.25 ms in seed 1](../../../build-numa-broad/campaign_20261011_broad/shared_slot_ranges_transition_fixed_node1_seed1.json).
+Small pass counts were 21/28 and 23/28; large counts were 23/24 in both.
+The [boundary matrix](../../../build-numa-broad/campaign_20261011_broad/shared_slot_ranges_transition_fixed_edges_node1_seed0.json)
+passed 31/36 large cells. These separate launches establish no broad 2× result.
+
+## Combine common splits on their owning node
+
+At M289 hot8, the preceding split assigned rows `[97,96,96]`, placing consecutive
+token intervals on nodes `[1,2,0]` to keep the partial block last. Fixed output
+thirds then read contributions remotely. For accepted complete common routes,
+record those intervals and combine each on its owning node. Reset ranges on
+every call. Keep the global input-completion barrier, original top-k addition
+order, and participation of every node leader, including empty queues.
+
+The [boundary matrix](../../../build-numa-broad/campaign_20261011_broad/owned_combine_fixed_edges_node1_seed0.json)
+passed correctness and measured 912.80 ms split replay versus 928.98 ms.
+M289 hot8 reached 2.058×, with sampled combine mean decreasing from
+72.1 to 33.9 µs; changing reached 2.131×, with combine decreasing from
+49.4 to 28.7 µs. Large pass count increased from 31/36 to 33/36.
+Changing M255, M257 and M288 still missed, at 1.956×, 1.966× and 1.954×.
+Large geometric mean latency decreased 0.94%, with no large p95 ratio above
+1.10. Small calls were unchanged by the ownership mechanism; one M4-changing
+p95 ratio was 1.713. Separate launches do not isolate its cause.
+
+The broader matrices use the same fixed input placement, 96 compute CPUs,
+three single-node controls, four policies, and ten paired rounds:
+
+| Run | Split replay | Small ≥2× | Large ≥2× | Paired split/static, 95% CI |
+| --- | ---: | ---: | ---: | --- |
+| [Seed 0](../../../build-numa-broad/campaign_20261011_broad/owned_combine_fixed_node1_seed0.json) | 740.91 ms | 20/28 | 23/24 | 1.0314 [1.0286, 1.0341] |
+| [Seed 1](../../../build-numa-broad/campaign_20261011_broad/owned_combine_fixed_node1_seed1.json) | 743.39 ms | 21/28 | 22/24 | 1.0272 [1.0220, 1.0321] |
+
+Against the corresponding slot-range runs, large geometric mean latency changed
++0.14% and −0.16%; neither had large p95 ratios above 1.10. Small mean ratios
+were +0.29% and +1.19%, with isolated p95 ratios above 1.10 preserved in the
+analysis artifacts. Retain the measured boundary locality fix, without claiming
+broad improvement. Unequal split counts may increase maximum combine work;
+the frozen prediction still covers inner node execution and excludes final
+combine and caller overhead.
+
+The existing replay test now covers M257 nine-block tails and M289 combine
+ownership, including aliasing followed by a changed batch. The selected
+FP8/MXFP4/NUMA suite passed **96 tests**, with 100 deselected. All applicable
+pre-commit hooks passed after formatting. No FP8 body or executor interface
+changed. The installed extension SHA-256 is
+`42e23f9b82ca9725c75cc6e7811043f3293c892b072e91059e4bae39ecb91125`;
+full [installation identity](../../../build-numa-broad/campaign_20261011_broad/owned_combine_install.json)
+and build commands are retained.
+
+[Captured numerical validation](../../../build-numa-broad/campaign_20261011_broad/owned_combine_primary_numerical.json)
+passed all 1,920 records under each of four policies, across all 40 layers.
+Static, balanced and split maximum absolute error was zero; rows had 0.03125
+maximum error and passed existing tolerances. Payload, source and extension
+identities were unchanged. This is numerical validation, not primary timing
+qualification. The broad 2× and original promotion gates remain unmet.
+
+## Rejected callback allocation and cost lookup changes
+
+The inline callback-storage trial replaced three heap-backed worker closures
+with small wrappers referring to a synchronous stack callback. Disassembly
+verified removal of those allocations, and all 11 NUMA tests passed.
+Its [matrix](../../../build-numa-broad/campaign_20261011_broad/inline_job_storage_transition_fixed_node1_seed0.json)
+measured 745.90 ms split replay versus 742.25 ms, passing 20/28 small and
+23/24 large cells. Reject it; the
+[restore journal](../../../build-numa-broad/campaign_20261011_broad/inline_job_storage_rejected_restored.json)
+verifies the previous source and binary.
+
+The frozen cost-cache trial precomputed unchanged interpolation values for
+groups of zero through 32 rows. All 11 NUMA tests passed.
+[Seed 0](../../../build-numa-broad/campaign_20261011_broad/small_row_cost_cache_transition_fixed_node1_seed0.json)
+and [seed 1](../../../build-numa-broad/campaign_20261011_broad/small_row_cost_cache_transition_fixed_node1_seed1.json)
+measured 740.32 and 743.18 ms split replay, passing 22/28 small and 22/24 large
+cells in both. Small geometric mean latency changed −1.90% and +1.82%;
+large changed +0.57% and −0.24%. Gains were inconsistent, and recorded p95
+ratios included M512 hot8 at 1.155 in seed 1. Reject the extra cache;
+the [restore journal](../../../build-numa-broad/campaign_20261011_broad/small_row_cost_cache_rejected_restored.json)
+confirms restoration before the ownership experiment.
