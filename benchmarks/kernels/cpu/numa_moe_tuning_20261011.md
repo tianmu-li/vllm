@@ -280,3 +280,17 @@ with involuntary context switches and zero page faults. The cause remains
 unresolved in these captures, which lack a thread-level timeline. These
 diagnostic captures are not promotion timing, and no historical artifacts were
 overwritten.
+
+A subsequent [switch-event capture](../../../build-numa-broad/campaign_20261011_broad/retained_switch_trace_seed0_retry1.switch_summary.json)
+recorded 60,819 process switch events for the retained binary and all 96 workers,
+with no reported lost records. The workload completed with correctness checks
+passing. The recorder finalized 3.303 MB of data, which `perf script` parsed
+successfully; the original launcher classified its intentional SIGINT exit
+as a recording infrastructure failure. That status file is preserved.
+
+The capture contained one small call exceeding 1 ms: the first warmup call,
+M1-uniform, took 3.598 ms. Its caller on CPU 32 was preempted for 3.334 ms.
+This establishes caller preemption in that warmup delay, but does not explain
+the roughly 100 ms measured outliers: none reproduced in this capture.
+Worker off-CPU overlap cannot establish a critical-path delay without worker
+completion markers; a worker may already have finished its contribution.
