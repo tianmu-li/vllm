@@ -1,173 +1,163 @@
 # NUMA FP8 MoE tuning results, 2026-10-11
 
-The current final native candidate is **active-experts**: `moe_numa.cpp`
-SHA-256 `9551cde9d9da4cc12c2982ea90f5ef6906096c2be7137080641baebf8fdc3f9e`,
-extension SHA-256
-`57d27406f5a20c04660ceedf062a6a70957b5b0769971e2f5609a36fc912a665`.
-The 2× complete-call target remains unmet for replay tuning: every fixed
-policy misses cells in both requested bands. The per-cell any-policy indicator
-is not a qualification union, and these synthetic diagnostics do not promote
-the operator for serving.
+The retained experimental candidate combines bounded whole-expert column
+scheduling, down-projection weight reuse within existing scratch, and shared
+staged inputs for identical node-local token lists. The broad 2× complete-call
+target remains unmet. Fixed ownership meets more cells than either dynamic
+policy, and the dynamic policies do not meet the 5% gain over fixed ownership.
+Serving promotion is rejected; numerical correctness and performance gates
+remain unchanged.
 
-The 64-cell matrix covers
-`M={1,2,3,4,5,6,7,8,32,128,129,256,512,1024,2048,4096}` under uniform, Zipf,
-hot8, and changing routes. This gives 28 cells for `M<8` and 24 cells for
-`M>128`. Each result uses 10 rounds of 10 full ordered-sequence repeats under
-the `sequence_replay` cache condition, with a 10 ms untimed pause between
-variants. Cell speedups use complete-call means against that cell's fastest
-numerically valid single-node control.
+## Complete-call measurements
 
-| Policy | Seed 0, `M<8` | Seed 0, `M>128` | Seed 1, `M<8` | Seed 1, `M>128` |
-| --- | --- | --- | --- | --- |
-| Static | 22/28; M1 uniform 1.744× | 19/24; M129 hot8 1.825× | 22/28; M1 hot8 1.697× | 19/24; M129 hot8 1.862× |
-| Balanced | 18/28; M6 hot8 1.439× | 19/24; M129 hot8 1.821× | 18/28; M6 hot8 1.259× | 19/24; M129 hot8 1.775× |
-| Split | 19/28; M6 hot8 1.431× | 20/24; M129 hot8 1.646× | 19/28; M2 hot8 1.258× | 20/24; M129 hot8 1.647× |
-| Rows | 10/28; M3 changing 1.192× | 9/24; M256 uniform 1.116× | 9/28; M1 changing 1.222× | 10/24; M256 uniform 1.133× |
+The 64-cell matrix covers M={1,2,3,4,5,6,7,8,32,128,129,256,512,1024,2048,4096}
+under uniform, reciprocal-Zipf, hot-eight, and changing-hot-eight routes. The
+changing distribution contains two successive records per cell, giving 80
+records per sequence. Each seed uses ten rotated paired rounds of ten full
+ordered-sequence repeats, after initialization, frozen calibration, and one
+warm sequence. A 10 ms untimed pause separates variants. Cell speedups compare
+complete-call means with that cell's fastest valid 32-thread single-node
+control. These are supplemental synthetic diagnostics, not primary timing.
 
-The table uses the [seed-0](/home/tianmuli/vllm_test/vllm_local/build-numa-broad/campaign_20261011_broad/active_experts_full64_seed0_retry.json) and
-[seed-1](/home/tianmuli/vllm_test/vllm_local/build-numa-broad/campaign_20261011_broad/active_experts_full64_seed1.json) full-grid results.
+| Policy | Replay ms, seeds 0 / 1 | M<8 passing cells, seeds 0 / 1 | M>128 passing cells, seeds 0 / 1 |
+| --- | --- | --- | --- |
+| Static | 763.24 / 764.09 | 26/28 / 24/28 | 20/24 / 21/24 |
+| Balanced | 780.13 / 785.64 | 18/28 / 21/28 | 21/24 / 21/24 |
+| Split | 782.75 / 788.56 | 19/28 / 21/28 | 20/24 / 20/24 |
+| Rows | 1088.09 / 1090.01 | 10/28 / 8/28 | 12/24 / 12/24 |
 
-The paired aggregate split/static speedup was 1.00121× [0.99924, 1.00285] for
-seed 0 and 1.00790× [1.00456, 1.01116] for seed 1. These are bootstrapped
-round-level confidence intervals over the 80-record synthetic diagnostic,
-not per-cell intervals or timed primary-corpus results. Both active-experts
-runs passed synthetic numerical checks over 80 records, 320 policy outputs,
-and four alias outputs; maximum absolute error was `4.77e-7`.
+The [seed-0 result](../../../build-numa-broad/campaign_20261011_broad/shared_staged_ranges_full64_seed0.json)
+and [seed-1 result](../../../build-numa-broad/campaign_20261011_broad/shared_staged_ranges_full64_seed1.json)
+record all cell means, median/p95 latency, throughput, node imbalance, splits,
+padding, modeled traffic, numerical checks and source identity. Both completed
+with 320 numerical comparisons and four alias comparisons; maximum absolute
+error was 4.77e-7. Neither seed qualifies every requested small or large cell.
 
-The cold-leader-sleep candidate was rejected as the retained path. Its
-[seed-0 run](/home/tianmuli/vllm_test/vllm_local/build-numa-broad/campaign_20261011_broad/cold_leader_sleep_full64_seed0.json) produced a paired
-split/static aggregate of 0.99806× [0.99630, 0.99981], with split passing
-18/28 small cells (weakest M6 hot8, 1.332×) and 20/24 large cells (weakest
-M129 hot8, 1.796×). The matched active-experts
-[seed-0 driver run](/home/tianmuli/vllm_test/vllm_local/build-numa-broad/campaign_20261011_broad/final_active_experts_shared_seed0.json) measured
-0.99940× [0.99570, 1.00293], with split passing 21/28 small cells (weakest
-M5 hot8, 1.302×) and 20/24 large cells (weakest M129 hot8, 1.717×). Both
-used the same frozen corpus and weights. This is one shared-host seed, not a
-causal comparison or evidence of a significant regression. The 100-cycle
-[lifecycle stress check](/home/tianmuli/vllm_test/vllm_local/build-numa-broad/campaign_20261011_broad/cold_leader_sleep_lifecycle_stress.json) completed
-with thread count 1 before and after; it establishes lifecycle behavior only.
-Both runs passed synthetic correctness checks (80 records, 320 policy
-outputs; maximum absolute error `4.77e-7`), with no captured outputs compared.
+Fixed ownership's weakest small cell is M4 changing: 1.920× and 1.905×.
+Its weakest large cell is M512 changing: 1.896× and 1.905×. Changing routes at
+M256 and M1024 also remain below 2× in both seeds. Other near-threshold misses
+vary by seed. Dynamic small hot-group placement remains sensitive: split's
+seed-0 minimum is M7 hot-eight at 1.249×.
 
-The cold-leader candidate used native `moe_numa.cpp` SHA-256
-`c13856a19961b99b24606ec87c3065e6d33230cf1905e24fc0ae06acfed20b88` and
-extension SHA-256
-`6bafe24990181a6a31b9019bce25298718d073b21f96e898a564acc8f39f6954`.
-The latest [host inventory](/home/tianmuli/vllm_test/vllm_local/build-numa-broad/campaign_20261011_broad/cold_leader_sleep_shared_host_inventory.json)
-shows Firecracker VMs on CPUs 0–3 and 4–7, each about 8.4 GiB RSS; nodes 1 and
-2 share a socket with node 0, and both VMs allow memory on nodes 0–5. Treat
-that measurement as shared-host diagnostic evidence only.
+Balanced/static aggregate paired speedups are 0.97834× [0.97463, 0.98182] and
+0.97257× [0.96972, 0.97560] for seeds 0 and 1.
 
-## Driver check and remaining bottlenecks
+Split/static aggregate paired speedups are 0.97512× [0.96724, 0.98104] and
+0.96897× [0.96544, 0.97239] for seeds 0 and 1.
 
-An additional same-binary [diagnostic](/home/tianmuli/vllm_test/vllm_local/build-numa-broad/campaign_20261011_broad/final_active_experts_stats_off_seed0.json)
-removed per-call statistics retrieval between native calls. Static coverage
-was 21/28 small and 18/24 large cells, versus 22/28 and 19/24 in the adjacent
-original-driver run. Static replay time was 832.719 versus 830.868 ms. This
-single shared-host comparison does not establish a significant regression;
-the stats-off run also failed the all-cell 2× target. Some individual misses
-cleared while other cells changed to fail. Its launcher records the diagnostic shim hash.
-The standard driver remains unchanged and records statistics outside the
-complete-call timer.
+The earlier bounded-column/down-cache candidate measured static replay at
+783.01/783.75 ms across its two seeds. The latest 763.24/764.09 ms is lower by
+about 2.5% in these separate runs. The earlier active-experts shared-host run
+measured 830.87 ms. These are descriptive comparisons: source/binary identities,
+live single-node denominators, and host occupancy changed. They do not establish
+paired causal gains. Two VMs observed earlier on CPUs 0–7 had exited by the
+[current host snapshot](../../../build-numa-broad/campaign_20261011_broad/shared_staged_inputs_host_inventory.json).
+No source update was selected by treating a per-cell union of policies as a pass.
 
-The active-experts [profile](/home/tianmuli/vllm_test/vllm_local/build-numa-broad/campaign_20261011_broad/active_experts_live_placement_profile.json)
-observed sparse scheduling times about 1.9–2.8 microseconds lower than the
-separate hot-stage profile. This is an unpaired diagnostic.
-The retained path also reuses node-local scratch and snapshots, gathers large
-inputs once, schedules columns for small expert queues, and combines weighted
-rows on workers in original top-k order. Larger queues retain the original
-rectangular scheduling. Joint hot-group split trials retain the 32-row
-boundary and 5% predicted-makespan improvement requirement.
+## Retained mechanism and remaining bottlenecks
 
-Sparse cold diagnostics still showed an approximately 180-microsecond excess
-on node 1 in the first parallel stage. Neither caller participation nor a
-separate sleeping-leader wake signal resolved it. The phase evidence locates
-the excess in the first parallel phase. Worker startup/barrier delay is an
-interpretation; its cause remains unresolved. Sparse hot and changing routes also remain sensitive to placement and
-cache state; adding copies or splits alone did not meet the broad target.
-Both seeds' aggregate split gains over static remain below the required 5%.
-Retain the simpler tuning as experimental replay work; reject serving
-promotion and retain the numerical/performance gates.
+For staged queues of at most eight experts and at most five 32-row blocks per
+expert, the executor partitions whole-expert column ranges by estimated work.
+It preserves the original equal single-block branch and rectangular execution
+for larger queues. The 160/161-row transition is an empirical scheduling bound,
+not a model-shape requirement. Down projections retain more unpacked columns
+only when both the existing per-thread scratch capacity and cache bound permit
+it. FP8 arithmetic, scales and GEMM microkernels are unchanged.
 
-## Provenance and validation
+When all 2–8 node-local expert groups contain the same ordered token list and
+have more than four rows, they share one staged input copy. Matching uses the
+canonical token's top-k-slot range. Separate input offsets leave intermediate
+and weighted-result rows indexed by the original routed slots. Group metadata
+resets every call; calibration and sharded controls disable input reuse. Gather
+and final combine barriers preserve input/output aliasing and top-k reduction
+order. For whole hot-eight groups at M4096, modeled BF16 staged writes decrease
+from 128 MiB to 48 MiB; result rows and logical/physical route counts are unchanged.
+This is a traffic model, not measured bandwidth.
 
-Full-grid timing runs use Qwen/Qwen3.6-35B-A3B-FP8 layer-12 weights,
-E256/top8/H2048/N512,
-BF16 activations and block-FP8 weights/scales. There is one request batch,
-one persistent runtime, and three distinct local weight copies. Worker CPUs
-are 32–63, 64–95 and 96–127 on NUMA nodes 1, 2 and 3 (32 physical cores each),
-with caller CPU32 and no SMT compute threads. Sparse cold diagnostics used
-E10 rotation runtimes containing eight selected experts. Native host OMP/MKL counts are
-1, wait policy PASSIVE, blocktime 0. Single-node controls each use 32 threads,
-ACTIVE waiting, blocktime 5 and TPAUSE 0. Commands use `uv run --no-sync
-.venv/bin/python` and preload repository libiomp5 plus system tcmalloc.
+The [static](../../../build-numa-broad/campaign_20261011_broad/shared_staged_ranges_static_live_profile.json),
+[balanced](../../../build-numa-broad/campaign_20261011_broad/shared_staged_ranges_balanced_live_profile.json)
+and [split](../../../build-numa-broad/campaign_20261011_broad/shared_staged_ranges_split_live_profile.json)
+profiles preserve per-call phases, physical counts and each profile's own frozen
+calibration tables. Static changing M256/M512/M1024 expert execution averaged
+0.316/0.519/0.974 ms, with dispatch 0.035/0.080/0.129 ms and combine
+0.037/0.072/0.125 ms. Node 1 completed those queues later than nodes 2 and 3.
+Small changing M3/M4 expert execution averaged 0.046/0.053 ms, versus combine
+about 0.008 ms. These native-only profiles locate costs; they do not independently
+qualify speedups or establish their hardware cause.
 
-The imported extension is `vllm/_C.abi3.so` in this worktree. The exact source
-and extension hashes appear above; [build commands](/home/tianmuli/vllm_test/vllm_local/build-numa-broad/campaign_20261011_broad/active_experts_build_commands.json)
-record compiler/link commands. Results record source identity, preload hashes,
-affinity, operator schemas, calibration and input hashes. The stats-off
-diagnostic omits per-call native snapshots and their derived summaries.
-Source descends from `c5a3a1389df9aae4be73bcac7b8eea6164af02c7` through
-prototype commit `c5abdc9dc39a970f2b1218d4dc9377764174cc71`.
-Layer-12 weight-file SHA256 is
-`25b2726ac8d55dddc767c7e214e53072e22202cbe35f59441d9bb938122cc0e6`;
-tensor SHA256 is
-`179f1ccfe059d35c1e0f957c6681440eb2fb65307dd3d6e61206b06905469895`.
-The [live placement check](/home/tianmuli/vllm_test/vllm_local/build-numa-broad/campaign_20261011_broad/active_experts_live_placement_verified.json)
-verified distinct weight storage and every live weight/scratch mapping on
-its intended node. Weights and small scratch use base pages; large scratch
-had 426 MiB of actual huge-page backing in that diagnostic.
+In the split M512-changing profile, node 2 took 0.611 ms versus its own
+0.388 ms prediction and was slowest in all 20 calls. Its four groups occupied
+[5,5,16,16] row blocks. Rectangular M slices crossed three experts there, versus
+at most two on the other nodes, adding weight-unpack sequences. Reordering
+whole expert groups could reduce those crossings without changing placement or
+within-group row blocks. This is a specific next experiment, not an established
+cause or a measured improvement.
 
-Memory-controller counters were measured in a separate [hot-stage run](/home/tianmuli/vllm_test/vllm_local/build-numa-broad/campaign_20261011_broad/hot_stage_full64_imc.json). The four IMC aliases cover both sockets system-wide, including driver
-work and unrelated traffic; they are not per-NUMA/kernel-only bandwidth or
-a bandwidth-ceiling proof. LLC behavior was not measured. Inferred dispatch
-and weight traffic remain models, not measured bandwidth.
+The separate [counter run](../../../build-numa-broad/campaign_20261011_broad/shared_staged_ranges_counters_seed0.json)
+collected cycles, instructions, generic cache references and cache misses over
+CPUs 32–127, with 100% event running time. Its enabled windows exclude creation,
+calibration and correctness checks but include replay bookkeeping and any other
+activity on those CPUs. Static measured 242.5 billion cycles, 134.4 billion
+instructions, 6.0 billion cache references and 1.9 billion cache misses over its
+instrumented window. These generic events do not establish a specific LLC cause
+or kernel-only memory bandwidth. Instrumented timings are excluded from the
+ordinary speedup table. Earlier IMC runs cover both sockets system-wide and
+cannot establish per-NUMA or kernel-only bandwidth.
 
-[Final captured-output validation](/home/tianmuli/vllm_test/vllm_local/build-numa-broad/campaign_20261011_broad/final_active_experts_primary_numerical.json)
-completed 1,920 comparisons per policy across 40 layers and 48 ordered steps:
-120 prefill, 840 mixed and 960 decode records per policy. Static, balanced
-and split matched the captured BF16 outputs exactly. Rows passed the stated
-`atol=rtol=0.01` tolerance, with maximum absolute error 0.03125. Frozen inputs,
-native source and extension were unchanged throughout validation. This is
-captured-output parity, not an independent oracle or a timing measurement.
-The corpus file SHA256 is
+## Provenance and correctness
+
+Source descends from c5a3a1389df9aae4be73bcac7b8eea6164af02c7. Current native
+source SHA-256 values are:
+
+- moe_numa.cpp: `2cfe4394afaccc04b463cdd1cad2a0633e8b47ee9ccded8f2fba157feb0e36c3`
+- moe_fp8.cpp: `22ee5072e94b30e549a667021596e42099047dbe291e6aabaf0b0763c6ad4f3b`
+- moe_executor.h: `e902ecd29f805aeb27e98e5ad296687724cb0307ce97cc519003e8da4ad1f761`
+- vllm/_C.abi3.so: `a6e8c2617fb95ee33edb2850d256a9a790e7be5d70bcfe4e3d578bb2625df237`
+
+[Build commands](../../../build-numa-broad/campaign_20261011_broad/shared_staged_ranges_build_commands.json)
+record compilation/linking. Results retain imported paths/hashes, registered
+schemas, checkpoint/corpus hashes, affinity, preload identities and calibration.
+Qwen/Qwen3.6-35B-A3B-FP8 layer-12 weights use E256/top8/H2048/N512, BF16 activations
+and block-FP8 scales. The weight-file hash is
+`25b2726ac8d55dddc767c7e214e53072e22202cbe35f59441d9bb938122cc0e6`.
+
+There is one batch/runtime with three local weight copies. Workers use CPUs
+32–63, 64–95 and 96–127 on nodes 1,2,3, with caller CPU32 and no SMT compute
+threads. Native host OMP/MKL counts are 1, PASSIVE/blocktime 0; single-node
+controls use 32 threads, ACTIVE/blocktime 5 and TPAUSE 0. Commands use
+`uv run --no-sync .venv/bin/python -P`, system tcmalloc and repository libiomp5.
+The [placement check](../../../build-numa-broad/campaign_20261011_broad/shared_staged_ranges_live_placement_verified.json)
+verified distinct replica storage and all 54 live native weight/scratch mappings
+on their intended nodes. Large scratch had 456 MiB actual huge-page backing;
+weights and small scratch used base pages.
+
+The nearest NUMA selection passed 11 tests on nodes 1,2,3. The shared quantized
+selection passed 85 tests on node 5. Added cases exercise multi-block shared
+inputs with a tail, equal-size groups containing different tokens, and aliased
+output across both cases. Changed native and test files passed pre-commit.
+[Captured-output validation](../../../build-numa-broad/campaign_20261011_broad/shared_staged_ranges_primary_numerical.json)
+completed 1,920 comparisons per policy over 40 layers and 48 ordered steps:
+120 prefill, 840 mixed and 960 decode records per policy. Static, balanced and
+split matched captured BF16 outputs exactly. Rows passed the unchanged
+atol=rtol=0.01 tolerance, with maximum absolute error 0.03125. Inputs, native
+source and extension stayed unchanged through validation and runtime cleanup.
+This establishes captured-output parity, not an independent oracle or timing.
+The frozen corpus hash is
 `4160faf51bd653f43b855f951c93b6259162a4971caff25ea64c460c26c649bb`;
-full captured-layer weights SHA256 is
+full captured-layer weights hash is
 `bc9a62f6a3bcdf5b6c8cbbb79062d79ab1e0ee2cd6dbbd12a23dbe596d4fbea5`.
 
-The nearest NUMA pytest selection passed 11 tests with all three nodes
-available. An earlier 85-test shared quantized suite passed with the same
-FP8/header source hashes. Changed files passed pre-commit checks. Coverage
-includes changed routes, partial invalid IDs, immutable latest-call snapshots,
-staging boundaries, split tails, aliasing, shared scratch and worker teardown.
+The synthetic timing campaign omits 96-thread, native TP2 and unequal-shard
+controls. It does not establish the primary replay promotion gate or full-model
+serving throughput. The current binary has no new primary timing qualification.
 
-The two-seed synthetic timing comparison omits the 96-thread, native TP2 and
-unequal-shard controls, and is supplemental evidence. It does not establish
-the primary replay promotion gate or full-model serving throughput.
+## Preserved rejected experiments
 
-## Follow-up wake experiments
-
-Two further E10 sparse cold diagnostics moved team broadcasts to an existing
-node-local worker, either alone or combined with caller participation. Both
-passed the 11-test NUMA selection and 60 creation/execution/destruction cycles
-alternating one-thread and 32-thread teams. Immediate `/proc/self/task`
-counts occasionally retained one terminating task entry; after 50 ms the
-count returned to the original single thread. The initial assertion failure
-and the repeat snapshots are preserved in the artifacts.
-
-| Rotation-0 complete-call mean, microseconds | M1 | M4 | M5 | M8 |
-| --- | --- | --- | --- | --- |
-| Earlier active-experts diagnostic | 477.2 | 492.7 | 517.9 | 528.6 |
-| Delegated broadcast | 595.6 | 604.7 | 614.7 | 632.9 |
-| Delegated broadcast plus caller | 594.8 | 594.1 | 630.2 | 644.5 |
-
-The delegated-only version lowered node 1's first-phase time, but additional
-startup time erased that benefit. The combined version confirmed caller
-participation and still missed the complete-call objective. These are
-unpaired shared-host diagnostics, not causal regression estimates. Both
-variants were rejected before full-grid timing. The committed active-experts
-source and its tested extension were restored byte-for-byte.
-
-[Delegated evidence](/home/tianmuli/vllm_test/vllm_local/build-numa-broad/campaign_20261011_broad/delegated_wake_shadow_sparse.json) and
-[combined evidence](/home/tianmuli/vllm_test/vllm_local/build-numa-broad/campaign_20261011_broad/combined_wake_shadow_sparse.json)
-record exact source/binary hashes, all rotations and numerical parity.
+Earlier artifacts and committed reports retain the detailed trial evidence.
+Follow-up active waits, expert-aligned gangs, padded input rows, a 16-worker
+sparse path and caller-last dispatch did not meet the broad target. Unrestricted
+weighted column scheduling regressed larger queues; expanding its down cache
+alone did not resolve that regression. The five-block bound retains larger
+rectangles. Delegated and combined wake protocols were also rejected; their
+cold-call and lifecycle evidence remains in the previous report revision and
+fresh campaign artifacts. No historical artifacts were overwritten.

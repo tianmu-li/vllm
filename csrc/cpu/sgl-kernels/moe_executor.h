@@ -18,4 +18,5 @@ struct CpuMoeExecutor {
   virtual const int32_t* routed_slots() const { return nullptr; }
   virtual int64_t input_topk() const { return 1; }
   virtual bool grouped_inputs() const { return false; }
+  virtual const int32_t* grouped_input_offsets() const { return nullptr; }
 };

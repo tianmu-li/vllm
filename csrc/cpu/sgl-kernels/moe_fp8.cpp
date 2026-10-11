@@ -60,6 +60,8 @@ void fused_experts_fp_kernel_impl(
   const int32_t* routed_slots = executor ? executor->routed_slots() : nullptr;
   const int64_t input_topk = executor ? executor->input_topk() : topk;
   const bool grouped_inputs = executor && executor->grouped_inputs();
+  const int32_t* input_offsets =
+      executor ? executor->grouped_input_offsets() : nullptr;
 
   // stage 1: intermediate_cache0 = hidden_states @ w1
   const int64_t MB = div_up(num_tokens_post_pad, BLOCK_M);
@@ -112,7 +114,7 @@ void fused_experts_fp_kernel_impl(
 
       const int64_t offset = offsets[mb];
       if (grouped_inputs) {
-        A = input + offset * K;
+        A = input + (input_offsets ? input_offsets[mb] : offset) * K;
       } else if (nb_offset == 0) {
         // 1.a load A
         const int32_t* A_ids = sorted_ids + mb * BLOCK_M;
@@ -179,7 +181,7 @@ void fused_experts_fp_kernel_impl(
     alignas(64) scalar_t C[BLOCK_M * BLOCK_K];
     bool use_brgemm = false;
 
-    loop_2d<packed_t>(mb0, mb1, nb0, nb1, BLOCK_N * IC, [&](int64_t mb, int64_t nb, int64_t nb_offset) {
+    auto kernel = [&](int64_t mb, int64_t nb, int64_t nb_offset) {
       int64_t m_size = offsets[mb + 1] - offsets[mb];
       if (m_size == 0) {
         return;
@@ -229,7 +231,15 @@ void fused_experts_fp_kernel_impl(
         float weight = topk_weights[routed_slots ? routed_slots[index] : index];
         copy_mul_stub(ic2 + index * K + nb * BLOCK_N, C + m * BLOCK_N, weight, n_size);
       }
-    });
+    };
+
+    if (executor && grouped_inputs &&
+        (nb1 - nb0) <= B_tmp_size_per_thread / (BLOCK_N * IC) &&
+        (nb1 - nb0) <= get_cache_blocks<scalar_t>(BLOCK_N * IC)) {
+      loop_2d<scalar_t>(mb0, mb1, nb0, nb1, BLOCK_N * IC, kernel);
+    } else {
+      loop_2d<packed_t>(mb0, mb1, nb0, nb1, BLOCK_N * IC, kernel);
+    }
 
     if (use_brgemm) {
       at::native::cpublas::brgemm_release();

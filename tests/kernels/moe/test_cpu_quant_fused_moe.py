@@ -526,6 +526,18 @@ def test_cpu_numa_fp8_moe_runtime_replays_routes_and_recreates(
                 torch.arange(num_experts, dtype=torch.int32).repeat(5, 1),
                 torch.full((5, num_experts), 1 / num_experts),
             ),
+            # Multi-block expert groups with uneven worker counts and row tails.
+            (
+                hot_hidden[:129],
+                torch.arange(num_experts, dtype=torch.int32).repeat(129, 1),
+                torch.full((129, num_experts), 1 / num_experts),
+            ),
+            # Equal counts alone do not permit reusing another group's inputs.
+            (
+                hot_hidden[:12],
+                torch.tensor([[0, 1]] * 6 + [[3, 4]] * 6, dtype=torch.int32),
+                torch.full((12, 2), 0.5),
+            ),
         )
         references = []
         for hidden, ids, weights in cases:
@@ -568,8 +580,13 @@ def test_cpu_numa_fp8_moe_runtime_replays_routes_and_recreates(
                     assert (physical_counts[:, 0] > 0).sum() == 1
                 if policy == "rows" and index == 1:
                     assert torch.all(physical_counts[:, 0] > 0)
+                if policy == "static" and index in (4, 5):
+                    input_rows = 129 * len(nodes) if index == 4 else ids.numel()
+                    assert stats["dispatch_bytes"].item() == (
+                        input_rows * hidden_size * 2 + ids.numel() * 4
+                    )
 
-            for index in (2, 3, 1):
+            for index in (2, 3, 4, 5, 1):
                 hidden, ids, weights = cases[index]
                 aliased = hidden.clone()
                 runtime.cpu_numa_moe_execute(

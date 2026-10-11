@@ -260,10 +260,24 @@ four rows; other calls gather directly into the existing per-thread GEMM input
 buffer. Dispatch records explicit staging, while direct gathering remains in
 the expert phase. Arithmetic and top-k reduction order are preserved. Small
 queues with one 32-row block per expert use column scheduling; larger queues
-retain rectangular scheduling. Small and large calls retain separate scratch
+also use whole-expert column scheduling when their inputs are staged, they have
+at most eight experts, each expert has at most five 32-row blocks, and group
+and column counts permit partitioning across the team. Other queues retain
+rectangular scheduling. Down projections reuse additional
+unpacked columns only within the existing scratch and cache capacity.
+Small and large calls retain separate scratch
 buffers, with huge pages requested only for large full-width scratch.
 Scheduling and packing traverse active experts, clearing the previous call
 and statistics buffer's active entries before reuse.
+
+Full-width node-local groups can share staged inputs when all 2–8 groups have
+the same ordered token list and more than four rows. Input offsets reference
+the shared copy; intermediate and weighted-result offsets remain separate
+for every routed slot. Equal counts alone do not enable sharing. Metadata resets
+between calls, and calibration and sharded controls retain separate inputs.
+`dispatch_bytes` models the shared input rows plus all routed-slot weights;
+direct gathering retains the original slot-based estimate. These are traffic
+estimates, not measured memory bandwidth.
 
 Execution captures counters and phase times before returning. The statistics
 operation materializes diagnostic tensors from that latest-call snapshot and
