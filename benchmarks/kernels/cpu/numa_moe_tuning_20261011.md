@@ -1007,3 +1007,30 @@ activity; these are not isolated GEMM metrics. No memory-controller events
 were collected, and no measured bandwidth claim follows from LLC counts.
 Reported migrations are system-wide events, not evidence of worker migration.
 The broad 2× and original promotion gates remain unmet.
+
+## Statistics-sampling sensitivity
+
+The new `--native-stats-mode post-timing` diagnostic omits Python stats
+conversion between timed native calls and collects a separate corpus replay
+after all timing rounds, using `--diagnostic-repeats`. The default remains
+`per-call`. Separate replay statistics carry their sampling contract and no
+timing-round index, including in failure diagnosis. Kernel-control layouts
+are installed before diagnostic collection. This mode is explicitly excluded
+from promotion; its phase samples cannot attribute a particular timed miss.
+
+The [base-policy matrix](../../../build-numa-broad/campaign_20261011_broad/stat_sampling_post_fixed_node1_seed0.json)
+used the retained extension, seed 0, fixed node-1 inputs, 10 rotated paired
+rounds and 10 sequence repeats. All numerical checks passed. Split replay
+was 739.65 ms versus 740.91 ms in the preceding per-call launch, with 23/28
+small and 23/24 large cells reaching 2×. M5 hot8/changing, M6 changing,
+M7 hot8/changing and M256 changing missed. The split/static paired speedup
+was 1.0349, CI [1.0332, 1.0365], below the 5% gate.
+Separate-launch comparisons are descriptive: this is not a kernel improvement
+and does not explain away the remaining misses.
+
+The [layout smoke](../../../build-numa-broad/campaign_20261011_broad/stat_sampling_v2_shard_smoke_retry.json)
+validated the corrected post-timing path at M1/7/129 across balanced,
+unequal and all three TP2 kernel controls. Numerical checks passed, diagnostic
+stats were separately labeled, and promotion remained unevaluated.
+The first launcher attempt failed argument parsing before execution because
+`--controls` had no value; its failure artifact is preserved.

@@ -1065,6 +1065,8 @@ def _synthetic_complete_call_summary(
     timing_repeats: int,
     rounds: int,
     latest_round_stats: dict[str, list[dict[str, Any]]],
+    stats_repeats: int,
+    stats_from_timing: bool,
 ) -> dict[str, Any]:
     cell_indices: dict[tuple[int, str], list[int]] = defaultdict(list)
     for index, record in enumerate(records):
@@ -1167,11 +1169,15 @@ def _synthetic_complete_call_summary(
                 cell_stats = _native_stats_summary(
                     [
                         snapshots[repeat * len(records) + index]
-                        for repeat in range(timing_repeats)
+                        for repeat in range(stats_repeats)
                         for index in indices
                     ]
                 )
-                cell_stats["timing_round_index"] = rounds
+                cell_stats["timing_round_index"] = rounds if stats_from_timing else None
+                if not stats_from_timing:
+                    cell_stats["sampling_contract"] = (
+                        "separate post-timing diagnostic corpus replay"
+                    )
                 policy_results[policy]["native_stats_summary"] = cell_stats
 
         measured_statuses = [
@@ -1696,6 +1702,7 @@ def _run_corpus(
     records: list[dict[str, Any]],
     policy: str,
     repeats: int = 1,
+    collect_stats: bool = True,
 ) -> tuple[list[float], list[dict[str, Any]], dict[str, list[float]]]:
     call_ms = []
     stats_samples = []
@@ -1708,9 +1715,10 @@ def _run_corpus(
             call_ms.append(elapsed_ms)
             if record.get("concurrency") is not None:
                 concurrency_ms[str(int(record["concurrency"]))].append(elapsed_ms)
-            stats = _call_stats(handles[record["layer"]])
-            stats["layer_id"] = record["layer"]
-            stats_samples.append(stats)
+            if collect_stats:
+                stats = _call_stats(handles[record["layer"]])
+                stats["layer_id"] = record["layer"]
+                stats_samples.append(stats)
     return call_ms, stats_samples, concurrency_ms
 
 
@@ -2500,6 +2508,10 @@ def _run_benchmark(args: argparse.Namespace) -> dict[str, Any]:
         round_call_p95 = {variant: [] for variant in variants}
         final_stats = {policy: {} for policy in args.policies}
         latest_round_stats = {policy: [] for policy in args.policies}
+        stats_from_timing = args.native_stats_mode == "per-call"
+        stats_repeats = (
+            args.timing_repeats if stats_from_timing else args.diagnostic_repeats
+        )
         concurrency_round_totals: dict[str, dict[str, list[float]]] = {
             variant: defaultdict(list) for variant in variants
         }
@@ -2560,7 +2572,11 @@ def _run_benchmark(args: argparse.Namespace) -> dict[str, Any]:
                 with collector if collector is not None else nullcontext():
                     if variant in args.policies:
                         timings, samples, by_concurrency = _run_corpus(
-                            handles, records, variant, args.timing_repeats
+                            handles,
+                            records,
+                            variant,
+                            args.timing_repeats,
+                            collect_stats=stats_from_timing,
                         )
                         final_stats[variant] = samples[-1] if samples else {}
                         latest_round_stats[variant] = samples
@@ -2635,6 +2651,24 @@ def _run_benchmark(args: argparse.Namespace) -> dict[str, Any]:
             ):
                 rounds = args.max_rounds
 
+        if not stats_from_timing:
+            for policy in args.policies:
+                time.sleep(VARIANT_QUIESCENCE_SECONDS)
+                if policy in KERNEL_CONTROLS:
+                    for record in layout_inputs.values():
+                        _execute(handles, record, policy)
+                    time.sleep(VARIANT_QUIESCENCE_SECONDS)
+                _, samples, _ = _run_corpus(handles, records, policy, stats_repeats)
+                latest_round_stats[policy] = samples
+                final_stats[policy] = samples[-1] if samples else {}
+                _progress(
+                    args.progress_jsonl,
+                    "post_timing_stats_complete",
+                    variant=policy,
+                    repeats=stats_repeats,
+                    records=len(records),
+                )
+
         policy_results = {}
         routed_tokens = sum(
             int(record["hidden"].shape[0] * record["ids"].shape[1])
@@ -2642,7 +2676,7 @@ def _run_benchmark(args: argparse.Namespace) -> dict[str, Any]:
         )
         logical_groups = (
             sum(int(torch.unique(record["ids"]).numel()) for record in records)
-            * args.timing_repeats
+            * stats_repeats
         )
         for variant in variants:
             total_ms = statistics.fmean(round_totals[variant])
@@ -2731,7 +2765,13 @@ def _run_benchmark(args: argparse.Namespace) -> dict[str, Any]:
             result_for_variant["by_phase"] = by_phase
             if variant in args.policies:
                 native_summary = _native_stats_summary(latest_round_stats[variant])
-                native_summary["timing_round_index"] = rounds
+                native_summary["timing_round_index"] = (
+                    rounds if stats_from_timing else None
+                )
+                if not stats_from_timing:
+                    native_summary["sampling_contract"] = (
+                        "separate post-timing diagnostic corpus replay"
+                    )
                 split_groups = native_summary["counters"].get("split_groups")
                 native_summary["split_frequency"] = (
                     split_groups / logical_groups
@@ -2772,6 +2812,8 @@ def _run_benchmark(args: argparse.Namespace) -> dict[str, Any]:
                 args.timing_repeats,
                 rounds,
                 latest_round_stats,
+                stats_repeats,
+                stats_from_timing,
             )
             if args.mode == "synthetic"
             else None
@@ -3007,12 +3049,15 @@ def _run_benchmark(args: argparse.Namespace) -> dict[str, Any]:
             and args.rounds >= 5
             and args.max_rounds >= 10
             and not args.perf_output_dir
+            and stats_from_timing
         )
         primary_eligible = primary_corpus["eligible"] and primary_environment
         preload = _preload_identity()
         preload_verified = preload["verified"]
         if args.perf_output_dir:
             overall_status = "not_evaluated_instrumented_diagnostic"
+        elif not stats_from_timing:
+            overall_status = "not_evaluated_post_timing_stats_diagnostic"
         elif not controls_complete or not primary_eligible:
             overall_status = "blocked_missing_controls_or_primary_corpus"
         elif not placement_verified or not preload_verified:
@@ -3157,6 +3202,9 @@ def _run_benchmark(args: argparse.Namespace) -> dict[str, Any]:
             "correctness": correctness,
             "timing": {
                 "instrumented": bool(args.perf_output_dir),
+                "native_stats_mode": args.native_stats_mode,
+                "native_stats_repeats": stats_repeats,
+                "native_stats_from_timing": stats_from_timing,
                 "repeats_per_round": args.timing_repeats,
                 "records_per_round": len(records) * args.timing_repeats,
                 "untimed_pause_between_variants_ms": (
@@ -3285,6 +3333,9 @@ def _run_benchmark(args: argparse.Namespace) -> dict[str, Any]:
                 "failure_diagnosis": {
                     "unmet_gates": unmet_gates,
                     "selected_policy": selected_dynamic,
+                    "sampling_contract": selected_summary.get("sampling_contract"),
+                    "native_stats_repeats": stats_repeats,
+                    "timing_round_index": selected_summary.get("timing_round_index"),
                     "largest_reported_phase": (
                         max(reported_phases, key=reported_phases.get)
                         if reported_phases
@@ -3408,6 +3459,15 @@ def _parser() -> argparse.ArgumentParser:
         help="repeat the full ordered record sequence in each measured round",
     )
     parser.add_argument("--diagnostic-repeats", type=int, default=5)
+    parser.add_argument(
+        "--native-stats-mode",
+        choices=("per-call", "post-timing"),
+        default="per-call",
+        help=(
+            "post-timing skips native stats extraction between measured calls, "
+            "then gathers diagnostics with --diagnostic-repeats; excludes promotion"
+        ),
+    )
     parser.add_argument("--atol", type=float, default=1e-2)
     parser.add_argument("--rtol", type=float, default=1e-2)
     parser.add_argument("--reference-chunk-tokens", type=int, default=1024)
