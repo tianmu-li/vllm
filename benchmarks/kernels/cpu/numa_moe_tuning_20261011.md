@@ -789,3 +789,23 @@ and 20/24 large cells reaching 2×. Small geometric mean latency decreased
 0.93%, while large latency increased 0.89%; M256 changing remained at 1.892×.
 These separate launches establish no useful overall gain. Retain caller CPU32.
 Neither experiment closes the broad target or qualifies primary performance.
+
+## Rejected four-block contribution reduction
+
+The candidate interleaved four independent channel-vector reductions, retaining
+each channel's original top-k-slot addition order and final BF16 conversion.
+The top-1 path and vector/scalar tails were unchanged. All 11 NUMA tests and
+synthetic correctness checks passed; independent static review found no
+semantic blocker. Existing numerical and alias coverage exercises this change.
+
+The [64-cell run](../../../build-numa-broad/campaign_20261011_broad/combine_unroll4_fixed_node1_seed0.json)
+did not improve complete calls: split replay was 747.17 ms versus 745.99 ms,
+with 20/28 small and 22/24 large cells reaching 2×. Split's small geometric
+mean latency increased 2.58%, including three p95 ratios above 1.10.
+M256 changing remained at 1.865×. Several sampled combine means decreased,
+including M256 changing from 39.62 to 36.19 µs, but these phase samples and
+separate launches establish no overall benefit. Reject the added reduction
+code. The [restore journal](../../../build-numa-broad/campaign_20261011_broad/combine_unroll4_rejected_restored.json)
+verifies the committed source and retained nonzero-calibration extension.
+The [cell analysis](../../../build-numa-broad/campaign_20261011_broad/combine_unroll4_fixed_node1_seed0.analysis.json)
+preserves failures and tail ratios. The broad 2× objective remains unmet.
