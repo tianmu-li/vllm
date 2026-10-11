@@ -767,3 +767,25 @@ Reject this scheduling extension. Its
 and [restore journal](../../../build-numa-broad/campaign_20261011_broad/equal_shared_columns_rejected_restored.json)
 preserve the experiment and verify restoration to nonzero calibration alone.
 The broad 2× target remains unmet.
+
+## Rejected caller wait and placement changes
+
+The bounded caller-wait candidate yielded at most eight times before returning
+to the existing atomic wait, only while sharing a CPU with its worker team.
+All 11 NUMA tests passed. Its
+[64-cell run](../../../build-numa-broad/campaign_20261011_broad/caller_yield_bounded_fixed_node1_seed0.json)
+passed correctness but split replay remained 745.92 ms versus 745.99 ms.
+Split passed 21/28 small and 23/24 large cells; small-call geometric mean
+latency increased 1.05%, and four small-cell p95 ratios exceeded 1.10.
+Reject the candidate. The
+[restore journal](../../../build-numa-broad/campaign_20261011_broad/caller_yield_bounded_rejected_restored.json)
+confirms restoration of the committed source and nonzero-calibration binary.
+
+A separate [caller-CPU63 run](../../../build-numa-broad/campaign_20261011_broad/controller63_early_finish_fixed_node1_seed0.json)
+kept the same 96 compute CPUs, node-1 input pages and committed binary.
+It tested whether early return of idle workers made CPU63 a better caller
+location. Correctness passed. Split replay was 746.41 ms, with 22/28 small
+and 20/24 large cells reaching 2×. Small geometric mean latency decreased
+0.93%, while large latency increased 0.89%; M256 changing remained at 1.892×.
+These separate launches establish no useful overall gain. Retain caller CPU32.
+Neither experiment closes the broad target or qualifies primary performance.
