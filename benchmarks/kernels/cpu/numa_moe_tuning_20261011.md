@@ -107,6 +107,13 @@ Its near-INT32_MAX block-count overflow was outside campaign sizes; the widened
 candidate remains an unbuilt artifact. The trial code and its dedicated test
 case were removed, and the retained source and binary were restored exactly.
 
+An [extra M129 calibration point](../../../build-numa-broad/campaign_20261011_broad/shared_staged_ranges_boundary129_seed0.json)
+also failed to improve aggregate replay. On the retained binary it measured
+static/balanced/split at 763.26/803.02/799.49 ms. Split M129 hot-eight improved
+to 1.954×, but remained below 2×; split's aggregate paired speedup over static
+was 0.95465× [0.94901, 0.96118]. The original calibration table remains unchanged.
+This single-seed diagnostic passed correctness and did not qualify broad speedups.
+
 The separate [counter run](../../../build-numa-broad/campaign_20261011_broad/shared_staged_ranges_counters_seed0.json)
 collected cycles, instructions, generic cache references and cache misses over
 CPUs 32–127, with 100% event running time. Its enabled windows exclude creation,
