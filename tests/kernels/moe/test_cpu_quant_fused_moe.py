@@ -5,6 +5,7 @@
 import math
 import os
 import sys
+import time
 from pathlib import Path
 
 import pytest
@@ -232,7 +233,7 @@ def _discover_cpu_numa_teams() -> tuple[list[int], list[int], int] | None:
     if len(teams) != 3:
         return None
 
-    threads_per_node = min(2, *(len(cpus) for _, cpus in teams))
+    threads_per_node = min(4, *(len(cpus) for _, cpus in teams))
     nodes = [node for node, _ in teams]
     cpus = [cpu for _, node_cpus in teams for cpu in node_cpus[:threads_per_node]]
     return cpus, nodes, threads_per_node
@@ -434,7 +435,6 @@ def test_cpu_numa_fp8_moe_runtime_replays_routes_and_recreates(
         BLOCK_SIZE[1],
     )
     try:
-        runtime.cpu_numa_moe_calibrate(handle, [1, 4, 8, 32, 64, 128])
         multi_slot_hidden = torch.randn(
             65, hidden_size, dtype=torch.bfloat16
         ) / math.sqrt(hidden_size)
@@ -462,10 +462,70 @@ def test_cpu_numa_fp8_moe_runtime_replays_routes_and_recreates(
         changed_ids = torch.tensor([[6, 7], [2, 5], [3, 4]], dtype=torch.int32)
         changed_weight = torch.softmax(torch.randn(3, 2, dtype=torch.float32), dim=-1)
 
+        output = torch.empty_like(changed_hidden)
+        runtime.cpu_numa_moe_execute(
+            handle,
+            changed_hidden,
+            changed_ids,
+            changed_weight,
+            output,
+            "static",
+            0,
+        )
+        stats = runtime.cpu_numa_moe_stats(handle)
+        assert stats["calibrated_rows"].numel() == 0
+
+        calibration_rows = [1, 4, 8, 32, 64, 128, 512]
+        runtime.cpu_numa_moe_calibrate(handle, calibration_rows)
+        assert runtime.cpu_numa_moe_stats(handle)["calibrated_rows"].numel() == 0
+
+        runtime.cpu_numa_moe_execute(
+            handle,
+            changed_hidden,
+            changed_ids,
+            changed_weight,
+            output,
+            "static",
+            0,
+        )
+        stats = runtime.cpu_numa_moe_stats(handle)
+        expected_rows = torch.tensor(calibration_rows, dtype=torch.int64)
+        assert torch.equal(stats["calibrated_rows"], expected_rows)
+        assert stats["cost_ms"].shape == (len(nodes), len(calibration_rows))
+
+        expected_costs = stats["cost_ms"].clone()
+        expected_worker_cpus = stats["worker_cpus"].clone()
+        stats["cost_ms"].fill_(-1)
+        stats["worker_cpus"].fill_(-1)
+        refreshed_stats = runtime.cpu_numa_moe_stats(handle)
+        assert torch.equal(refreshed_stats["cost_ms"], expected_costs)
+        assert torch.equal(refreshed_stats["worker_cpus"], expected_worker_cpus)
+        invalid_ids = changed_ids.clone()
+        invalid_ids.view(-1)[-1] = num_experts
+        with pytest.raises(RuntimeError, match="Invalid logical expert"):
+            runtime.cpu_numa_moe_execute(
+                handle,
+                changed_hidden,
+                invalid_ids,
+                changed_weight,
+                output,
+                "static",
+                0,
+            )
+        failed_call_stats = runtime.cpu_numa_moe_stats(handle)
+        assert failed_call_stats.keys() == refreshed_stats.keys()
+        for key in refreshed_stats:
+            assert torch.equal(failed_call_stats[key], refreshed_stats[key])
+
         cases = (
             (multi_slot_hidden, multi_slot_ids, multi_slot_weight),
             (hot_hidden, hot_ids, hot_weight),
             (changed_hidden, changed_ids, changed_weight),
+            (
+                hot_hidden[:5],
+                torch.arange(num_experts, dtype=torch.int32).repeat(5, 1),
+                torch.full((5, num_experts), 1 / num_experts),
+            ),
         )
         references = []
         for hidden, ids, weights in cases:
@@ -509,29 +569,70 @@ def test_cpu_numa_fp8_moe_runtime_replays_routes_and_recreates(
                 if policy == "rows" and index == 1:
                     assert torch.all(physical_counts[:, 0] > 0)
 
-            aliased = changed_hidden.clone()
-            runtime.cpu_numa_moe_execute(
-                handle,
-                aliased,
-                changed_ids,
-                changed_weight,
-                aliased,
-                policy,
-                layer_id,
-            )
-            torch.testing.assert_close(aliased, references[2][1], atol=0, rtol=0)
+            for index in (2, 3, 1):
+                hidden, ids, weights = cases[index]
+                aliased = hidden.clone()
+                runtime.cpu_numa_moe_execute(
+                    handle, aliased, ids, weights, aliased, policy, layer_id
+                )
+                tolerance = 1e-2 if policy == "rows" and index != 2 else 0
+                torch.testing.assert_close(
+                    aliased, references[index][1], atol=tolerance, rtol=tolerance
+                )
+
+        # Replay changed routes after idle intervals and caller-affinity changes.
+        original_affinity = os.sched_getaffinity(0)
+        try:
+            for affinity, quiesce, index in (
+                ({cpus[0]}, True, 3),
+                (original_affinity, False, 2),
+                ({cpus[0]}, True, 2),
+                ({cpus[0]}, False, 3),
+            ):
+                os.sched_setaffinity(0, affinity)
+                if quiesce:
+                    time.sleep(0.02)
+                hidden, ids, weights = cases[index]
+                aliased = hidden.clone()
+                runtime.cpu_numa_moe_execute(
+                    handle, aliased, ids, weights, aliased, "static", 0
+                )
+                torch.testing.assert_close(
+                    aliased, references[index][1], atol=0, rtol=0
+                )
+                stats = runtime.cpu_numa_moe_stats(handle)
+                _assert_numa_moe_stats(stats, ids, num_experts, len(nodes))
+        finally:
+            os.sched_setaffinity(0, original_affinity)
 
         workers_before_destroy = len(list(Path("/proc/self/task").iterdir()))
+        second_w2_s = w2_s * 0.5
         second_layer = runtime.cpu_numa_moe_create(
-            packed_w1, packed_w2, w1_s, w2_s, cpus, nodes, threads_per_node, *BLOCK_SIZE
+            packed_w1,
+            packed_w2,
+            w1_s,
+            second_w2_s,
+            cpus,
+            nodes,
+            threads_per_node,
+            *BLOCK_SIZE,
         )
         try:
             assert (
                 len(list(Path("/proc/self/task").iterdir())) == workers_before_destroy
             )
-            # Grow shared scratch from another layer, then replay the first layer.
+            # Shared scratch must not reuse another layer's unpacked weights.
             larger_hidden = hot_hidden.repeat(2, 1)
             larger_output = torch.empty_like(larger_hidden)
+            second_reference = _fused_fp8_moe_output(
+                larger_hidden,
+                packed_w1,
+                packed_w2,
+                hot_weight.repeat(2, 1),
+                hot_ids.repeat(2, 1),
+                w1_s,
+                second_w2_s,
+            )
             runtime.cpu_numa_moe_execute(
                 second_layer,
                 larger_hidden,
@@ -541,8 +642,19 @@ def test_cpu_numa_fp8_moe_runtime_replays_routes_and_recreates(
                 "static",
                 1,
             )
+            torch.testing.assert_close(larger_output, second_reference, atol=0, rtol=0)
+            restored_hot_output = torch.empty_like(hot_hidden)
+            runtime.cpu_numa_moe_execute(
+                handle,
+                hot_hidden,
+                hot_ids,
+                hot_weight,
+                restored_hot_output,
+                "static",
+                0,
+            )
             torch.testing.assert_close(
-                larger_output, references[1][1].repeat(2, 1), atol=0, rtol=0
+                restored_hot_output, references[1][1], atol=0, rtol=0
             )
             output = torch.empty_like(changed_hidden)
             runtime.cpu_numa_moe_execute(
@@ -555,6 +667,25 @@ def test_cpu_numa_fp8_moe_runtime_replays_routes_and_recreates(
                 0,
             )
             torch.testing.assert_close(output, references[2][1], atol=0, rtol=0)
+            second_small_reference = _fused_fp8_moe_output(
+                changed_hidden,
+                packed_w1,
+                packed_w2,
+                changed_weight,
+                changed_ids,
+                w1_s,
+                second_w2_s,
+            )
+            runtime.cpu_numa_moe_execute(
+                second_layer,
+                changed_hidden,
+                changed_ids,
+                changed_weight,
+                output,
+                "static",
+                1,
+            )
+            torch.testing.assert_close(output, second_small_reference, atol=0, rtol=0)
             assert torch.equal(
                 runtime.cpu_numa_moe_stats(handle)["scratch_addresses"],
                 runtime.cpu_numa_moe_stats(second_layer)["scratch_addresses"],
@@ -581,15 +712,23 @@ def test_cpu_numa_fp8_moe_runtime_replays_routes_and_recreates(
             BLOCK_SIZE[1],
         )
         output = torch.empty_like(changed_hidden)
-        runtime.cpu_numa_moe_execute(
-            handle,
-            changed_hidden,
-            changed_ids,
-            changed_weight,
-            output,
-            "static",
-            0,
-        )
+        original_affinity = os.sched_getaffinity(0)
+        try:
+            os.sched_setaffinity(0, {cpus[0]})
+            time.sleep(0.02)
+            runtime.cpu_numa_moe_execute(
+                handle,
+                changed_hidden,
+                changed_ids,
+                changed_weight,
+                output,
+                "static",
+                0,
+            )
+            runtime.cpu_numa_moe_destroy(handle)
+            handle = None
+        finally:
+            os.sched_setaffinity(0, original_affinity)
         torch.testing.assert_close(output, references[2][1], atol=0, rtol=0)
     finally:
         if handle is not None:

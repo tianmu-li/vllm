@@ -10,6 +10,7 @@
 #include <condition_variable>
 #include <cstring>
 #include <fstream>
+#include <limits>
 #include <map>
 #include <mutex>
 #include <numeric>
@@ -37,16 +38,28 @@ class LocalBuffer {
   LocalBuffer(const LocalBuffer&) = delete;
   LocalBuffer& operator=(const LocalBuffer&) = delete;
   ~LocalBuffer() { release(); }
-  void reserve(size_t bytes, int node) {
+  void reserve(size_t bytes, int node, bool huge_pages = false) {
     if (bytes <= capacity_) return;
     release();
-    size_t page = sysconf(_SC_PAGESIZE);
-    capacity_ = ((bytes + page - 1) / page) * page;
-    mapping_size_ = capacity_ + 2 * page;
+    constexpr size_t huge_page = 2 * 1024 * 1024;
+    long system_page = sysconf(_SC_PAGESIZE);
+    TORCH_CHECK(system_page > 0, "Cannot determine system page size");
+    size_t page = system_page;
+    bool use_huge_pages = huge_pages && bytes >= huge_page;
+    size_t alignment = use_huge_pages ? huge_page : page;
+    size_t overhead = 2 * page + (use_huge_pages ? huge_page : 0);
+    TORCH_CHECK(bytes <= std::numeric_limits<size_t>::max() - overhead -
+                             (alignment - 1),
+                "NUMA allocation size overflow");
+    capacity_ = ((bytes + alignment - 1) / alignment) * alignment;
+    mapping_size_ = capacity_ + overhead;
     mapping_ = mmap(nullptr, mapping_size_, PROT_NONE,
                     MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
     TORCH_CHECK(mapping_ != MAP_FAILED, "NUMA allocation failed");
-    data_ = static_cast<char*>(mapping_) + page;
+    uintptr_t address = reinterpret_cast<uintptr_t>(mapping_) + page;
+    if (use_huge_pages)
+      address = (address + huge_page - 1) & ~(uintptr_t(huge_page) - 1);
+    data_ = reinterpret_cast<void*>(address);
     TORCH_CHECK(mprotect(data_, capacity_, PROT_READ | PROT_WRITE) == 0,
                 "NUMA allocation mprotect failed");
     TORCH_CHECK(node >= 0 && node < sizeof(unsigned long) * 8,
@@ -55,7 +68,12 @@ class LocalBuffer {
     TORCH_CHECK(mbind(data_, capacity_, MPOL_BIND, &node_mask,
                       sizeof(node_mask) * 8, 0) == 0,
                 "NUMA allocation mbind failed: ", std::strerror(errno));
-    madvise(data_, capacity_, MADV_NOHUGEPAGE);
+    if (use_huge_pages) {
+      TORCH_CHECK(madvise(data_, capacity_, MADV_HUGEPAGE) == 0,
+                  "NUMA allocation madvise failed: ", std::strerror(errno));
+    } else {
+      madvise(data_, capacity_, MADV_NOHUGEPAGE);
+    }
     // The calling worker is already pinned to this node.
     std::memset(data_, 0, capacity_);
     verify(node);
@@ -132,7 +150,7 @@ class Team {
           ++ready_;
           done_.notify_one();
         }
-        uint64_t previous = 0;
+        uint32_t previous = 0;
         for (;;) {
           auto deadline = Clock::now() + std::chrono::milliseconds(5);
           while (generation_.load(std::memory_order_acquire) == previous &&
@@ -142,12 +160,12 @@ class Team {
             else
               for (int spin = 0; spin < 64; ++spin) _mm_pause();
           }
-          generation_.wait(previous, std::memory_order_acquire);
+          if (generation_.load(std::memory_order_acquire) == previous)
+            generation_.wait(previous, std::memory_order_acquire);
           if (stop_.load(std::memory_order_acquire)) return;
           previous = generation_.load(std::memory_order_acquire);
-          auto job = job_;
           try {
-            job(tid);
+            job_(tid);
           } catch (...) {
             fail(std::current_exception());
           }
@@ -208,7 +226,7 @@ class Team {
   alignas(64) std::atomic<int> remaining_;
   alignas(64) std::atomic<uint64_t> barrier_generation_{0};
   alignas(64) std::atomic<int> finished_{0};
-  alignas(64) std::atomic<uint64_t> generation_{0};
+  alignas(64) std::atomic<uint32_t> generation_{0};
   std::atomic<bool> stop_{false}, failed_{false};
   const std::atomic<int>& controller_cpu_;
   std::mutex mutex_;
@@ -218,14 +236,34 @@ class Team {
   std::vector<std::thread> threads_;
 };
 
+struct ExpertTiles {
+  std::vector<int32_t> block_offsets;
+  std::vector<int64_t> work_prefix;
+};
+
 struct Executor : CpuMoeExecutor {
   Team& team;
   int tid;
   bool reduce;
-  Executor(Team& team, int tid, bool reduce = true)
-      : team(team), tid(tid), reduce(reduce) {}
+  const ExpertTiles* tiles;
+  const int32_t* slots;
+  int64_t topk;
+  bool grouped;
+  Executor(Team& team, int tid, bool reduce = true,
+           const ExpertTiles* tiles = nullptr, const int32_t* slots = nullptr,
+           int64_t topk = 1, bool grouped = false)
+      : team(team),
+        tid(tid),
+        reduce(reduce),
+        tiles(tiles),
+        slots(slots),
+        topk(topk),
+        grouped(grouped) {}
   int thread_id() const override { return tid; }
   bool reduce_output() const override { return reduce; }
+  const int32_t* routed_slots() const override { return slots; }
+  int64_t input_topk() const override { return topk; }
+  bool grouped_inputs() const override { return grouped; }
   void for_1d(int64_t n,
               const std::function<void(int64_t, int64_t)>& f) override {
     int64_t begin = n * tid / team.size();
@@ -241,8 +279,60 @@ struct Executor : CpuMoeExecutor {
   void for_2d(int m, int n,
               const std::function<void(int64_t, int64_t, int64_t, int64_t)>& f)
       override {
-    // Same decomposition as the native operator, with a team-local thread
-    // count.
+    if (tiles && m >= 1 && m <= team.size() &&
+        m == static_cast<int>(tiles->work_prefix.size()) - 1 &&
+        n >= team.size()) {
+      int64_t group_work = tiles->work_prefix[1] - tiles->work_prefix[0];
+      bool equal_single_mb_groups = group_work > 36;
+      for (size_t group = 0;
+           equal_single_mb_groups && group + 1 < tiles->work_prefix.size();
+           ++group) {
+        equal_single_mb_groups =
+            tiles->work_prefix[group + 1] - tiles->work_prefix[group] ==
+            group_work;
+      }
+      if (equal_single_mb_groups) {
+        int64_t n0 = int64_t(n) * tid / team.size();
+        int64_t n1 = int64_t(n) * (tid + 1) / team.size();
+        try {
+          f(0, m, n0, n1);
+        } catch (...) {
+          team.fail(std::current_exception());
+        }
+        team.sync();
+        team.check();
+        return;
+      }
+    }
+    if (tiles && m == static_cast<int>(tiles->work_prefix.size()) - 1 &&
+        n >= team.size() && tiles->work_prefix.size() - 1 <= team.size()) {
+      int64_t total = tiles->work_prefix.back() * n;
+      int64_t begin = (total * tid + team.size() - 1) / team.size();
+      int64_t end = (total * (tid + 1) + team.size() - 1) / team.size();
+      try {
+        for (size_t group = 0; group + 1 < tiles->work_prefix.size(); ++group) {
+          int64_t base = tiles->work_prefix[group] * n;
+          int64_t limit = tiles->work_prefix[group + 1] * n;
+          if (limit <= begin || base >= end) continue;
+          int64_t weight =
+              tiles->work_prefix[group + 1] - tiles->work_prefix[group];
+          int64_t first =
+              (std::max(int64_t(0), begin - base) + weight - 1) / weight;
+          int64_t last = std::min(
+              int64_t(n),
+              (std::max(int64_t(0), end - base) + weight - 1) / weight);
+          if (first < last)
+            f(tiles->block_offsets[group], tiles->block_offsets[group + 1],
+              first, last);
+        }
+      } catch (...) {
+        team.fail(std::current_exception());
+      }
+      team.sync();
+      team.check();
+      return;
+    }
+    // Retain the original rectangle decomposition for larger expert queues.
     int tm = std::max(1, int(std::ceil(std::sqrt(float(m) / n * team.size()))));
     tm = std::min(tm, team.size());
     while (team.size() % tm) --tm;
@@ -273,6 +363,7 @@ struct Replica {
   LocalBuffer shard_w1, shard_w2, shard_s1, shard_s2;
   int64_t shard_n = 0, shard_begin = -1;
   std::vector<int32_t> slots, sorted, experts, offsets;
+  ExpertTiles tiles;
   double dispatch_ms = 0, expert_ms = 0, gather_ms = 0, total_ms = 0;
   int64_t padded = 0;
 };
@@ -281,7 +372,9 @@ struct Pool {
   std::mutex mutex;
   std::atomic<int> controller_cpu{-1};
   std::vector<int64_t> cpus, nodes;
+  std::array<LocalBuffer, 3> team_storage;
   std::array<Scratch, 3> scratch;
+  std::array<Scratch, 3> large_scratch;
   std::array<std::shared_ptr<Team>, 3> teams;
 };
 std::mutex pool_registry_mutex;
@@ -300,21 +393,16 @@ std::shared_ptr<Pool> acquire_pool(const std::vector<int64_t>& cpus,
   pool->nodes = nodes;
   pool->controller_cpu.store(sched_getcpu(), std::memory_order_relaxed);
   for (int i = 0; i < 3; ++i) {
-    pool->teams[i] = std::make_shared<Team>(
-        std::vector<int64_t>(cpus.begin() + i * threads,
-                             cpus.begin() + (i + 1) * threads),
-        pool->controller_cpu);
+    pool->team_storage[i].reserve(sizeof(Team), nodes[i]);
+    auto* team = new (pool->team_storage[i].ptr<Team>())
+        Team(std::vector<int64_t>(cpus.begin() + i * threads,
+                                  cpus.begin() + (i + 1) * threads),
+             pool->controller_cpu);
+    pool->teams[i] = std::shared_ptr<Team>(team, [](Team* t) { t->~Team(); });
     pool->teams[i]->check();
   }
   shared_pool = pool;
   return pool;
-}
-
-at::Tensor longs(const std::vector<int64_t>& values) {
-  return at::tensor(values, at::TensorOptions().dtype(at::kLong));
-}
-at::Tensor doubles(const std::vector<double>& values) {
-  return at::tensor(values, at::TensorOptions().dtype(at::kDouble));
 }
 
 void sum_rows(BF16* output, const BF16* const* rows, int64_t topk, int64_t K) {
@@ -342,6 +430,19 @@ void sum_rows(BF16* output, const BF16* const* rows, int64_t topk, int64_t K) {
   }
 }
 
+struct CallStats {
+  std::vector<int64_t> logical_counts, physical_counts;
+  std::vector<int> active_experts;
+  std::vector<int64_t> scratch_pages, scratch_addresses, shard_pages;
+  std::array<int64_t, 3> intermediate_slices{};
+  std::vector<double> node_ms;
+  std::array<double, 5> phase_ms{};
+  std::array<double, 3> predicted_load{};
+  int64_t splits = 0, padded_rows = 0;
+  int64_t M = 0, slots = 0, physical_slots = 0;
+  bool sharded = false, dynamic = false, calibrated = false;
+};
+
 struct Runtime {
   int64_t E, N, K, bn, bk;
   std::mutex mutex;
@@ -354,8 +455,118 @@ struct Runtime {
   std::array<std::vector<double>, 3> single_costs, batch_costs;
   std::vector<int64_t> calibration_groups;
   c10::Dict<std::string, at::Tensor> stats;
+  CallStats last_call_stats;
+  CallStats working_call_stats;
+  std::vector<int> active_experts;
+  std::vector<int64_t> expert_order;
+  std::vector<double> expert_estimates;
   std::vector<const BF16*> contribution_rows;
+  std::atomic<int> completed_nodes{0};
+  std::atomic<bool> combine_ready{false}, combine_failed{false};
+  Clock::time_point combine_start;
+  double fused_combine_ms = 0;
   bool sharded = false;
+  bool has_stats = false;
+  std::vector<int64_t> weight_pages, weight_addresses;
+  std::vector<std::vector<int32_t>> logical;
+  std::array<std::vector<std::vector<int32_t>>, 3> groups;
+
+  template <class T>
+  at::Tensor reuse_stat(const std::string& name, const std::vector<T>& values) {
+    auto found = stats.find(name);
+    at::Tensor value;
+    if (found != stats.end() &&
+        found->value().numel() == static_cast<int64_t>(values.size()))
+      value = found->value();
+    else
+      value =
+          at::empty({static_cast<int64_t>(values.size())},
+                    at::TensorOptions().dtype(
+                        std::is_same_v<T, int64_t> ? at::kLong : at::kDouble));
+    std::copy(values.begin(), values.end(), value.data_ptr<T>());
+    return value;
+  }
+
+  void materialize_stats() {
+    if (!has_stats) return;
+    const auto& call = last_call_stats;
+    auto phase_ms =
+        std::vector<double>(call.phase_ms.begin(), call.phase_ms.end());
+    auto intermediate_slices = std::vector<int64_t>(
+        call.intermediate_slices.begin(), call.intermediate_slices.end());
+    stats.insert("logical_counts",
+                 reuse_stat<int64_t>("logical_counts", call.logical_counts));
+    stats.insert("physical_counts",
+                 reuse_stat<int64_t>("physical_counts", call.physical_counts)
+                     .reshape({3, E}));
+    stats.insert("split_groups",
+                 reuse_stat<int64_t>("split_groups", {call.splits}).squeeze());
+    stats.insert(
+        "padded_rows",
+        reuse_stat<int64_t>("padded_rows", {call.padded_rows}).squeeze());
+    stats.insert("phase_ms", reuse_stat<double>("phase_ms", phase_ms));
+    stats.insert("node_ms", reuse_stat<double>("node_ms", call.node_ms));
+    stats.insert("weight_pages",
+                 reuse_stat<int64_t>("weight_pages", weight_pages));
+    stats.insert("weight_addresses",
+                 reuse_stat<int64_t>("weight_addresses", weight_addresses)
+                     .reshape({3, 4}));
+    stats.insert("numa_nodes", reuse_stat<int64_t>("numa_nodes", pool->nodes));
+    stats.insert("worker_cpus", reuse_stat<int64_t>("worker_cpus", pool->cpus));
+    stats.insert("scratch_pages",
+                 reuse_stat<int64_t>("scratch_pages", call.scratch_pages));
+    stats.insert(
+        "scratch_addresses",
+        reuse_stat<int64_t>("scratch_addresses", call.scratch_addresses)
+            .reshape({3, 9}));
+    stats.insert("shard_pages",
+                 reuse_stat<int64_t>("shard_pages", call.shard_pages));
+    stats.insert(
+        "intermediate_slices",
+        reuse_stat<int64_t>("intermediate_slices", intermediate_slices));
+    stats.insert("dispatch_bytes",
+                 reuse_stat<int64_t>("dispatch_bytes",
+                                     {call.physical_slots * (K * 2 + 4)})
+                     .squeeze());
+    stats.insert("result_bytes",
+                 reuse_stat<int64_t>(
+                     "result_bytes",
+                     {call.sharded ? call.M * K * 2 *
+                                         (call.physical_slots /
+                                          std::max<int64_t>(call.slots, 1))
+                                   : call.slots * K * 2})
+                     .squeeze());
+    std::vector<int64_t> empty_rows;
+    const auto& calibrated_rows = call.calibrated ? cost_rows : empty_rows;
+    stats.insert_or_assign(
+        "calibrated_rows",
+        reuse_stat<int64_t>("calibrated_rows", calibrated_rows));
+    if (call.dynamic) {
+      auto predicted_load = std::vector<double>(call.predicted_load.begin(),
+                                                call.predicted_load.end());
+      stats.insert("predicted_node_ms",
+                   reuse_stat<double>("predicted_node_ms", predicted_load));
+    } else {
+      (void)stats.erase("predicted_node_ms");
+    }
+    if (call.calibrated) {
+      stats.insert(
+          "fixed_node_ms",
+          reuse_stat<double>("fixed_node_ms",
+                             {fixed_cost[0], fixed_cost[1], fixed_cost[2]}));
+      stats.insert(
+          "calibration_group_counts",
+          reuse_stat<int64_t>("calibration_group_counts", calibration_groups));
+      for (auto entry : {std::pair{"cost_ms", &costs},
+                         std::pair{"calibration_single_ms", &single_costs},
+                         std::pair{"calibration_batch_ms", &batch_costs}}) {
+        std::vector<double> all;
+        for (auto& c : *entry.second) all.insert(all.end(), c.begin(), c.end());
+        stats.insert(entry.first,
+                     reuse_stat<double>(entry.first, all).reshape({3, -1}));
+      }
+    }
+  }
 
   Runtime(const at::Tensor& w1, const at::Tensor& w2, const at::Tensor& s1,
           const at::Tensor& s2, const std::vector<int64_t>& cpus,
@@ -366,6 +577,20 @@ struct Runtime {
         K(w1.size(2)),
         bn(block_n),
         bk(block_k) {
+    expert_order.reserve(E);
+    active_experts.reserve(E);
+    expert_estimates.resize(E, 0);
+    for (auto* call : {&last_call_stats, &working_call_stats}) {
+      call->logical_counts.resize(E);
+      call->physical_counts.resize(3 * E);
+      call->active_experts.reserve(E);
+      call->node_ms.reserve(3);
+      call->scratch_pages.reserve(3);
+      call->scratch_addresses.reserve(27);
+      call->shard_pages.reserve(3);
+    }
+    logical.resize(E);
+    for (auto& g : groups) g.resize(E);
     pool = acquire_pool(cpus, nodes, threads);
     std::lock_guard pool_lock(pool->mutex);
     for (auto& team : pool->teams) team->check();
@@ -390,6 +615,14 @@ struct Runtime {
       });
     }
     wait_all();
+    weight_pages.reserve(3);
+    weight_addresses.reserve(12);
+    for (auto& r : replicas) {
+      weight_pages.push_back(r.w1.pages() + r.w2.pages() + r.s1.pages() +
+                             r.s2.pages());
+      for (auto* b : {&r.w1, &r.w2, &r.s1, &r.s2})
+        weight_addresses.push_back(reinterpret_cast<int64_t>(b->ptr<char>()));
+    }
   }
 
   void wait_all() {
@@ -404,15 +637,16 @@ struct Runtime {
     if (error) std::rethrow_exception(error);
   }
 
-  void prepare(Replica& r) {
+  void prepare(Replica& r, bool use_large_scratch, bool staged_inputs) {
     auto& scratch = *r.scratch;
     int64_t rows = r.slots.size(), threads = r.team->size();
     int64_t width = sharded ? r.shard_n : N;
     auto reserve = [&](LocalBuffer& b, int64_t bytes) {
-      b.reserve(bytes, r.node);
+      b.reserve(bytes, r.node, use_large_scratch);
     };
-    reserve(scratch.input, rows * K * sizeof(BF16));
-    reserve(scratch.weights, rows * sizeof(float));
+    if (sharded || staged_inputs)
+      reserve(scratch.input, rows * K * sizeof(BF16));
+    if (sharded) reserve(scratch.weights, rows * sizeof(float));
     reserve(scratch.ic0, rows * 2 * width * sizeof(BF16));
     reserve(scratch.ic1, rows * width * sizeof(BF16));
     reserve(scratch.ic2, rows * K * sizeof(BF16));
@@ -484,77 +718,147 @@ struct Runtime {
     for (int n = 0; n < 3; ++n) replicas[n].shard_n = widths[n];
   }
 
-  void run(const at::Tensor& hidden, const at::Tensor& weights, int64_t topk) {
+  void run(const at::Tensor& hidden, const at::Tensor& weights, int64_t topk,
+           BF16* combined_output = nullptr) {
+    const bool combine_output = combined_output && !sharded;
+    completed_nodes.store(0, std::memory_order_relaxed);
+    combine_ready.store(false, std::memory_order_relaxed);
+    combine_failed.store(false, std::memory_order_relaxed);
     pool->controller_cpu.store(sched_getcpu(), std::memory_order_relaxed);
     for (auto& r : replicas) r.team->check();
+    const bool use_large_scratch = !sharded && hidden.size(0) > 128;
+    bool staged_inputs = use_large_scratch;
+    if (!sharded && !use_large_scratch) {
+      bool has_group = false;
+      bool all_groups_large = true;
+      for (const auto& r : replicas) {
+        const auto& prefix = r.tiles.work_prefix;
+        for (size_t group = 0; group + 1 < prefix.size(); ++group) {
+          has_group = true;
+          if (prefix[group + 1] - prefix[group] <= 32 + 4) {
+            all_groups_large = false;
+            break;
+          }
+        }
+        if (!all_groups_large) break;
+      }
+      staged_inputs = has_group && all_groups_large;
+    }
+    auto& scratch_set = use_large_scratch ? pool->large_scratch : pool->scratch;
+    for (size_t i = 0; i < replicas.size(); ++i)
+      replicas[i].scratch = &scratch_set[i];
     if (!sharded) contribution_rows.resize(hidden.size(0) * topk);
     // Allocation is outside worker barriers, so an allocation failure cannot
     // strand other team members inside a stage.
     try {
       for (auto& r : replicas)
-        if (!r.slots.empty()) prepare(r);
+        if (!r.slots.empty()) prepare(r, use_large_scratch, staged_inputs);
     } catch (...) {
       auto error = std::current_exception();
       for (auto& r : replicas) r.team->fail(error);
       throw;
     }
+    const bool direct = !sharded;
+    if (direct)
+      for (auto& r : replicas)
+        for (size_t row = 0; row < r.slots.size(); ++row)
+          contribution_rows[r.slots[row]] =
+              r.scratch->ic2.ptr<BF16>() + row * K;
     for (auto& r : replicas) {
       r.dispatch_ms = r.expert_ms = r.gather_ms = r.total_ms = 0;
       r.team->submit([&, rp = &r](int tid) {
-        auto& local = *rp;
-        auto& scratch = *local.scratch;
-        if (local.slots.empty()) return;
-        Executor executor(*local.team, tid, sharded);
-        int64_t width = sharded ? local.shard_n : N;
-        auto start = Clock::now();
-        executor.for_1d(local.slots.size(), [&](int64_t b, int64_t e) {
-          for (int64_t row = b; row < e; ++row) {
-            int slot = local.slots[row];
-            copy_stub(scratch.input.ptr<BF16>() + row * K,
-                      hidden.data_ptr<BF16>() + (slot / topk) * K, K);
-            scratch.weights.ptr<float>()[row] = weights.data_ptr<float>()[slot];
-            if (!sharded)
-              contribution_rows[slot] = scratch.ic2.ptr<BF16>() + row * K;
+        try {
+          auto& local = *rp;
+          auto& scratch = *local.scratch;
+          if (!local.slots.empty()) {
+            Executor executor(*local.team, tid, sharded, &local.tiles,
+                              direct ? local.slots.data() : nullptr, topk,
+                              staged_inputs);
+            int64_t width = sharded ? local.shard_n : N;
+            auto start = Clock::now();
+            if (staged_inputs || !direct)
+              executor.for_1d(local.slots.size(), [&](int64_t b, int64_t e) {
+                for (int64_t row = b; row < e; ++row) {
+                  int slot = local.slots[row];
+                  copy_stub(scratch.input.ptr<BF16>() + row * K,
+                            hidden.data_ptr<BF16>() + (slot / topk) * K, K);
+                  if (!direct)
+                    scratch.weights.ptr<float>()[row] =
+                        weights.data_ptr<float>()[slot];
+                }
+              });
+            if (tid == 0)
+              local.dispatch_ms = direct && !staged_inputs ? 0 : ms(start);
+            start = Clock::now();
+            fused_experts_fp_kernel_impl<BF16, at::Float8_e4m3fn, float, false>(
+                scratch.output.ptr<BF16>(), scratch.ic0.ptr<BF16>(),
+                scratch.ic1.ptr<BF16>(), scratch.ic2.ptr<BF16>(),
+                scratch.a_tmp.ptr<BF16>(), scratch.b_tmp.ptr<BF16>(),
+                scratch.c_tmp.ptr<float>(),
+                direct && !staged_inputs ? hidden.data_ptr<BF16>()
+                                         : scratch.input.ptr<BF16>(),
+                (sharded ? local.shard_w1 : local.w1).ptr<at::Float8_e4m3fn>(),
+                (sharded ? local.shard_w2 : local.w2).ptr<at::Float8_e4m3fn>(),
+                nullptr, nullptr,
+                (sharded ? local.shard_s1 : local.s1).ptr<float>(),
+                (sharded ? local.shard_s2 : local.s2).ptr<float>(), bn, bk,
+                direct ? weights.data_ptr<float>()
+                       : scratch.weights.ptr<float>(),
+                local.sorted.data(), local.experts.data(), local.offsets.data(),
+                local.slots.size(), width, K, E, 1, local.sorted.size(), 0, 0,
+                CPUActMethod::silu_and_mul, false, &executor);
+            if (tid == 0) local.expert_ms = ms(start);
+            start = Clock::now();
+            if (sharded) {
+              executor.for_1d(local.slots.size(), [&](int64_t b, int64_t e) {
+                for (int64_t row = b; row < e; ++row)
+                  copy_stub(scratch.ic2.ptr<BF16>() + local.slots[row] * K,
+                            scratch.output.ptr<BF16>() + row * K, K);
+              });
+              executor.for_1d(hidden.size(0), [&](int64_t b, int64_t e) {
+                for (int64_t token = b; token < e; ++token)
+                  sum_stub(scratch.input.ptr<BF16>() + token * K,
+                           scratch.ic2.ptr<BF16>() + token * topk * K, topk, K);
+              });
+            }
+            if (tid == 0) {
+              local.gather_ms = sharded ? ms(start) : 0;
+              local.total_ms =
+                  local.dispatch_ms + local.expert_ms + local.gather_ms;
+            }
           }
-        });
-        if (tid == 0) local.dispatch_ms = ms(start);
-        start = Clock::now();
-        fused_experts_fp_kernel_impl<BF16, at::Float8_e4m3fn, float, false>(
-            scratch.output.ptr<BF16>(), scratch.ic0.ptr<BF16>(),
-            scratch.ic1.ptr<BF16>(), scratch.ic2.ptr<BF16>(),
-            scratch.a_tmp.ptr<BF16>(), scratch.b_tmp.ptr<BF16>(),
-            scratch.c_tmp.ptr<float>(), scratch.input.ptr<BF16>(),
-            (sharded ? local.shard_w1 : local.w1).ptr<at::Float8_e4m3fn>(),
-            (sharded ? local.shard_w2 : local.w2).ptr<at::Float8_e4m3fn>(),
-            nullptr, nullptr,
-            (sharded ? local.shard_s1 : local.s1).ptr<float>(),
-            (sharded ? local.shard_s2 : local.s2).ptr<float>(), bn, bk,
-            scratch.weights.ptr<float>(), local.sorted.data(),
-            local.experts.data(), local.offsets.data(), local.slots.size(),
-            width, K, E, 1, local.sorted.size(), 0, 0,
-            CPUActMethod::silu_and_mul, false, &executor);
-        if (tid == 0) local.expert_ms = ms(start);
-        start = Clock::now();
-        if (sharded) {
-          executor.for_1d(local.slots.size(), [&](int64_t b, int64_t e) {
-            for (int64_t row = b; row < e; ++row)
-              copy_stub(scratch.ic2.ptr<BF16>() + local.slots[row] * K,
-                        scratch.output.ptr<BF16>() + row * K, K);
-          });
-          executor.for_1d(hidden.size(0), [&](int64_t b, int64_t e) {
-            for (int64_t token = b; token < e; ++token)
-              sum_stub(scratch.input.ptr<BF16>() + token * K,
-                       scratch.ic2.ptr<BF16>() + token * topk * K, topk, K);
-          });
-        }
-        if (tid == 0) {
-          local.gather_ms = sharded ? ms(start) : 0;
-          local.total_ms =
-              local.dispatch_ms + local.expert_ms + local.gather_ms;
+          if (combine_output) {
+            // Publish only after every node has finished reading its inputs.
+            if (tid == 0 &&
+                completed_nodes.fetch_add(1, std::memory_order_acq_rel) == 2) {
+              combine_start = Clock::now();
+              combine_ready.store(true, std::memory_order_release);
+            }
+            while (!combine_ready.load(std::memory_order_acquire)) _mm_pause();
+            if (combine_failed.load(std::memory_order_acquire)) return;
+            int node = &local - replicas.data();
+            int64_t begin = hidden.size(0) <= 32
+                                ? (node == 0 ? 0 : hidden.size(0))
+                                : hidden.size(0) * node / 3;
+            int64_t end = hidden.size(0) <= 32
+                              ? hidden.size(0)
+                              : hidden.size(0) * (node + 1) / 3;
+            for (int64_t token = begin + tid; token < end;
+                 token += local.team->size())
+              sum_rows(combined_output + token * K,
+                       contribution_rows.data() + token * topk, topk, K);
+          }
+        } catch (...) {
+          if (combine_output) {
+            combine_failed.store(true, std::memory_order_release);
+            combine_ready.store(true, std::memory_order_release);
+          }
+          throw;
         }
       });
     }
     wait_all();
+    fused_combine_ms = combine_output ? ms(combine_start) : 0;
   }
 
   double cost(int node, int64_t rows) const {
@@ -575,7 +879,8 @@ struct Runtime {
     return costs[node][j - 1] * (1 - f) + costs[node][j] * f;
   }
 
-  void group(const std::array<std::vector<std::vector<int32_t>>, 3>& groups) {
+  void group(const std::array<std::vector<std::vector<int32_t>>, 3>& groups,
+             const std::vector<int>& active) {
     for (int node = 0; node < 3; ++node) {
       auto& r = replicas[node];
       r.slots.clear();
@@ -584,7 +889,11 @@ struct Runtime {
       r.offsets.clear();
       r.offsets.push_back(0);
       r.padded = 0;
-      for (int expert = 0; expert < E; ++expert) {
+      r.tiles.block_offsets.clear();
+      r.tiles.block_offsets.push_back(0);
+      r.tiles.work_prefix.clear();
+      r.tiles.work_prefix.push_back(0);
+      for (int expert : active) {
         const auto& slots = groups[node][expert];
         for (size_t begin = 0; begin < slots.size(); begin += 32) {
           int count = std::min<size_t>(32, slots.size() - begin);
@@ -597,6 +906,11 @@ struct Runtime {
           r.sorted.insert(r.sorted.end(), 32 - count, -1);
           r.padded += 32 - count;
           r.offsets.push_back(r.slots.size());
+        }
+        if (!slots.empty()) {
+          r.tiles.block_offsets.push_back(r.experts.size());
+          r.tiles.work_prefix.push_back(r.tiles.work_prefix.back() +
+                                        slots.size() + 32);
         }
       }
     }
@@ -617,27 +931,49 @@ struct Runtime {
         "Calibrate before dynamic scheduling");
     int64_t M = hidden.size(0), topk = ids.size(1), slots = M * topk;
     TORCH_CHECK(slots <= INT32_MAX, "Too many routed slots");
-    std::vector<std::vector<int32_t>> logical(E);
+    auto& working = working_call_stats;
+    for (int expert : active_experts) {
+      logical[expert].clear();
+      expert_estimates[expert] = 0;
+      for (auto& node_groups : groups) node_groups[expert].clear();
+    }
+    active_experts.clear();
+    for (int expert : working.active_experts) {
+      working.logical_counts[expert] = 0;
+      for (int node = 0; node < 3; ++node)
+        working.physical_counts[node * E + expert] = 0;
+    }
+    working.active_experts.clear();
+    const int32_t* route_ids = ids.data_ptr<int32_t>();
     for (int32_t slot = 0; slot < slots; ++slot) {
-      int expert = ids.data_ptr<int32_t>()[slot];
+      int expert = route_ids[slot];
       TORCH_CHECK(expert >= 0 && expert < E, "Invalid logical expert ID");
+      if (logical[expert].empty()) {
+        active_experts.push_back(expert);
+      }
       logical[expert].push_back(slot);
     }
-    std::array<std::vector<std::vector<int32_t>>, 3> groups;
-    for (auto& g : groups) g.resize(E);
-    std::vector<int64_t> order, logical_counts(E), physical_counts(3 * E);
-    std::vector<double> estimates(E);
+    std::sort(active_experts.begin(), active_experts.end());
+    working.active_experts.assign(active_experts.begin(), active_experts.end());
+
+    auto& order = expert_order;
+    auto& estimates = expert_estimates;
+    order.assign(active_experts.begin(), active_experts.end());
+    working.node_ms.clear();
+    working.scratch_pages.clear();
+    working.scratch_addresses.clear();
+    working.shard_pages.clear();
     bool dynamic = policy == "balanced" || policy == "split";
-    for (int e = 0; e < E; ++e) {
-      logical_counts[e] = logical[e].size();
-      if (!logical[e].empty()) order.push_back(e);
+    for (int e : active_experts) {
+      working.logical_counts[e] = logical[e].size();
       if (dynamic)
         for (int n = 0; n < 3; ++n)
           estimates[e] = std::max(estimates[e], cost(n, logical[e].size()));
     }
     if (dynamic)
-      std::stable_sort(order.begin(), order.end(), [&](int a, int b) {
-        return estimates[a] > estimates[b];
+      std::sort(order.begin(), order.end(), [&](int a, int b) {
+        if (estimates[a] != estimates[b]) return estimates[a] > estimates[b];
+        return a < b;
       });
     auto& previous = history[{layer, policy}];
     if (previous.empty()) previous.assign(E, -1);
@@ -744,10 +1080,14 @@ struct Runtime {
         groups[owner][expert].clear();
         size_t begin = 0;
         std::array<int, 3> placement_order{0, 1, 2};
-        std::stable_sort(placement_order.begin(), placement_order.end(),
-                         [&](int a, int b) {
-                           return best_rows[a] % 32 < best_rows[b] % 32;
-                         });
+        std::sort(placement_order.begin(), placement_order.end(),
+                  [&](int a, int b) {
+                    auto remainder_a = best_rows[a] % 32;
+                    auto remainder_b = best_rows[b] % 32;
+                    if (remainder_a != remainder_b)
+                      return remainder_a < remainder_b;
+                    return a < b;
+                  });
         for (int n : placement_order) {
           auto count = best_rows[n];
           groups[n][expert].assign(tokens.begin() + begin,
@@ -760,21 +1100,143 @@ struct Runtime {
         ++splits;
         previous[expert] = -1;
       }
+      if (splits == 0 && order.size() <= 8) {
+        const double unsplit = *std::max_element(load.begin(), load.end());
+        std::array<int, 3> representatives{-1, -1, -1};
+        int representative_count = 0;
+        for (int n = 0; n < 3; ++n) {
+          if (load[n] <= unsplit * 0.95) continue;
+          double largest_removal = -1;
+          for (int expert : order) {
+            const auto& tokens = logical[expert];
+            if (tokens.size() <= 32 || previous[expert] != n) continue;
+            double removal = cost(n, tokens.size()) +
+                             (group_counts[n] == 1 ? fixed_cost[n] : 0);
+            if (removal > largest_removal ||
+                (removal == largest_removal &&
+                 (representatives[n] < 0 || expert < representatives[n]))) {
+              representatives[n] = expert;
+              largest_removal = removal;
+            }
+          }
+          if (representatives[n] >= 0) ++representative_count;
+        }
+
+        double best_joint_load = std::numeric_limits<double>::infinity();
+        std::array<int, 2> best_experts{-1, -1};
+        std::array<std::array<int64_t, 3>, 2> best_rows{};
+        std::array<double, 3> best_joint_node_load{};
+        for (int first_node = 0; first_node < 3; ++first_node) {
+          if (representatives[first_node] < 0) continue;
+          for (int second_node = first_node + 1; second_node < 3;
+               ++second_node) {
+            if (representatives[second_node] < 0) continue;
+            std::array<int, 2> pair{representatives[first_node],
+                                    representatives[second_node]};
+            for (int orientation = 0; orientation < 2; ++orientation) {
+              std::array<int, 2> experts =
+                  orientation == 0 ? pair
+                                   : std::array<int, 2>{pair[1], pair[0]};
+              auto base_load = load;
+              auto base_counts = group_counts;
+              for (int expert : experts) {
+                int owner = previous[expert];
+                base_load[owner] -= cost(owner, logical[expert].size());
+                if (--base_counts[owner] == 0) base_load[owner] = 0;
+              }
+
+              std::array<std::array<int64_t, 3>, 2> trial_rows{};
+              std::array<double, 3> assigned_cost{};
+              for (int group = 0; group < 2; ++group) {
+                const auto& tokens = logical[experts[group]];
+                for (size_t row = 0; row < tokens.size(); row += 32) {
+                  int count = std::min<size_t>(32, tokens.size() - row);
+                  int target = -1;
+                  double finish = std::numeric_limits<double>::infinity();
+                  for (int n = 0; n < 3; ++n) {
+                    int64_t current_rows = trial_rows[group][n];
+                    double candidate =
+                        base_load[n] + assigned_cost[n] -
+                        cost(n, current_rows) + cost(n, current_rows + count) +
+                        (base_counts[n] == 0 ? fixed_cost[n] : 0);
+                    if (candidate < finish) {
+                      finish = candidate;
+                      target = n;
+                    }
+                  }
+                  int64_t old_rows = trial_rows[group][target];
+                  trial_rows[group][target] += count;
+                  assigned_cost[target] +=
+                      cost(target, trial_rows[group][target]) -
+                      cost(target, old_rows);
+                }
+              }
+
+              bool both_split = true;
+              for (int group = 0; group < 2; ++group) {
+                int active_nodes = 0;
+                for (int n = 0; n < 3; ++n)
+                  active_nodes += trial_rows[group][n] > 0;
+                both_split = both_split && active_nodes > 1;
+              }
+              if (!both_split) continue;
+              auto trial_load = base_load;
+              for (int n = 0; n < 3; ++n) {
+                trial_load[n] += assigned_cost[n];
+                if (base_counts[n] == 0 &&
+                    (trial_rows[0][n] > 0 || trial_rows[1][n] > 0))
+                  trial_load[n] += fixed_cost[n];
+              }
+              double candidate =
+                  *std::max_element(trial_load.begin(), trial_load.end());
+              if (candidate < best_joint_load) {
+                best_joint_load = candidate;
+                best_experts = experts;
+                best_rows = trial_rows;
+                best_joint_node_load = trial_load;
+              }
+            }
+          }
+        }
+        if (representative_count >= 2 && best_joint_load <= unsplit * 0.95) {
+          for (int group = 0; group < 2; ++group) {
+            int expert = best_experts[group];
+            const auto& tokens = logical[expert];
+            int owner = previous[expert];
+            groups[owner][expert].clear();
+            --group_counts[owner];
+            size_t begin = 0;
+            std::array<int, 3> placement_order{0, 1, 2};
+            std::sort(placement_order.begin(), placement_order.end(),
+                      [&](int a, int b) {
+                        auto a_tail = best_rows[group][a] % 32;
+                        auto b_tail = best_rows[group][b] % 32;
+                        return a_tail != b_tail ? a_tail < b_tail : a < b;
+                      });
+            for (int n : placement_order) {
+              auto count = best_rows[group][n];
+              groups[n][expert].assign(tokens.begin() + begin,
+                                       tokens.begin() + begin + count);
+              begin += count;
+              group_counts[n] += count > 0;
+            }
+            previous[expert] = -1;
+          }
+          load = best_joint_node_load;
+          splits += 2;
+        }
+      }
     }
     for (int n = 0; n < 3; ++n)
-      for (int e = 0; e < E; ++e)
-        physical_counts[n * E + e] = groups[n][e].size();
-    group(groups);
+      for (int e : active_experts)
+        working.physical_counts[n * E + e] = groups[n][e].size();
+    group(groups, active_experts);
     auto scheduling_ms = ms(start);
-    run(hidden, weights, topk);
+    run(hidden, weights, topk, sharded ? nullptr : output.data_ptr<BF16>());
     auto combine = Clock::now();
     // No floating-point scatter-add: restore the original top-k-slot order.
     // All input reads have finished, including when output aliases input.
-    if (!sharded && M <= 32) {
-      for (int64_t token = 0; token < M; ++token)
-        sum_rows(output.data_ptr<BF16>() + token * K,
-                 contribution_rows.data() + token * topk, topk, K);
-    } else {
+    if (sharded) {
       for (int node = 0; node < 3; ++node) {
         auto& r = replicas[node];
         int64_t begin = M * node / 3, end = M * (node + 1) / 3;
@@ -783,11 +1245,6 @@ struct Runtime {
           executor.for_1d(end - begin, [&](int64_t b, int64_t e) {
             for (int64_t token = begin + b; token < begin + e; ++token) {
               auto* destination = output.data_ptr<BF16>() + token * K;
-              if (!sharded) {
-                sum_rows(destination, contribution_rows.data() + token * topk,
-                         topk, K);
-                continue;
-              }
               using bVec = at::vec::Vectorized<BF16>;
               using fVec = at::vec::Vectorized<float>;
               for (int64_t channel = 0; channel < K; channel += bVec::size()) {
@@ -808,80 +1265,46 @@ struct Runtime {
       }
       wait_all();
     }
-    double combine_ms = ms(combine);
-    std::vector<double> node_ms;
+    double combine_ms = sharded ? ms(combine) : fused_combine_ms;
     double dispatch = 0, expert = 0, gather = 0;
     int64_t padded = 0;
-    std::vector<int64_t> pages;
-    std::vector<int64_t> addresses, scratch_pages, shard_pages;
-    std::vector<int64_t> scratch_addresses;
     for (auto& r : replicas) {
       auto& scratch = *r.scratch;
-      node_ms.push_back(r.total_ms);
+      working.node_ms.push_back(r.total_ms);
       dispatch = std::max(dispatch, r.dispatch_ms);
       expert = std::max(expert, r.expert_ms);
       gather = std::max(gather, r.gather_ms);
       padded += r.padded;
-      pages.push_back(r.w1.pages() + r.w2.pages() + r.s1.pages() +
-                      r.s2.pages());
-      for (auto* b : {&r.w1, &r.w2, &r.s1, &r.s2})
-        addresses.push_back(reinterpret_cast<int64_t>(b->ptr<char>()));
-      scratch_pages.push_back(scratch.input.pages() + scratch.weights.pages() +
-                              scratch.ic0.pages() + scratch.ic1.pages() +
-                              scratch.ic2.pages() + scratch.output.pages() +
-                              scratch.a_tmp.pages() + scratch.b_tmp.pages() +
-                              scratch.c_tmp.pages());
+      working.scratch_pages.push_back(
+          scratch.input.pages() + scratch.weights.pages() +
+          scratch.ic0.pages() + scratch.ic1.pages() + scratch.ic2.pages() +
+          scratch.output.pages() + scratch.a_tmp.pages() +
+          scratch.b_tmp.pages() + scratch.c_tmp.pages());
       for (auto* b : {&scratch.input, &scratch.weights, &scratch.ic0,
                       &scratch.ic1, &scratch.ic2, &scratch.output,
                       &scratch.a_tmp, &scratch.b_tmp, &scratch.c_tmp})
-        scratch_addresses.push_back(reinterpret_cast<int64_t>(b->ptr<char>()));
-      shard_pages.push_back(r.shard_w1.pages() + r.shard_w2.pages() +
-                            r.shard_s1.pages() + r.shard_s2.pages());
+        working.scratch_addresses.push_back(
+            reinterpret_cast<int64_t>(b->ptr<char>()));
+      working.shard_pages.push_back(r.shard_w1.pages() + r.shard_w2.pages() +
+                                    r.shard_s1.pages() + r.shard_s2.pages());
     }
-    stats.clear();
-    stats.insert("logical_counts", longs(logical_counts));
-    stats.insert("physical_counts", longs(physical_counts).reshape({3, E}));
-    stats.insert("split_groups", longs({splits}).squeeze());
-    stats.insert("padded_rows", longs({padded}).squeeze());
-    stats.insert("phase_ms", doubles({scheduling_ms, dispatch, expert,
-                                      gather + combine_ms, ms(start)}));
-    stats.insert("node_ms", doubles(node_ms));
-    stats.insert("weight_pages", longs(pages));
-    stats.insert("weight_addresses", longs(addresses).reshape({3, 4}));
-    stats.insert("scratch_pages", longs(scratch_pages));
-    stats.insert("scratch_addresses", longs(scratch_addresses).reshape({3, 9}));
-    stats.insert("shard_pages", longs(shard_pages));
-    stats.insert("numa_nodes", longs(pool->nodes));
-    stats.insert("worker_cpus", longs(pool->cpus));
-    int64_t physical_slots = std::accumulate(physical_counts.begin(),
-                                             physical_counts.end(), int64_t(0));
-    stats.insert("intermediate_slices",
-                 longs({sharded ? replicas[0].shard_n : N,
-                        sharded ? replicas[1].shard_n : N,
-                        sharded ? replicas[2].shard_n : N}));
-    stats.insert("dispatch_bytes",
-                 longs({physical_slots * (K * 2 + 4)}).squeeze());
-    stats.insert(
-        "result_bytes",
-        longs({sharded
-                   ? M * K * 2 * (physical_slots / std::max<int64_t>(slots, 1))
-                   : slots * K * 2})
-            .squeeze());
-    stats.insert("calibrated_rows", longs(cost_rows));
-    if (dynamic)
-      stats.insert("predicted_node_ms", doubles({load[0], load[1], load[2]}));
-    if (!cost_rows.empty()) {
-      stats.insert("fixed_node_ms",
-                   doubles({fixed_cost[0], fixed_cost[1], fixed_cost[2]}));
-      stats.insert("calibration_group_counts", longs(calibration_groups));
-      for (auto entry : {std::pair{"cost_ms", &costs},
-                         std::pair{"calibration_single_ms", &single_costs},
-                         std::pair{"calibration_batch_ms", &batch_costs}}) {
-        std::vector<double> all;
-        for (auto& c : *entry.second) all.insert(all.end(), c.begin(), c.end());
-        stats.insert(entry.first, doubles(all).reshape({3, -1}));
-      }
-    }
+    int64_t physical_slots = 0;
+    for (const auto& r : replicas) physical_slots += r.slots.size();
+    for (size_t node = 0; node < replicas.size(); ++node)
+      working.intermediate_slices[node] = sharded ? replicas[node].shard_n : N;
+    working.phase_ms = {scheduling_ms, dispatch, expert, gather + combine_ms,
+                        ms(start)};
+    working.predicted_load = load;
+    working.splits = splits;
+    working.padded_rows = padded;
+    working.M = M;
+    working.slots = slots;
+    working.physical_slots = physical_slots;
+    working.sharded = sharded;
+    working.dynamic = dynamic;
+    working.calibrated = !cost_rows.empty();
+    std::swap(last_call_stats, working_call_stats);
+    has_stats = true;
   }
 
   void calibrate(std::vector<int64_t> rows) {
@@ -893,6 +1316,8 @@ struct Runtime {
     rows.erase(std::unique(rows.begin(), rows.end()), rows.end());
     TORCH_CHECK(rows.front() > 0 && rows.back() <= INT32_MAX / 3,
                 "Invalid calibration rows");
+    std::vector<int> calibration_active;
+    calibration_active.reserve(E);
     for (auto count : rows) {
       int64_t batch =
           std::min<int64_t>({E, 64, std::max<int64_t>(1, 8192 / count)});
@@ -900,6 +1325,8 @@ struct Runtime {
                   "Too many calibration slots");
       calibration_groups.push_back(batch);
       for (int64_t experts : {int64_t(1), batch}) {
+        calibration_active.resize(experts);
+        std::iota(calibration_active.begin(), calibration_active.end(), 0);
         auto hidden = at::zeros({3 * experts * count, K},
                                 at::TensorOptions().dtype(at::kBFloat16));
         auto weights = at::ones({3 * experts * count},
@@ -911,7 +1338,7 @@ struct Runtime {
             for (int row = 0; row < count; ++row)
               groups[n][e].push_back((n * experts + e) * count + row);
         }
-        group(groups);
+        group(groups, calibration_active);
         run(hidden, weights, 1);
         std::array<std::vector<double>, 3> samples;
         for (int repeat = 0; repeat < 5; ++repeat) {
@@ -1066,6 +1493,7 @@ void cpu_numa_moe_execute(int64_t handle, const at::Tensor& hidden,
 
 c10::Dict<std::string, at::Tensor> cpu_numa_moe_stats(int64_t handle) {
   auto runtime = lookup(handle);
+  runtime->materialize_stats();
   c10::Dict<std::string, at::Tensor> result;
   for (auto& entry : runtime->stats)
     result.insert(entry.key(), entry.value().clone());

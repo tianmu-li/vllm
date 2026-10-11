@@ -3,10 +3,11 @@
 `benchmark_cpu_numa_moe.py` validates and times the experimental native
 `cpu_numa_moe` runtime. It does not capture model traffic, start a model server,
 or download checkpoint data. Supply an ordered offline replay and the raw
-block-FP8 weights for its MoE layers.
-It fails closed unless the checkout HEAD is
+block-FP8 weights for its MoE layers. It fails closed unless the checkout HEAD
+descends from the pinned source ancestor
 `c5a3a1389df9aae4be73bcac7b8eea6164af02c7` and the imported `vllm._C`
-extension resolves inside this checkout.
+extension resolves inside this checkout. Results record the exact HEAD and
+source diff hash.
 
 The runtime creation op receives one layer of VNNI-prepacked weights. The
 harness packs each layer with `_C.convert_weight_packed`, then creates a
@@ -51,7 +52,7 @@ Prepare checkpoint expert weights and fixed Sonnet token IDs, then capture from
 one TP1 reference runtime in a fresh directory:
 
 ```bash
-.venv/bin/python benchmarks/kernels/cpu/prepare_numa_moe_capture.py \
+uv run --no-sync .venv/bin/python -P benchmarks/kernels/cpu/prepare_numa_moe_capture.py \
   --output-dir /data/numa_run/inputs
 PYTHONPATH="$PWD" \
 LD_PRELOAD="/usr/lib/x86_64-linux-gnu/libtcmalloc_minimal.so.4:$PWD/.venv/lib/libiomp5.so" \
@@ -60,7 +61,7 @@ VLLM_CPU_OMP_THREADS_BIND=32-127 VLLM_CPU_NUM_OF_RESERVED_CPU=0 \
 OMP_NUM_THREADS=96 MKL_NUM_THREADS=96 OMP_WAIT_POLICY=ACTIVE \
 KMP_BLOCKTIME=5 KMP_TPAUSE=0 \
 KMP_AFFINITY='granularity=fine,explicit,proclist=[32-127]' \
-taskset -c 32-127 .venv/bin/python \
+taskset -c 32-127 uv run --no-sync .venv/bin/python -P \
   benchmarks/kernels/cpu/capture_cpu_numa_moe.py \
   --checkpoint /data/checkpoint --inputs /data/numa_run/inputs \
   --output-dir /data/numa_run/capture --max-batched-tokens 1152
@@ -184,7 +185,7 @@ export OMP_WAIT_POLICY=PASSIVE KMP_BLOCKTIME=0
 Freeze the corpus and checkpoint mapping before comparing policies:
 
 ```bash
-.venv/bin/python benchmarks/kernels/cpu/benchmark_cpu_numa_moe.py \
+uv run --no-sync .venv/bin/python -P benchmarks/kernels/cpu/benchmark_cpu_numa_moe.py \
   --corpus /data/qwen36_replay.pt \
   --weights /data/qwen36_moe_weights.pt \
   --freeze-manifest /data/qwen36_replay.freeze.json
@@ -206,7 +207,7 @@ aliasing, routing counts, isolated existing-op workers, and page placement. It
 writes provenance and correctness output, then exits without warmup or timing:
 
 ```bash
-.venv/bin/python benchmarks/kernels/cpu/benchmark_cpu_numa_moe.py \
+uv run --no-sync .venv/bin/python -P benchmarks/kernels/cpu/benchmark_cpu_numa_moe.py \
   --corpus /data/qwen36_replay.pt \
   --weights /data/qwen36_moe_weights.pt \
   --manifest /data/qwen36_replay.freeze.json \
@@ -219,7 +220,7 @@ writes provenance and correctness output, then exits without warmup or timing:
 Run all native policies and existing-operator controls on the frozen replay:
 
 ```bash
-uv run --no-sync .venv/bin/python benchmarks/kernels/cpu/benchmark_cpu_numa_moe.py \
+uv run --no-sync .venv/bin/python -P benchmarks/kernels/cpu/benchmark_cpu_numa_moe.py \
   --corpus /data/qwen36_replay.pt \
   --weights /data/qwen36_moe_weights.pt \
   --manifest /data/qwen36_replay.freeze.json \
@@ -251,18 +252,58 @@ The scheduler charges the fitted pipeline overhead once per active node, plus
 the per-group costs. Split trials run after whole-expert assignment and require
 at least a 5% reduction in the predicted complete queue makespan. Reports retain
 both calibration densities, single-group fit residuals, and prediction errors
-on the replay's mixed queues. These predictions cover inner node execution;
-complete-call timings also include launch, allocation, and final combine.
+on the replay's mixed queues. These predictions cover inner node execution.
+Complete-call timings also include launch, allocation, and final combine.
+Full-width calls above 128 tokens gather inputs once into node-local scratch.
+Smaller calls also stage inputs when every physical expert group has more than
+four rows; other calls gather directly into the existing per-thread GEMM input
+buffer. Dispatch records explicit staging, while direct gathering remains in
+the expert phase. Arithmetic and top-k reduction order are preserved. Small
+queues with one 32-row block per expert use column scheduling; larger queues
+retain rectangular scheduling. Small and large calls retain separate scratch
+buffers, with huge pages requested only for large full-width scratch.
+Scheduling and packing traverse active experts, clearing the previous call
+and statistics buffer's active entries before reuse.
 
-Synthetic diagnostics create token counts `1, 8, 32, 128, 512, 2048`, with
-uniform, Zipf-skewed, hot-eight, and changing-hot-eight routing. They still use
-the supplied layer weights. For example:
+Execution captures counters and phase times before returning. The statistics
+operation materializes diagnostic tensors from that latest-call snapshot and
+returns independent copies. Complete-call timing includes grouping, input
+movement, expert execution, and combine; diagnostic tensor materialization is
+outside that timer.
+
+Synthetic diagnostics default to token counts `1, 8, 32, 128, 512, 2048` and
+uniform, Zipf-skewed, hot-eight, and changing-hot-eight routing. The
+`--synthetic-token-counts` option accepts a comma-separated list of positive,
+unique token counts without changing the default. A broader diagnostic grid for
+small, boundary, and large calls is
+`1,2,3,4,5,6,7,8,32,128,129,256,512,1024,2048,4096`. Changing-hot-eight
+routing uses two ordered records per token count and changes the hot expert
+group between them.
+
+`--timing-repeats` defaults to 1. It repeats the entire ordered record sequence
+within each measured round, including controls, rather than timing isolated
+calls repeatedly. Each variant receives one untimed full-sequence warmup.
+Throughput and work counters include all repeated calls. The synthetic
+`synthetic_complete_call` report gives each `(M, routing)` cell per-call
+median, p95, and mean latency across individual calls plus per-round means.
+Each policy's speedup uses the fastest numerically valid measured single-node
+control among nodes 1, 2, and 3 for that cell. The per-policy and cell statuses
+show whether a valid policy reaches at least `2x`. The cell status is the union
+of passing policies, not evidence that one selected policy passes every cell.
+These are supplemental diagnostics only, and synthetic results remain outside
+the primary promotion gate.
+
+For example, time the broad grid with ten sequence repetitions per round:
 
 ```bash
-.venv/bin/python benchmarks/kernels/cpu/benchmark_cpu_numa_moe.py \
+uv run --no-sync .venv/bin/python -P benchmarks/kernels/cpu/benchmark_cpu_numa_moe.py \
   --mode synthetic \
   --weights /data/qwen36_moe_weights.pt \
   --layer-id 12 \
+  --synthetic-token-counts 1,2,3,4,5,6,7,8,32,128,129,256,512,1024,2048,4096 \
+  --timing-repeats 10 \
+  --policies static balanced split rows \
+  --controls single_node_node1 single_node_node2 single_node_node3 \
   --output /data/qwen36_synthetic_results.json
 ```
 
@@ -298,7 +339,8 @@ the bottleneck investigation; byte estimates do not establish memory bandwidth.
 `tp2_01`, `tp2_02`, and `tp2_12` measure two-node intermediate-sharding kernel
 controls; they do not establish native model TP2 serving. Synthetic results
 and replays without the exact primary workload metadata cannot pass the
-serving promotion gate.
+serving promotion gate. The synthetic per-cell `2x` statuses do not change
+that requirement.
 
 The primary metadata is an explicit corpus assertion. The harness can verify
 observable geometry, complete per-step layer order, record phases and
@@ -306,18 +348,21 @@ concurrency, warmup-cutoff ordering, and numerical outputs. It cannot prove
 that prompts were actually used, that warmup occurred, or that the supplied
 checkpoint revision/hash matches a remote model identifier.
 
-Consecutive corpus replay is the promotion timing condition. Supplemental
-isolated diagnostics choose one record per phase/concurrency, warm it once,
-then measure five warm-layer and five cold-weight calls per variant
+Consecutive corpus replay is the promotion timing condition. Before each
+variant warmup and measured round, the coordinator waits 10 ms without timing.
+Native and OpenMP workers can spin for up to 5 ms after work; the quiet interval
+lets those tails end before the next variant's first, potentially tiny call.
+Supplemental isolated diagnostics choose one record per phase/concurrency, warm
+it once, then measure five warm-layer and five cold-weight calls per variant
 (`--diagnostic-repeats` changes this count). Cold calls flush the packed weights
-and scales outside the timer; other data and allocator state remain warm.
-TP2 cold diagnostics synchronize ranks after their local flushes.
-The report retains these results separately from paired replay rounds.
+and scales outside the timer; other data and allocator state remain warm. TP2
+cold diagnostics synchronize ranks after their local flushes. The report
+retains these results separately from paired replay rounds.
 
 Collect hardware counters in a separate replay invocation:
 
 ```bash
-.venv/bin/python benchmarks/kernels/cpu/benchmark_cpu_numa_moe.py \
+uv run --no-sync .venv/bin/python -P benchmarks/kernels/cpu/benchmark_cpu_numa_moe.py \
   --corpus /data/qwen36_replay.pt --weights /data/qwen36_moe_weights.pt \
   --manifest /data/qwen36_replay.freeze.json \
   --rounds 1 --max-rounds 1 --perf-output-dir /data/numa_run/counters \
@@ -342,3 +387,6 @@ estimates, not measured memory bandwidth. Full-model TP2 and serving throughput
 remain outside this milestone. Promotion also requires the specified
 96 physical CPUs, three 32-thread teams, nodes 1/2/3, and the default numerical
 tolerance or a stricter one.
+
+The [broad tuning results](numa_moe_tuning_20261011.md) record the retained
+implementation, correctness checks, and the remaining 2× target misses.

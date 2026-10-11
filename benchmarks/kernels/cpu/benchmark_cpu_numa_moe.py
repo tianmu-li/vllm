@@ -59,6 +59,7 @@ DEFAULT_CPUS = tuple(range(32, 64)) + tuple(range(64, 96)) + tuple(range(96, 128
 DEFAULT_NODES = (1, 2, 3)
 PHASE_NAMES = ("schedule", "dispatch", "expert", "gather_combine", "total")
 EXPECTED_SOURCE_HEAD = "c5a3a1389df9aae4be73bcac7b8eea6164af02c7"
+VARIANT_QUIESCENCE_SECONDS = 0.01
 
 
 def _progress(path: str | None, event: str, **fields: Any) -> None:
@@ -217,9 +218,20 @@ def _repo_root() -> Path:
 def _validate_source_context() -> Path:
     repo_root = _repo_root()
     revision = _git("rev-parse", "HEAD", cwd=repo_root)
-    if revision != EXPECTED_SOURCE_HEAD:
+    if (
+        revision is None
+        or _git(
+            "merge-base",
+            "--is-ancestor",
+            EXPECTED_SOURCE_HEAD,
+            revision,
+            cwd=repo_root,
+        )
+        is None
+    ):
         raise RuntimeError(
-            f"Expected source HEAD {EXPECTED_SOURCE_HEAD}, found {revision!r}"
+            "Expected source HEAD to descend from "
+            f"{EXPECTED_SOURCE_HEAD}, found {revision!r}"
         )
     extension_path = Path(vllm._C.__file__).resolve()
     try:
@@ -896,6 +908,18 @@ def _parse_int_list(value: str) -> tuple[int, ...]:
     return tuple(values)
 
 
+def _parse_positive_int_list(value: str) -> tuple[int, ...]:
+    try:
+        values = tuple(int(item) for item in value.split(","))
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError("Expected comma-separated integers") from exc
+    if not values or len(set(values)) != len(values):
+        raise argparse.ArgumentTypeError("Values must be unique")
+    if any(item <= 0 for item in values):
+        raise argparse.ArgumentTypeError("Values must be positive")
+    return values
+
+
 def _validate_topology(
     cpus: tuple[int, ...], nodes: tuple[int, ...], threads_per_node: int
 ) -> None:
@@ -928,6 +952,7 @@ def _make_synthetic_records(
     layers: dict[int, dict[str, torch.Tensor]],
     layer_id: int,
     seed: int,
+    token_counts: tuple[int, ...] = SYNTHETIC_TOKEN_COUNTS,
 ) -> list[dict[str, Any]]:
     layer = layers[layer_id]
     expert_count, _, hidden_size = layer["w1"].shape
@@ -936,7 +961,7 @@ def _make_synthetic_records(
         raise ValueError("Synthetic routing requires at least eight experts")
     generator = torch.Generator().manual_seed(seed)
     records = []
-    for token_count in SYNTHETIC_TOKEN_COUNTS:
+    for token_count in token_counts:
         for routing in ("uniform", "zipf", "hot8", "changing"):
             step_count = 2 if routing == "changing" else 1
             for step in range(step_count):
@@ -1018,6 +1043,154 @@ def _distribution(values: list[float]) -> dict[str, float] | None:
         "median": statistics.median(ordered),
         "p95": ordered[p95_index],
         "mean": statistics.fmean(ordered),
+    }
+
+
+def _synthetic_complete_call_summary(
+    records: list[dict[str, Any]],
+    policies: tuple[str, ...],
+    controls: tuple[str, ...],
+    variant_validity: dict[str, bool],
+    call_samples: dict[str, list[float]],
+    timing_repeats: int,
+    rounds: int,
+) -> dict[str, Any]:
+    cell_indices: dict[tuple[int, str], list[int]] = defaultdict(list)
+    for index, record in enumerate(records):
+        cell_indices[(int(record["hidden"].shape[0]), record["routing"])].append(index)
+
+    single_node_controls = tuple(
+        control
+        for control in ("single_node_node1", "single_node_node2", "single_node_node3")
+        if control in controls and variant_validity.get(control, False)
+    )
+    cells = []
+    for (token_count, routing), indices in cell_indices.items():
+        calls_by_variant: dict[str, list[float]] = {}
+        round_means_by_variant: dict[str, list[float]] = {}
+        for variant, samples in call_samples.items():
+            calls = []
+            round_means = []
+            for round_index in range(rounds):
+                round_start = round_index * timing_repeats * len(records)
+                round_calls = [
+                    samples[round_start + repeat * len(records) + index]
+                    for repeat in range(timing_repeats)
+                    for index in indices
+                ]
+                calls.extend(round_calls)
+                round_means.append(statistics.fmean(round_calls))
+            calls_by_variant[variant] = calls
+            round_means_by_variant[variant] = round_means
+
+        reference_candidates = {
+            control: _distribution(calls_by_variant[control])
+            for control in single_node_controls
+            if calls_by_variant.get(control)
+        }
+        reference = (
+            min(
+                reference_candidates,
+                key=lambda control: reference_candidates[control]["mean"],
+            )
+            if reference_candidates
+            else None
+        )
+        reference_mean_ms = (
+            reference_candidates[reference]["mean"] if reference is not None else None
+        )
+        policy_results = {}
+        policy_statuses = {}
+        single_node_results = {}
+        for control in (
+            "single_node_node1",
+            "single_node_node2",
+            "single_node_node3",
+        ):
+            single_node_results[control] = {
+                "numerically_valid": variant_validity.get(control, False),
+                "complete_call_latency_ms": _distribution(
+                    calls_by_variant.get(control, [])
+                ),
+                "per_round_mean_ms": round_means_by_variant.get(control, []),
+            }
+        for policy in policies:
+            distribution = _distribution(calls_by_variant.get(policy, []))
+            speedup = (
+                reference_mean_ms / distribution["mean"]
+                if (
+                    variant_validity.get(policy, False)
+                    and reference_mean_ms is not None
+                    and distribution is not None
+                    and distribution["mean"] > 0
+                )
+                else None
+            )
+            status = (
+                "invalid_policy"
+                if not variant_validity.get(policy, False)
+                else (
+                    "unavailable"
+                    if speedup is None
+                    else ("pass" if speedup >= 2.0 else "fail")
+                )
+            )
+            policy_statuses[policy] = status
+            policy_results[policy] = {
+                "numerically_valid": variant_validity.get(policy, False),
+                "complete_call_latency_ms": distribution,
+                "per_round_mean_ms": round_means_by_variant.get(policy, []),
+                "speedup_vs_fastest_valid_single_node": (
+                    {
+                        "reference": reference,
+                        "reference_mean_ms": reference_mean_ms,
+                        "speedup": speedup,
+                    }
+                    if speedup is not None
+                    else None
+                ),
+                "two_x_status": status,
+            }
+
+        measured_statuses = [
+            status for status in policy_statuses.values() if status in ("pass", "fail")
+        ]
+        cell_status = (
+            "pass"
+            if "pass" in measured_statuses
+            else ("fail" if measured_statuses else "unavailable")
+        )
+        cells.append(
+            {
+                "token_count": token_count,
+                "routing": routing,
+                "target_band": (
+                    "small"
+                    if token_count < 8
+                    else "large"
+                    if token_count > 128
+                    else "middle"
+                ),
+                "fastest_valid_single_node_reference": (
+                    {
+                        "control": reference,
+                        "mean_ms": reference_mean_ms,
+                    }
+                    if reference is not None
+                    else None
+                ),
+                "single_node_controls": single_node_results,
+                "policies": policy_results,
+                "two_x_cell_status": cell_status,
+                "two_x_status_by_policy": policy_statuses,
+            }
+        )
+    return {
+        "scope": "supplemental synthetic diagnostic; excluded from promotion gates",
+        "timing_repeats": timing_repeats,
+        "cache_condition": "sequence_replay",
+        "record_sequence": "repeat the full ordered record list within each round",
+        "cells": cells,
     }
 
 
@@ -1106,7 +1279,12 @@ def _native_stats_summary(stats_samples: list[dict[str, Any]]) -> dict[str, Any]
         if "layer_id" not in sample:
             continue
         layout = runtime_layout_by_layer.setdefault(str(sample["layer_id"]), {})
-        for name in ("scratch_pages", "shard_pages", "numa_nodes", "worker_cpus"):
+        for name in (
+            "scratch_pages",
+            "shard_pages",
+            "numa_nodes",
+            "worker_cpus",
+        ):
             if name in sample:
                 layout[name] = sample[name]
     all_weight_addresses = [
@@ -1494,20 +1672,22 @@ def _run_corpus(
     handles: dict[int, int],
     records: list[dict[str, Any]],
     policy: str,
+    repeats: int = 1,
 ) -> tuple[list[float], list[dict[str, Any]], dict[str, list[float]]]:
     call_ms = []
     stats_samples = []
     concurrency_ms: dict[str, list[float]] = defaultdict(list)
-    for record in records:
-        start = time.perf_counter_ns()
-        _execute(handles, record, policy)
-        elapsed_ms = (time.perf_counter_ns() - start) / 1e6
-        call_ms.append(elapsed_ms)
-        if record.get("concurrency") is not None:
-            concurrency_ms[str(int(record["concurrency"]))].append(elapsed_ms)
-        stats = _call_stats(handles[record["layer"]])
-        stats["layer_id"] = record["layer"]
-        stats_samples.append(stats)
+    for _ in range(repeats):
+        for record in records:
+            start = time.perf_counter_ns()
+            _execute(handles, record, policy)
+            elapsed_ms = (time.perf_counter_ns() - start) / 1e6
+            call_ms.append(elapsed_ms)
+            if record.get("concurrency") is not None:
+                concurrency_ms[str(int(record["concurrency"]))].append(elapsed_ms)
+            stats = _call_stats(handles[record["layer"]])
+            stats["layer_id"] = record["layer"]
+            stats_samples.append(stats)
     return call_ms, stats_samples, concurrency_ms
 
 
@@ -1724,7 +1904,9 @@ def _control_worker_main(args: argparse.Namespace) -> None:
         layer_id = _normalize_layer_key(args.layer_id)
         layer_ids = [layer_id]
         layers = {layer_id: layers[layer_id]}
-        records = _make_synthetic_records(layers, layer_id, args.seed)
+        records = _make_synthetic_records(
+            layers, layer_id, args.seed, args.synthetic_token_counts
+        )
         manifest = {
             "weights_file_sha256": _sha256_file(weights_path),
             "weights_tensor_sha256": _content_hash(layers),
@@ -1889,7 +2071,14 @@ def _worker_command(
             ]
         )
     else:
-        command.extend(["--layer-id", str(args.layer_id)])
+        command.extend(
+            [
+                "--layer-id",
+                str(args.layer_id),
+                "--synthetic-token-counts",
+                ",".join(map(str, args.synthetic_token_counts)),
+            ]
+        )
     if args.measure_invalid_controls:
         command.append("--measure-invalid-controls")
     if args.reference_cache_dir:
@@ -1955,12 +2144,43 @@ def _start_control_workers(
     return workers, preflight
 
 
-def _control_request(process: subprocess.Popen[str], command: str) -> dict[str, Any]:
+def _control_request(
+    process: subprocess.Popen[str], command: str, repeats: int = 1
+) -> dict[str, Any]:
     if process.stdin is None:
         raise RuntimeError("Worker stdin was not captured")
-    process.stdin.write(json.dumps({"command": command}) + "\n")
-    process.stdin.flush()
-    return _worker_receive(process)
+    responses = []
+    for _ in range(repeats):
+        process.stdin.write(json.dumps({"command": command}) + "\n")
+        process.stdin.flush()
+        responses.append(_worker_receive(process))
+    if len(responses) == 1:
+        return responses[0]
+    if command != "run":
+        raise ValueError("Only measured run requests can be repeated")
+    if any(response.get("event") != "run" for response in responses):
+        raise RuntimeError(f"Control worker returned an invalid result: {responses}")
+
+    call_ms = [value for response in responses for value in response["call_ms"]]
+    by_concurrency: dict[str, list[float]] = defaultdict(list)
+    for response in responses:
+        for concurrency, values in response["by_concurrency_ms"].items():
+            by_concurrency[concurrency].extend(values)
+    combined = {
+        **responses[-1],
+        "total_ms": sum(call_ms),
+        "call_ms": call_ms,
+        "by_concurrency_ms": dict(by_concurrency),
+    }
+    if all("replay_wall_ms" in response for response in responses):
+        combined["replay_wall_ms"] = sum(
+            response["replay_wall_ms"] for response in responses
+        )
+        combined["rank_replay_wall_ms"] = [
+            sum(response["rank_replay_wall_ms"][rank] for response in responses)
+            for rank in range(len(responses[0]["rank_replay_wall_ms"]))
+        ]
+    return combined
 
 
 def _stop_control_workers(workers: dict[str, subprocess.Popen[str]]) -> None:
@@ -2054,7 +2274,9 @@ def _run_benchmark(args: argparse.Namespace) -> dict[str, Any]:
             raise ValueError(f"--layer-id {layer_id} is missing from weights")
         layer_ids = [layer_id]
         layers = {layer_id: layers[layer_id]}
-        records = _make_synthetic_records(layers, layer_id, args.seed)
+        records = _make_synthetic_records(
+            layers, layer_id, args.seed, args.synthetic_token_counts
+        )
         _validate_records(records, layer_ids, layers)
         manifest = {
             "format_version": 1,
@@ -2062,6 +2284,7 @@ def _run_benchmark(args: argparse.Namespace) -> dict[str, Any]:
             "weights_file_sha256": _sha256_file(weights_path),
             "weights_tensor_sha256": _content_hash(layers),
             "synthetic_seed": args.seed,
+            "synthetic_token_counts": list(args.synthetic_token_counts),
             "record_count": len(records),
             "corpus_tensor_sha256": _content_hash(records),
         }
@@ -2235,10 +2458,12 @@ def _run_benchmark(args: argparse.Namespace) -> dict[str, Any]:
         variants = [*args.policies, *args.controls]
         warmup_stats = {}
         for policy in args.policies:
+            time.sleep(VARIANT_QUIESCENCE_SECONDS)
             _, samples, _ = _run_corpus(handles, records, policy)
             warmup_stats[policy] = samples[-1] if samples else {}
             _progress(args.progress_jsonl, "warmup_complete", variant=policy)
         for control in args.controls:
+            time.sleep(VARIANT_QUIESCENCE_SECONDS)
             response = _control_request(control_workers[control], "warm")
             warmup_stats[control] = {
                 "event": response["event"],
@@ -2284,6 +2509,8 @@ def _run_benchmark(args: argparse.Namespace) -> dict[str, Any]:
             order = order[offset:] + order[:offset]
             variant_order_by_round.append(order)
             for variant in order:
+                # Both native and OpenMP teams spin for up to 5 ms after work.
+                time.sleep(VARIANT_QUIESCENCE_SECONDS)
                 if variant in KERNEL_CONTROLS:
                     setup_start = time.perf_counter()
                     for record in layout_inputs.values():
@@ -2296,6 +2523,7 @@ def _run_benchmark(args: argparse.Namespace) -> dict[str, Any]:
                     }
                     layout_setup.append(setup)
                     _progress(args.progress_jsonl, "kernel_layout_ready", **setup)
+                    time.sleep(VARIANT_QUIESCENCE_SECONDS)
                 collector = (
                     PerfCounters(
                         Path(args.perf_output_dir)
@@ -2309,12 +2537,16 @@ def _run_benchmark(args: argparse.Namespace) -> dict[str, Any]:
                 with collector if collector is not None else nullcontext():
                     if variant in args.policies:
                         timings, samples, by_concurrency = _run_corpus(
-                            handles, records, variant
+                            handles, records, variant, args.timing_repeats
                         )
                         final_stats[variant] = samples[-1] if samples else {}
                         latest_round_stats[variant] = samples
                     else:
-                        response = _control_request(control_workers[variant], "run")
+                        response = _control_request(
+                            control_workers[variant],
+                            "run",
+                            repeats=args.timing_repeats,
+                        )
                         if response.get("event") != "run":
                             raise RuntimeError(
                                 f"Control worker returned an invalid result: {response}"
@@ -2385,18 +2617,22 @@ def _run_benchmark(args: argparse.Namespace) -> dict[str, Any]:
             int(record["hidden"].shape[0] * record["ids"].shape[1])
             for record in records
         )
-        logical_groups = sum(
-            int(torch.unique(record["ids"]).numel()) for record in records
+        logical_groups = (
+            sum(int(torch.unique(record["ids"]).numel()) for record in records)
+            * args.timing_repeats
         )
         for variant in variants:
             total_ms = statistics.fmean(round_totals[variant])
             by_concurrency = {}
             for concurrency, totals in concurrency_round_totals[variant].items():
-                routed_tokens_for_group = sum(
-                    int(record["hidden"].shape[0] * record["ids"].shape[1])
-                    for record in records
-                    if record.get("concurrency") is not None
-                    and str(int(record["concurrency"])) == concurrency
+                routed_tokens_for_group = (
+                    sum(
+                        int(record["hidden"].shape[0] * record["ids"].shape[1])
+                        for record in records
+                        if record.get("concurrency") is not None
+                        and str(int(record["concurrency"])) == concurrency
+                    )
+                    * args.timing_repeats
                 )
                 mean_ms = statistics.fmean(totals)
                 group_calls = concurrency_call_samples[variant][concurrency]
@@ -2428,7 +2664,9 @@ def _run_benchmark(args: argparse.Namespace) -> dict[str, Any]:
                 ),
                 "round_total_ms": round_totals[variant],
                 "mean_replay_ms": total_ms,
-                "useful_routed_tokens_per_second": (routed_tokens / (total_ms / 1000)),
+                "useful_routed_tokens_per_second": (
+                    routed_tokens * args.timing_repeats / (total_ms / 1000)
+                ),
                 "call_latency_ms": _distribution(call_samples[variant]),
                 "by_concurrency": by_concurrency,
             }
@@ -2440,19 +2678,29 @@ def _run_benchmark(args: argparse.Namespace) -> dict[str, Any]:
                     if record["phase"] == phase
                 ]
                 phase_calls = [
-                    call_samples[variant][round_id * len(records) + index]
+                    call_samples[variant][
+                        round_id * args.timing_repeats * len(records)
+                        + repeat_id * len(records)
+                        + index
+                    ]
                     for round_id in range(rounds)
+                    for repeat_id in range(args.timing_repeats)
                     for index in indices
                 ]
                 phase_round_ms = [
                     sum(
-                        call_samples[variant][round_id * len(records) + index]
+                        call_samples[variant][
+                            round_id * args.timing_repeats * len(records)
+                            + repeat_id * len(records)
+                            + index
+                        ]
                         for index in indices
+                        for repeat_id in range(args.timing_repeats)
                     )
                     for round_id in range(rounds)
                 ]
                 by_phase[phase] = {
-                    "calls_per_round": len(indices),
+                    "calls_per_round": len(indices) * args.timing_repeats,
                     "round_total_ms": phase_round_ms,
                     "mean_replay_ms": statistics.fmean(phase_round_ms),
                     "call_latency_ms": _distribution(phase_calls),
@@ -2491,6 +2739,19 @@ def _run_benchmark(args: argparse.Namespace) -> dict[str, Any]:
                     replay_wall_by_round=control_wall_samples[variant],
                 )
             policy_results[variant] = result_for_variant
+        synthetic_complete_call = (
+            _synthetic_complete_call_summary(
+                records,
+                tuple(args.policies),
+                tuple(args.controls),
+                variant_validity,
+                call_samples,
+                args.timing_repeats,
+                rounds,
+            )
+            if args.mode == "synthetic"
+            else None
+        )
         paired = _paired_speedups(round_totals)
         eligible_dynamic = [
             policy for policy in ("balanced", "split") if policy in paired
@@ -2843,6 +3104,7 @@ def _run_benchmark(args: argparse.Namespace) -> dict[str, Any]:
             },
             "checkpoint_and_corpus": manifest,
             "frozen_manifest": frozen_manifest,
+            "synthetic_complete_call": synthetic_complete_call,
             "workload": {
                 "records": len(records),
                 "ordered_layers": [record["layer"] for record in records],
@@ -2856,7 +3118,9 @@ def _run_benchmark(args: argparse.Namespace) -> dict[str, Any]:
                 ),
                 "routed_tokens": routed_tokens,
                 "synthetic_token_counts": (
-                    list(SYNTHETIC_TOKEN_COUNTS) if args.mode == "synthetic" else None
+                    list(args.synthetic_token_counts)
+                    if args.mode == "synthetic"
+                    else None
                 ),
                 "metadata": corpus_metadata,
                 "primary_corpus_validation": primary_corpus,
@@ -2869,6 +3133,11 @@ def _run_benchmark(args: argparse.Namespace) -> dict[str, Any]:
             "correctness": correctness,
             "timing": {
                 "instrumented": bool(args.perf_output_dir),
+                "repeats_per_round": args.timing_repeats,
+                "records_per_round": len(records) * args.timing_repeats,
+                "untimed_pause_between_variants_ms": (
+                    VARIANT_QUIESCENCE_SECONDS * 1000
+                ),
                 "hardware_counters": {
                     "scope": (
                         "system-wide on requested physical CPUs; includes replay "
@@ -3068,6 +3337,13 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--layer-id", type=int, help="synthetic mode layer")
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument(
+        "--synthetic-token-counts",
+        type=_parse_positive_int_list,
+        default=SYNTHETIC_TOKEN_COUNTS,
+        metavar="M[,M...]",
+        help="positive synthetic token counts (default: existing matrix)",
+    )
+    parser.add_argument(
         "--check-only",
         action="store_true",
         help="run reference, alias, routing, and placement checks without timing",
@@ -3101,6 +3377,12 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--block-k", type=int, default=128)
     parser.add_argument("--rounds", type=int, default=5)
     parser.add_argument("--max-rounds", type=int, default=10)
+    parser.add_argument(
+        "--timing-repeats",
+        type=int,
+        default=1,
+        help="repeat the full ordered record sequence in each measured round",
+    )
     parser.add_argument("--diagnostic-repeats", type=int, default=5)
     parser.add_argument("--atol", type=float, default=1e-2)
     parser.add_argument("--rtol", type=float, default=1e-2)
@@ -3159,6 +3441,8 @@ def main() -> None:
         return
     if args.rounds <= 0 or args.max_rounds < args.rounds:
         raise SystemExit("Require 0 < --rounds <= --max-rounds")
+    if args.timing_repeats <= 0:
+        raise SystemExit("--timing-repeats must be positive")
     if args.reference_chunk_tokens <= 0:
         raise SystemExit("--reference-chunk-tokens must be positive")
     if args.diagnostic_repeats <= 0:

@@ -160,7 +160,9 @@ def _load_inputs(
             raise ValueError(f"Synthetic layer {layer_id} is absent from weights")
         layer_ids = [layer_id]
         layers = {layer_id: layers[layer_id]}
-        records = replay._make_synthetic_records(layers, layer_id, config["seed"])
+        records = replay._make_synthetic_records(
+            layers, layer_id, config["seed"], tuple(config["synthetic_token_counts"])
+        )
         metadata = {"kind": "synthetic routing diagnostic"}
         manifest = {
             "weights_file_sha256": replay._sha256_file(weights_path),
@@ -865,6 +867,7 @@ def worker_main(args: Any) -> None:
         "mode": args.mode,
         "layer_id": args.layer_id,
         "seed": args.seed,
+        "synthetic_token_counts": args.synthetic_token_counts,
         "expected_corpus_hash": args.expected_corpus_hash,
         "block_n": args.block_n,
         "block_k": args.block_k,

@@ -57,6 +57,10 @@ void fused_experts_fp_kernel_impl(
     }
   };
 
+  const int32_t* routed_slots = executor ? executor->routed_slots() : nullptr;
+  const int64_t input_topk = executor ? executor->input_topk() : topk;
+  const bool grouped_inputs = executor && executor->grouped_inputs();
+
   // stage 1: intermediate_cache0 = hidden_states @ w1
   const int64_t MB = div_up(num_tokens_post_pad, BLOCK_M);
   const int64_t NB = div_up(2 * N, BLOCK_N);
@@ -81,7 +85,8 @@ void fused_experts_fp_kernel_impl(
   team_2d(MB, NB, [&](int64_t mb0, int64_t mb1, int64_t nb0, int64_t nb1) {
     // get local pointers
     int tid = executor ? executor->thread_id() : get_thread_num();
-    scalar_t* __restrict__ A = A_tmp + tid * BLOCK_M * K;
+    scalar_t* __restrict__ A_local = A_tmp + tid * BLOCK_M * K;
+    const scalar_t* A = A_local;
     bool use_brgemm = false;
 
     loop_2d<packed_t>(mb0, mb1, nb0, nb1, BLOCK_N * K, [&](int64_t mb, int64_t nb, int64_t nb_offset) {
@@ -105,16 +110,18 @@ void fused_experts_fp_kernel_impl(
       const bool brg = can_use_brgemm<packed_t>(m_size, n_size);
       use_brgemm |= brg;
 
-      if (nb_offset == 0) {
+      const int64_t offset = offsets[mb];
+      if (grouped_inputs) {
+        A = input + offset * K;
+      } else if (nb_offset == 0) {
         // 1.a load A
         const int32_t* A_ids = sorted_ids + mb * BLOCK_M;
         for (int64_t m = 0; m < m_size; ++m) {
-          int32_t index = A_ids[m] / topk;
-          copy_stub(A + m * K, input + index * K, K);
+          int32_t index = routed_slots ? routed_slots[A_ids[m]] / input_topk : A_ids[m] / topk;
+          copy_stub(A_local + m * K, input + index * K, K);
         }
       }
 
-      const int64_t offset = offsets[mb];
       tinygemm_kernel<scalar_t>(
           /*   A            */ A,
           /*   B            */ B,
@@ -219,7 +226,7 @@ void fused_experts_fp_kernel_impl(
       //   and also mul topk_weights in float32
       for (int64_t m = 0; m < m_size; ++m) {
         int32_t index = A_ids[m];
-        float weight = topk_weights[index];
+        float weight = topk_weights[routed_slots ? routed_slots[index] : index];
         copy_mul_stub(ic2 + index * K + nb * BLOCK_N, C + m * BLOCK_N, weight, n_size);
       }
     });
