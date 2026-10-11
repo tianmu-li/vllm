@@ -570,3 +570,66 @@ The [installation identity](../../../build-numa-broad/campaign_20261011_broad/in
 [build commands](../../../build-numa-broad/campaign_20261011_broad/inline_fused_build_commands.json)
 and [cell analysis](../../../build-numa-broad/campaign_20261011_broad/inline_fused_fixed_node1_seed0.analysis.json)
 preserve the rejected experiment. The broad 2× target remains unmet.
+
+## Coordinated splits for shared token lists
+
+Independent expert splits can destroy shared-input reuse. In the committed
+baseline's M1024 changing cell, split gathered 6M rows per call, versus 3M for
+whole ownership and M for equal row partitioning. Its node-time prediction was
+about 30% below observed time. The one-expert/large-queue calibration did not
+represent these small shared-input queues well.
+
+The new split candidate measures frozen node costs for one through eight
+experts sharing token lists. Five samples per point flush the participating
+weights and scales before measurement, charging additional replica reads.
+All shared-cost samples use the existing large-batch scratch/staging regime,
+including short local slices. Calibration remains outside steady-state timing.
+The original per-expert calibration serves other routes.
+
+For large batches, the scheduler recognizes identical strictly increasing token
+lists across the complete active expert set, within the existing eight-group
+input-sharing limit. It evaluates two- and three-node partitions at 32-row
+boundaries, moves every group's cuts together, and leaves one final tail.
+It accepts a coordinated split only when measured shared-cost curves predict
+at least 5% lower node makespan. Other inputs retain the existing scheduler.
+FP8 arithmetic, full expert widths, weighting and original-slot reduction
+are unchanged.
+
+| Fixed node-1 input run | Static replay | Split replay | Split small ≥2× | Split large ≥2× |
+| --- | ---: | ---: | ---: | ---: |
+| [Initial 64-cell candidate](../../../build-numa-broad/campaign_20261011_broad/coherent_shared_split_fixed_node1_seed0.json) | 784.41 ms | 751.07 ms | 21/28 | 23/24 |
+| [Refined 64-cell candidate](../../../build-numa-broad/campaign_20261011_broad/coherent_large_fixed_node1_seed0.json) | 764.22 ms | 748.52 ms | 22/28 | 22/24 |
+| [Refined 56-cell boundary matrix](../../../build-numa-broad/campaign_20261011_broad/coherent_large_fixed_edges_node1_seed0.json) | 871.01 ms | 836.13 ms | 17/28 | 23/28 |
+
+All runs used four native policies, three valid single-node controls and ten
+rotated rounds of ten repeats. Refined split's paired speedup over static was
+1.021×, CI [1.017, 1.025], in the main matrix and 1.042×,
+CI [1.024, 1.053], in the boundary matrix. Isolated latency outliers remain;
+the initial run's static mean includes a large small-call outlier.
+These are synthetic diagnostics, rather than primary promotion evidence.
+
+Changing-route speedups reached 2.08× at M512, 2.40× at M1024,
+2.72× at M2048 and 3.12× at M4096. The boundary matrix reached 2.34×
+at M384, 2.48× at M768 and 3.26× at M8192. These cells accepted all
+eight expert splits while gathering M input rows. M256 hot-eight/changing
+still missed 2× in the refined main matrix. M192 and M257 hot-eight,
+and M192/M255/M257 changing, remained failures in the boundary matrix.
+Those cells accepted no coordinated split. The existing whole-group model
+and independent-split path still need work, as do the small-M failures.
+
+Retain the shared-list scheduling improvement as experimental progress.
+The frozen prediction covers node execution, excluding caller overhead and
+final combine. The 5% node acceptance test therefore does not establish a
+5% complete-step prediction. Neither aggregate result satisfies the primary
+promotion gate, and the broad 2× objective remains unmet.
+
+The existing numerical suite adds M513 shared lists with a distinct padded
+tail and alias replay. All 96 selected NUMA, FP8 and MXFP4 cases passed.
+[Captured-output validation](../../../build-numa-broad/campaign_20261011_broad/coherent_large_primary_numerical.json)
+passed all 1,920 records for every policy: static, balanced and split matched
+exactly; rows' maximum absolute error remained 0.03125 within the existing
+tolerance. Pre-commit checks passed.
+The [installation journal](../../../build-numa-broad/campaign_20261011_broad/coherent_large_final_install.json)
+and [build commands](../../../build-numa-broad/campaign_20261011_broad/coherent_large_build_commands.json)
+record the retained implementation. Shared calibration tables are preserved
+in full warmup snapshots and per-cell metadata.

@@ -538,6 +538,13 @@ def test_cpu_numa_fp8_moe_runtime_replays_routes_and_recreates(
                 torch.tensor([[0, 1]] * 6 + [[3, 4]] * 6, dtype=torch.int32),
                 torch.full((12, 2), 0.5),
             ),
+            # Shared row splits retain a final padded block and alias safety.
+            (
+                torch.randn(513, hidden_size, dtype=torch.bfloat16)
+                / math.sqrt(hidden_size),
+                torch.arange(num_experts, dtype=torch.int32).repeat(513, 1),
+                torch.full((513, num_experts), 1 / num_experts),
+            ),
         )
         references = []
         for hidden, ids, weights in cases:
@@ -586,7 +593,7 @@ def test_cpu_numa_fp8_moe_runtime_replays_routes_and_recreates(
                         input_rows * hidden_size * 2 + ids.numel() * 4
                     )
 
-            for index in (2, 3, 4, 5, 1):
+            for index in (2, 3, 4, 5, 6, 1):
                 hidden, ids, weights = cases[index]
                 aliased = hidden.clone()
                 runtime.cpu_numa_moe_execute(

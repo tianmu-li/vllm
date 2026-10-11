@@ -1321,6 +1321,7 @@ def _native_stats_summary(stats_samples: list[dict[str, Any]]) -> dict[str, Any]
                 "calibration_group_counts",
                 "calibration_single_ms",
                 "calibration_batch_ms",
+                "calibration_shared_ms",
             ):
                 if name in sample:
                     entry[name] = sample[name]

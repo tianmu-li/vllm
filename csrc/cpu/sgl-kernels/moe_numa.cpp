@@ -469,6 +469,7 @@ struct Runtime {
   std::array<double, 3> fixed_cost{};
   std::array<std::vector<double>, 3> single_costs, batch_costs;
   std::vector<int64_t> calibration_groups;
+  std::array<std::array<std::vector<double>, 3>, 9> shared_costs;
   c10::Dict<std::string, at::Tensor> stats;
   CallStats last_call_stats;
   CallStats working_call_stats;
@@ -581,6 +582,13 @@ struct Runtime {
         stats.insert(entry.first,
                      reuse_stat<double>(entry.first, all).reshape({3, -1}));
       }
+      std::vector<double> shared;
+      for (int experts = 1; experts <= std::min<int64_t>(8, E); ++experts)
+        for (const auto& node : shared_costs[experts])
+          shared.insert(shared.end(), node.begin(), node.end());
+      stats.insert("calibration_shared_ms",
+                   reuse_stat<double>("calibration_shared_ms", shared)
+                       .reshape({std::min<int64_t>(8, E), 3, -1}));
     }
   }
 
@@ -884,22 +892,32 @@ struct Runtime {
     return dispatch_rows;
   }
 
-  double cost(int node, int64_t rows) const {
+  double interpolate_cost(const std::vector<double>& values,
+                          int64_t rows) const {
     if (!rows) return 0;
     auto it = std::lower_bound(cost_rows.begin(), cost_rows.end(), rows);
-    if (it == cost_rows.begin()) return costs[node][0];
+    if (it == cost_rows.begin()) return values[0];
     if (it == cost_rows.end()) {
       size_t last = cost_rows.size() - 1;
       double slope = 0;
       if (last)
-        slope = std::max(0., (costs[node][last] - costs[node][last - 1]) /
+        slope = std::max(0., (values[last] - values[last - 1]) /
                                  (cost_rows[last] - cost_rows[last - 1]));
-      return costs[node].back() + slope * (rows - cost_rows.back());
+      return values.back() + slope * (rows - cost_rows.back());
     }
     auto j = it - cost_rows.begin();
     double f =
         double(rows - cost_rows[j - 1]) / (cost_rows[j] - cost_rows[j - 1]);
-    return costs[node][j - 1] * (1 - f) + costs[node][j] * f;
+    return values[j - 1] * (1 - f) + values[j] * f;
+  }
+
+  double cost(int node, int64_t rows) const {
+    return interpolate_cost(costs[node], rows);
+  }
+
+  double shared_cost(int node, int groups, int64_t rows) const {
+    return rows && groups ? interpolate_cost(shared_costs[groups][node], rows)
+                          : 0;
   }
 
   void group(const std::array<std::vector<std::vector<int32_t>>, 3>& groups,
@@ -1078,7 +1096,91 @@ struct Runtime {
         groups[chosen][expert] = tokens;
       }
     }
-    if (policy == "split") {
+    bool shared_split = false;
+    if (policy == "split" && M > 128 && order.size() >= 2 &&
+        order.size() <= 8) {
+      const auto& first = logical[order[0]];
+      bool shared = first.size() > 32;
+      for (size_t row = 0; shared && row < first.size(); ++row) {
+        int token = first[row] / topk;
+        if (row && token <= first[row - 1] / topk) shared = false;
+        for (size_t expert = 1; shared && expert < order.size(); ++expert) {
+          const auto& slots = logical[order[expert]];
+          shared = slots.size() == first.size() && slots[row] / topk == token;
+        }
+      }
+      if (shared) {
+        std::array<double, 3> unsplit_load{};
+        for (int n = 0; n < 3; ++n)
+          unsplit_load[n] = shared_cost(n, group_counts[n], first.size());
+        double best =
+            *std::max_element(unsplit_load.begin(), unsplit_load.end());
+        const double unsplit = best;
+        std::array<int64_t, 3> best_rows{};
+        std::array<double, 3> best_load{};
+        // Move common token lists together so every local expert reuses the
+        // same gathered inputs. Calibration charges all replicated weight
+        // reads.
+        for (int mask = 1; mask < 8; ++mask) {
+          if (std::popcount(unsigned(mask)) < 2) continue;
+          std::array<int64_t, 3> trial_rows{};
+          std::array<double, 3> trial_load{};
+          for (size_t row = 0; row < first.size(); row += 32) {
+            int count = std::min<size_t>(32, first.size() - row);
+            int target = -1;
+            double finish = std::numeric_limits<double>::infinity();
+            for (int n = 0; n < 3; ++n) {
+              if (!(mask & (1 << n))) continue;
+              auto candidate = trial_load;
+              candidate[n] =
+                  shared_cost(n, order.size(), trial_rows[n] + count);
+              double completion =
+                  *std::max_element(candidate.begin(), candidate.end());
+              if (completion < finish) {
+                target = n;
+                finish = completion;
+              }
+            }
+            trial_rows[target] += count;
+            trial_load[target] =
+                shared_cost(target, order.size(), trial_rows[target]);
+          }
+          int active = 0;
+          for (auto rows : trial_rows) active += rows > 0;
+          double candidate =
+              *std::max_element(trial_load.begin(), trial_load.end());
+          if (active > 1 && candidate <= unsplit * 0.95 && candidate < best) {
+            best = candidate;
+            best_rows = trial_rows;
+            best_load = trial_load;
+          }
+        }
+        if (best < unsplit) {
+          std::array<int, 3> placement_order{0, 1, 2};
+          std::sort(placement_order.begin(), placement_order.end(),
+                    [&](int a, int b) {
+                      auto a_tail = best_rows[a] % 32,
+                           b_tail = best_rows[b] % 32;
+                      return a_tail != b_tail ? a_tail < b_tail : a < b;
+                    });
+          for (int expert : order) {
+            const auto& tokens = logical[expert];
+            size_t begin = 0;
+            for (int n : placement_order) {
+              auto count = best_rows[n];
+              groups[n][expert].assign(tokens.begin() + begin,
+                                       tokens.begin() + begin + count);
+              begin += count;
+            }
+            previous[expert] = -1;
+          }
+          load = best_load;
+          splits = order.size();
+          shared_split = true;
+        }
+      }
+    }
+    if (policy == "split" && !shared_split) {
       for (int expert : order) {
         const auto& tokens = logical[expert];
         if (tokens.size() <= 32) continue;
@@ -1373,6 +1475,25 @@ struct Runtime {
                 "Invalid calibration rows");
     std::vector<int> calibration_active;
     calibration_active.reserve(E);
+    auto evict_calibration_weights = [&](int64_t experts) {
+      for (auto& r : replicas) {
+        r.team->submit([rp = &r, experts, this](int tid) {
+          std::array<std::pair<LocalBuffer*, size_t>, 4> buffers{
+              std::pair{&rp->w1, size_t(experts * 2 * N * K)},
+              std::pair{&rp->w2, size_t(experts * N * K)},
+              std::pair{&rp->s1, size_t(experts * div_up(2 * N, bn) *
+                                        div_up(K, bk) * sizeof(float))},
+              std::pair{&rp->s2, size_t(experts * div_up(K, bn) *
+                                        div_up(N, bk) * sizeof(float))}};
+          for (auto [buffer, bytes] : buffers)
+            for (size_t offset = tid * 64; offset < bytes;
+                 offset += rp->team->size() * 64)
+              _mm_clflush(buffer->ptr<char>() + offset);
+          _mm_mfence();
+        });
+      }
+      wait_all();
+    };
     for (auto count : rows) {
       int64_t batch =
           std::min<int64_t>({E, 64, std::max<int64_t>(1, 8192 / count)});
@@ -1397,23 +1518,7 @@ struct Runtime {
         run(hidden, weights, 1);
         std::array<std::vector<double>, 3> samples;
         for (int repeat = 0; repeat < 5; ++repeat) {
-          for (auto& r : replicas) {
-            r.team->submit([rp = &r, experts, this](int tid) {
-              std::array<std::pair<LocalBuffer*, size_t>, 4> buffers{
-                  std::pair{&rp->w1, size_t(experts * 2 * N * K)},
-                  std::pair{&rp->w2, size_t(experts * N * K)},
-                  std::pair{&rp->s1, size_t(experts * div_up(2 * N, bn) *
-                                            div_up(K, bk) * sizeof(float))},
-                  std::pair{&rp->s2, size_t(experts * div_up(K, bn) *
-                                            div_up(N, bk) * sizeof(float))}};
-              for (auto [buffer, bytes] : buffers)
-                for (size_t offset = tid * 64; offset < bytes;
-                     offset += rp->team->size() * 64)
-                  _mm_clflush(buffer->ptr<char>() + offset);
-              _mm_mfence();
-            });
-          }
-          wait_all();
+          evict_calibration_weights(experts);
           run(hidden, weights, 1);
           for (int n = 0; n < 3; ++n)
             samples[n].push_back(replicas[n].total_ms);
@@ -1447,6 +1552,41 @@ struct Runtime {
       for (size_t j = 0; j < rows.size(); ++j)
         costs[n].push_back((batch_costs[n][j] - fixed_cost[n]) /
                            calibration_groups[j]);
+    }
+    for (int experts = 1; experts <= std::min<int64_t>(8, E); ++experts) {
+      calibration_active.resize(experts);
+      std::iota(calibration_active.begin(), calibration_active.end(), 0);
+      for (auto count : rows) {
+        TORCH_CHECK(count <= INT32_MAX / (3 * experts),
+                    "Too many shared calibration slots");
+        // Shared splits use the large-batch scratch and staging paths even
+        // when a local slice contains only a few rows.
+        int64_t input_rows = std::max<int64_t>(129, 3 * count);
+        auto hidden = at::zeros({input_rows, K},
+                                at::TensorOptions().dtype(at::kBFloat16));
+        auto weights = at::ones({input_rows * experts},
+                                at::TensorOptions().dtype(at::kFloat));
+        std::array<std::vector<std::vector<int32_t>>, 3> shared_groups;
+        for (int n = 0; n < 3; ++n) {
+          shared_groups[n].resize(E);
+          for (int e = 0; e < experts; ++e)
+            for (int row = 0; row < count; ++row)
+              shared_groups[n][e].push_back((n * count + row) * experts + e);
+        }
+        group(shared_groups, calibration_active, experts);
+        run(hidden, weights, experts);
+        std::array<std::vector<double>, 3> samples;
+        for (int repeat = 0; repeat < 5; ++repeat) {
+          evict_calibration_weights(experts);
+          run(hidden, weights, experts);
+          for (int n = 0; n < 3; ++n)
+            samples[n].push_back(replicas[n].total_ms);
+        }
+        for (int n = 0; n < 3; ++n) {
+          std::sort(samples[n].begin(), samples[n].end());
+          shared_costs[experts][n].push_back(samples[n][2]);
+        }
+      }
     }
     cost_rows = std::move(rows);
     history.clear();
