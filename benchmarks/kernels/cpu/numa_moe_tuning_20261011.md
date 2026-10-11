@@ -668,3 +668,36 @@ Input payloads, sources and extension remained unchanged throughout validation.
 The [installation journal](../../../build-numa-broad/campaign_20261011_broad/combine_waiters_install.json)
 and [build commands](../../../build-numa-broad/campaign_20261011_broad/combine_waiters_build_commands.json)
 preserve implementation provenance.
+
+## Rejected paired gate/up execution
+
+The candidate assigned matching gate/up tiles to one worker and applied the
+existing SiLU stub immediately after both BF16 projection stores. It retained
+the FP8 GEMM bodies and eliminated the separate activation barrier. Eligibility
+required one row block per expert and enough weighted column jobs to avoid
+idle workers; multiple-block groups and other executors retained the old path.
+All 16 linked extension translation units depending on the executor header
+were rebuilt from the recorded compiler flags. Independent static review found
+no correctness blocker, and all 96 selected numerical tests passed.
+
+The [64-cell run](../../../build-numa-broad/campaign_20261011_broad/paired_gate_up_fixed_node1_seed0.json)
+passed synthetic correctness but regressed small calls. Balanced and split
+small-call geometric mean latency increased by 7.16% and 6.97% against the
+retained seed-0 run; each passed only 19/28 small cells. Static passed 18/28
+and included a large M3 hot-eight outlier, which remains in the evidence.
+Split replay was 750.70 ms versus the retained 743.99 ms. Large-cell latency
+changed by less than 1% geometrically and did not close M256 changing's failure.
+Separate launches do not establish paired causal effects; the repeated small
+failures provide no reason to retain the candidate. The apparent paired
+split/static aggregate gain is distorted by the static outlier.
+
+Halving the column jobs can increase the maximum worker's tile count even
+when every worker receives work, particularly with three equal expert groups.
+Removing one barrier did not compensate in this experiment. Reject the
+candidate rather than add another scheduling path for its narrow cases.
+The [build journal](../../../build-numa-broad/campaign_20261011_broad/paired_gate_up_build_commands.json)
+and [cell analysis](../../../build-numa-broad/campaign_20261011_broad/paired_gate_up_fixed_node1_seed0.analysis.json)
+preserve it. The [restore journal](../../../build-numa-broad/campaign_20261011_broad/paired_gate_up_rejected_restored.json)
+verifies native sources, tests, benchmark and installed extension against
+`ba37af5210`. No captured validation or promotion claim was made for this
+rejected candidate. The broad 2× objective remains unmet.
