@@ -144,3 +144,30 @@ staging boundaries, split tails, aliasing, shared scratch and worker teardown.
 The two-seed synthetic timing comparison omits the 96-thread, native TP2 and
 unequal-shard controls, and is supplemental evidence. It does not establish
 the primary replay promotion gate or full-model serving throughput.
+
+## Follow-up wake experiments
+
+Two further E10 sparse cold diagnostics moved team broadcasts to an existing
+node-local worker, either alone or combined with caller participation. Both
+passed the 11-test NUMA selection and 60 creation/execution/destruction cycles
+alternating one-thread and 32-thread teams. Immediate `/proc/self/task`
+counts occasionally retained one terminating task entry; after 50 ms the
+count returned to the original single thread. The initial assertion failure
+and the repeat snapshots are preserved in the artifacts.
+
+| Rotation-0 complete-call mean, microseconds | M1 | M4 | M5 | M8 |
+| --- | --- | --- | --- | --- |
+| Earlier active-experts diagnostic | 477.2 | 492.7 | 517.9 | 528.6 |
+| Delegated broadcast | 595.6 | 604.7 | 614.7 | 632.9 |
+| Delegated broadcast plus caller | 594.8 | 594.1 | 630.2 | 644.5 |
+
+The delegated-only version lowered node 1's first-phase time, but additional
+startup time erased that benefit. The combined version confirmed caller
+participation and still missed the complete-call objective. These are
+unpaired shared-host diagnostics, not causal regression estimates. Both
+variants were rejected before full-grid timing. The committed active-experts
+source and its tested extension were restored byte-for-byte.
+
+[Delegated evidence](/home/tianmuli/vllm_test/vllm_local/build-numa-broad/campaign_20261011_broad/delegated_wake_shadow_sparse.json) and
+[combined evidence](/home/tianmuli/vllm_test/vllm_local/build-numa-broad/campaign_20261011_broad/combined_wake_shadow_sparse.json)
+record exact source/binary hashes, all rotations and numerical parity.
