@@ -2,7 +2,9 @@
 
 The retained experimental candidate combines bounded whole-expert column
 scheduling, down-projection weight reuse within existing scratch, and shared
-staged inputs for identical node-local token lists. The broad 2× complete-call
+staged inputs for identical node-local token lists. Synchronous stage callbacks
+use non-owning references to eliminate per-worker closure allocations.
+The broad 2× complete-call
 target remains unmet. Fixed ownership meets more cells than either dynamic
 policy, and the dynamic policies do not meet the 5% gain over fixed ownership.
 Serving promotion is rejected; numerical correctness and performance gates
@@ -439,3 +441,91 @@ at M={1,7,129,257} passed numerical/routing correctness with all three
 single-node references. Each cell's reported logical and physical routed-slot
 totals and final-round index were independently checked. This smoke validates
 reporting, not speedup. Pre-commit checks passed for both retained changed files.
+
+## Subset dispatch, barrier and input-placement diagnostics
+
+The [subset-sharing trial](../../../build-numa-broad/campaign_20261011_broad/subset_staging_full64_seed0_retry1.json)
+mapped each 32-row expert block to a verified contiguous subset of the first
+local group's staged inputs. Its new M129 case reduced dispatched input rows
+from 258 to 162 and passed aliasing and numerical checks. All 11 NUMA tests
+passed. Full64 static/balanced/split replay measured 760.31/780.50/784.93 ms;
+their small pass counts were 22/20/21 of 28 and large counts 20/21/20 of 24.
+Split rarely exercised this reuse in the failing common-set cells. It did not
+close the target, so the change is rejected. The first launch rejected an old
+oracle identity before timing; that failure remains preserved.
+
+A [dissemination-barrier trial](../../../build-numa-broad/campaign_20261011_broad/dissemination_local_full64_seed0.json)
+replaced the shared arrival counter with five rounds of peer notifications.
+Its flags occupied the NUMA-bound Team object; an initial heap-storage version
+was corrected before timing. Twelve NUMA tests passed, including a three-thread
+team to exercise non-power-of-two membership. Full64 static/balanced/split
+measured 785.11/789.63/786.97 ms, with small counts 21/19/20 and large counts
+20/20/20. Static M3 changing had median/p95 0.06910/0.07613 ms but mean
+1.13984 ms, dominated by one round averaging 10.77312 ms. The outlier is
+unexplained; M4/M5/M6 changing still missed 2×. The barrier is rejected.
+
+Both native trials were restored to the exact retained
+[source/binary identity](../../../build-numa-broad/campaign_20261011_broad/after_subset_dissemination_restored.json).
+
+Two diagnostics then kept that binary and fixed input pages before runtime
+creation, calibration, warmup and timing. Affinity alone left some allocator
+pages on other nodes, so own-process `move_pages` migrated and queried all pages
+covering hidden states, IDs and routing weights. This changes placement without
+duplicating activations or changing tensor bytes. Both corpora retained hash
+`e75710853492d4cafa8138b9bebb248f42ffd2f85eda701813e840a82f4dd5ee`.
+Single-node controls kept their local inputs. Each run used static and the three
+single-node references with ten paired rounds.
+
+| Input placement | Verified input pages | Static replay | Small ≥2× | Large ≥2× |
+| --- | ---: | ---: | ---: | ---: |
+| [Node 1](../../../build-numa-broad/campaign_20261011_broad/fixed_input_node1_seed0.json) | 41,963 on node 1 | 764.63 ms | 21/28 | 20/24 |
+| [Node 3](../../../build-numa-broad/campaign_20261011_broad/fixed_input_node3_seed0.json) | 41,962 on node 3 | 799.85 ms | 21/28 | 21/24 |
+
+Both passed numerical checks; neither closes the target. These separate runs
+establish verified placement conditions, rather than a paired causal estimate
+between placements. Their page-query records and wrapper source are preserved
+beside the timing artifacts.
+
+## Synchronous callback ownership
+
+The retained callback change replaces `std::function` parameters in
+`CpuMoeExecutor` with Torch's `c10::function_ref`. Executor stages invoke these
+callbacks synchronously and finish before returning; asynchronous Team jobs
+still own their callbacks. No new wrapper or helper is introduced, and the FP8
+kernel source and arithmetic remain unchanged.
+
+The [retained-binary disassembly](../../../build-numa-broad/campaign_20261011_broad/CAF_fp8_callback_allocations.disasm.txt)
+showed closure allocations of 232 bytes for gate/up, 224 for down and 32 for
+SiLU on the executor path. With all 96 workers active, that is 288 allocations
+per call. The
+[new binary](../../../build-numa-broad/campaign_20261011_broad/function_ref_fp8_callback_paths.disasm.txt)
+has no direct `operator new` call in that specialized FP8 function. This
+establishes eliminated allocation work, not a complete-call speedup claim.
+
+| Run | Static replay | Small ≥2× | Large ≥2× |
+| --- | ---: | ---: | ---: |
+| [All four policies, fixed node-1 inputs](../../../build-numa-broad/campaign_20261011_broad/function_ref_fixed_node1_seed0.json) | 764.50 ms | 23/28 | 20/24 |
+| [Matching four-variant diagnostic](../../../build-numa-broad/campaign_20261011_broad/function_ref_fixed_node1_matched_seed0.json) | 763.81 ms | 22/28 | 21/24 |
+
+The matching run used static and three single-node controls, as in the retained
+fixed-input diagnostic. Aggregate time was essentially unchanged from its
+764.63 ms. Several small changing calls were descriptively 1–2% faster, but
+these separate launches do not establish paired causal gains. All small-cell
+p95 ratios stayed within 5% regression relative to that diagnostic. Isolated
+mean outliers remain, and M3 Zipf, M3/M4/M5 changing and large changing cells
+still miss 2×. Balanced and split in the four-policy run were slower than static,
+at 778.34/778.15 ms. The broad target and promotion gate remain unmet.
+
+Retain this small ownership change because it demonstrably eliminates recurrent
+allocations with a simpler synchronous contract and no measured aggregate
+regression; continue tuning rather than treating it as qualification.
+The [installation journal](../../../build-numa-broad/campaign_20261011_broad/function_ref_install.json)
+records source/extension identity;
+[build commands](../../../build-numa-broad/campaign_20261011_broad/function_ref_build_commands.json)
+record the rebuilt native and FP8 objects.
+All 96 selected NUMA, FP8 and MXFP4 tests passed, as did pre-commit checks.
+[Captured-output validation](../../../build-numa-broad/campaign_20261011_broad/function_ref_primary_numerical.json)
+completed all 1,920 records over 40 layers for each of the four policies.
+Static, balanced and split matched captured outputs exactly; rows' maximum
+absolute error was 0.03125 within the existing tolerance.
+This validates captured outputs, rather than primary timing or serving throughput.

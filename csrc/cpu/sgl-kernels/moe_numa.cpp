@@ -10,6 +10,7 @@
 #include <condition_variable>
 #include <cstring>
 #include <fstream>
+#include <functional>
 #include <limits>
 #include <map>
 #include <mutex>
@@ -270,8 +271,7 @@ struct Executor : CpuMoeExecutor {
   const int32_t* grouped_input_offsets() const override {
     return input_offsets;
   }
-  void for_1d(int64_t n,
-              const std::function<void(int64_t, int64_t)>& f) override {
+  void for_1d(int64_t n, c10::function_ref<void(int64_t, int64_t)> f) override {
     int64_t begin = n * tid / team.size();
     int64_t end = n * (tid + 1) / team.size();
     try {
@@ -282,9 +282,9 @@ struct Executor : CpuMoeExecutor {
     team.sync();
     team.check();
   }
-  void for_2d(int m, int n,
-              const std::function<void(int64_t, int64_t, int64_t, int64_t)>& f)
-      override {
+  void for_2d(
+      int m, int n,
+      c10::function_ref<void(int64_t, int64_t, int64_t, int64_t)> f) override {
     if (tiles && m >= 1 && m <= team.size() &&
         m == static_cast<int>(tiles->work_prefix.size()) - 1 &&
         n >= team.size()) {
