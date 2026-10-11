@@ -701,3 +701,69 @@ preserve it. The [restore journal](../../../build-numa-broad/campaign_20261011_b
 verifies native sources, tests, benchmark and installed extension against
 `ba37af5210`. No captured validation or promotion claim was made for this
 rejected candidate. The broad 2× objective remains unmet.
+
+## Calibrate with nonzero activations
+
+The [activation-data diagnostic](../../../build-numa-broad/campaign_20261011_broad/calibration_activation_diagnostic_v2.json)
+compared zero and deterministic normal inputs using the first eight checkpoint
+experts, fixed static ownership and verified node-1 input pages. Five rotated
+rounds measured ten complete calls per case, both isolated warm calls and calls
+after explicit expert-weight eviction. All outputs matched the existing
+single-node operator exactly. Nonzero cold-weight complete-call medians were
+8–14% higher at M129–512; M1–5 changed little. This isolates a bias in zero-input
+calibration but does not qualify replay performance. The initial launcher
+stopped before worker creation because the caller affinity was narrowed too
+early; its script and log remain preserved.
+
+Calibration now fills both fixture families from a local fixed-seed normal
+BF16 pattern, scaled by the inverse square root of hidden width. Repeating
+32 rows keeps generation inexpensive without consuming PyTorch RNG state.
+The pattern is reproducible within the same standard-library implementation.
+It remains an approximation of real layer activations. Calibration is still
+untimed, uses five weight-evicted samples per point, and freezes its coefficients.
+Execution arithmetic and FP8 microkernels are unchanged.
+
+| Nonzero calibration run | Static replay | Split replay | Split small ≥2× | Split large ≥2× |
+| --- | ---: | ---: | ---: | ---: |
+| [Seed 0](../../../build-numa-broad/campaign_20261011_broad/nonzero_calibration_fixed_node1_seed0.json) | 766.70 ms | 745.99 ms | 21/28 | 22/24 |
+| [Seed 1](../../../build-numa-broad/campaign_20261011_broad/nonzero_calibration_fixed_node1_seed1.json) | 765.24 ms | 741.80 ms | 21/28 | 22/24 |
+
+Against the earlier launches with matching seeds, split aggregate time changed
+by +0.27% and −0.38%. Its paired advantage over static was 1.028×,
+CI [1.025, 1.031], and 1.032×, CI [1.028, 1.035].
+These results establish no gain from changing calibration inputs. Several
+small-cell p95 ratios exceeded 1.10 in seed 1, including 1.335 for split M6
+hot-eight; none of those split increases repeated in seed 0. Balanced seed 1
+also had large small-call outliers. Separate-launch comparisons are descriptive.
+The small-group cost model and caller preemption still need work.
+
+Retain the nonzero fixtures as a calibration realism correction, without a
+speedup or promotion claim. All 11 existing NUMA tests passed.
+[Captured validation](../../../build-numa-broad/campaign_20261011_broad/nonzero_calibration_primary_numerical.json)
+passed all 1,920 records for every policy: static/balanced/split matched exactly,
+and rows' maximum absolute error stayed at 0.03125 within the existing tolerance.
+Input payloads, source and extension identities remained stable.
+The [installation journal](../../../build-numa-broad/campaign_20261011_broad/nonzero_calibration_install.json)
+and [build commands](../../../build-numa-broad/campaign_20261011_broad/nonzero_calibration_build_commands.json)
+record the retained implementation. The fixture helper serves both calibration
+families; existing behavior tests cover the unchanged replay interface.
+
+## Rejected equal columns across short multiple-block groups
+
+The candidate extended existing equal-row column ownership to grouped queues
+of at most eight experts and five row blocks per expert. It retained the GEMM
+loop, per-MB input offsets, weight unpacking, tails and stage barriers.
+Independent review found no correctness blocker, and all 11 NUMA tests passed.
+This was a bounded refinement of the earlier archived `grouped_columns` idea,
+on the newer input-sharing foundation and with nonzero calibration.
+
+The [64-cell result](../../../build-numa-broad/campaign_20261011_broad/equal_shared_columns_fixed_node1_seed0.json)
+passed synthetic correctness but did not improve on nonzero calibration alone.
+Split replay rose from 745.99 to 747.66 ms, while large-cell passes fell from
+22/24 to 20/24. Split's large-call geometric mean latency increased by 1.11%;
+M512 changing fell to 1.809×. M256 hot-eight/changing remained below 2×.
+Reject this scheduling extension. Its
+[cell analysis](../../../build-numa-broad/campaign_20261011_broad/equal_shared_columns_fixed_node1_seed0.analysis.json)
+and [restore journal](../../../build-numa-broad/campaign_20261011_broad/equal_shared_columns_rejected_restored.json)
+preserve the experiment and verify restoration to nonzero calibration alone.
+The broad 2× target remains unmet.

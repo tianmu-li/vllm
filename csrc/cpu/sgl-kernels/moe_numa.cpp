@@ -15,6 +15,7 @@
 #include <map>
 #include <mutex>
 #include <numeric>
+#include <random>
 #include <set>
 #include <sstream>
 #include <thread>
@@ -1476,6 +1477,19 @@ struct Runtime {
                 "Invalid calibration rows");
     std::vector<int> calibration_active;
     calibration_active.reserve(E);
+    std::mt19937 generator(0);
+    std::normal_distribution<float> distribution(0.f,
+                                                 1.f / std::sqrt(float(K)));
+    std::vector<BF16> input_pattern(32 * K);
+    for (auto& value : input_pattern) value = distribution(generator);
+    auto calibration_input = [&](int64_t count) {
+      auto hidden =
+          at::empty({count, K}, at::TensorOptions().dtype(at::kBFloat16));
+      for (int64_t row = 0; row < count; ++row)
+        copy_stub(hidden.data_ptr<BF16>() + row * K,
+                  input_pattern.data() + (row % 32) * K, K);
+      return hidden;
+    };
     auto evict_calibration_weights = [&](int64_t experts) {
       for (auto& r : replicas) {
         r.team->submit([rp = &r, experts, this](int tid) {
@@ -1504,8 +1518,7 @@ struct Runtime {
       for (int64_t experts : {int64_t(1), batch}) {
         calibration_active.resize(experts);
         std::iota(calibration_active.begin(), calibration_active.end(), 0);
-        auto hidden = at::zeros({3 * experts * count, K},
-                                at::TensorOptions().dtype(at::kBFloat16));
+        auto hidden = calibration_input(3 * experts * count);
         auto weights = at::ones({3 * experts * count},
                                 at::TensorOptions().dtype(at::kFloat));
         std::array<std::vector<std::vector<int32_t>>, 3> groups;
@@ -1563,8 +1576,7 @@ struct Runtime {
         // Shared splits use the large-batch scratch and staging paths even
         // when a local slice contains only a few rows.
         int64_t input_rows = std::max<int64_t>(129, 3 * count);
-        auto hidden = at::zeros({input_rows, K},
-                                at::TensorOptions().dtype(at::kBFloat16));
+        auto hidden = calibration_input(input_rows);
         auto weights = at::ones({input_rows * experts},
                                 at::TensorOptions().dtype(at::kFloat));
         std::array<std::vector<std::vector<int32_t>>, 3> shared_groups;
