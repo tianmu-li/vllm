@@ -855,6 +855,14 @@ struct Runtime {
             }
           }
           if (combine_output) {
+            int node = &local - replicas.data();
+            int64_t begin = hidden.size(0) <= 32
+                                ? (node == 0 ? 0 : hidden.size(0))
+                                : hidden.size(0) * node / 3;
+            int64_t end = hidden.size(0) <= 32
+                              ? hidden.size(0)
+                              : hidden.size(0) * (node + 1) / 3;
+            if (tid != 0 && begin + tid >= end) return;
             // Publish only after every node has finished reading its inputs.
             if (tid == 0 &&
                 completed_nodes.fetch_add(1, std::memory_order_acq_rel) == 2) {
@@ -863,13 +871,6 @@ struct Runtime {
             }
             while (!combine_ready.load(std::memory_order_acquire)) _mm_pause();
             if (combine_failed.load(std::memory_order_acquire)) return;
-            int node = &local - replicas.data();
-            int64_t begin = hidden.size(0) <= 32
-                                ? (node == 0 ? 0 : hidden.size(0))
-                                : hidden.size(0) * node / 3;
-            int64_t end = hidden.size(0) <= 32
-                              ? hidden.size(0)
-                              : hidden.size(0) * (node + 1) / 3;
             for (int64_t token = begin + tid; token < end;
                  token += local.team->size())
               sum_rows(combined_output + token * K,

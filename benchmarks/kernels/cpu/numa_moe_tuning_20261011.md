@@ -633,3 +633,38 @@ The [installation journal](../../../build-numa-broad/campaign_20261011_broad/coh
 and [build commands](../../../build-numa-broad/campaign_20261011_broad/coherent_large_build_commands.json)
 record the retained implementation. Shared calibration tables are preserved
 in full warmup snapshots and per-cell metadata.
+
+## Finish workers without output rows before combine
+
+Nonleader workers whose existing output range is empty now finish before
+waiting for all nodes to publish expert completion. Node leaders still publish
+completion, and the runtime still joins every worker. This removes 87–91
+unnecessary readiness pollers at M3–7 without changing projection arithmetic,
+output ownership or alias safety. Large calls retain their existing combine.
+
+| Fixed node-1 input run | Static replay | Split replay | Static small ≥2× | Split large ≥2× |
+| --- | ---: | ---: | ---: | ---: |
+| [Candidate seed 0](../../../build-numa-broad/campaign_20261011_broad/combine_waiters_fixed_node1_seed0.json) | 763.69 ms | 743.99 ms | 25/28 | 23/24 |
+| [Candidate seed 1](../../../build-numa-broad/campaign_20261011_broad/combine_waiters_fixed_node1_seed1.json) | 765.06 ms | 744.62 ms | 26/28 | 22/24 |
+| [Matched parent seed 1](../../../build-numa-broad/campaign_20261011_broad/coherent_large_fixed_node1_seed1.json) | 766.36 ms | 747.08 ms | 25/28 | 22/24 |
+
+These 64-cell runs retain four distributions, four policies, three single-node
+controls and ten rotated rounds. Seed 0's paired split speedup over static was
+1.026×, CI [1.023, 1.030]. Against the matched seed-1 parent in separate
+launches, small-call geometric mean latency ratios were 0.996 for static,
+0.977 for balanced and 0.981 for split. Their p95 ratios were 0.999, 0.972
+and 0.966. Static had isolated p95 increases above 10% at M1/M2 changing;
+balanced and split had none. Cross-launch ratios are descriptive rather than
+paired evidence of a causal improvement.
+
+Retain the small scheduling change with its narrow benefit. Individual
+small and large cells still fail 2×, and the aggregate advantage over static
+remains below the promotion gate.
+All 11 existing NUMA tests passed.
+[Captured validation](../../../build-numa-broad/campaign_20261011_broad/combine_waiters_primary_numerical.json)
+passed all 1,920 records for each policy, with exact static/balanced/split
+outputs and rows' maximum absolute error 0.03125 within the existing tolerance.
+Input payloads, sources and extension remained unchanged throughout validation.
+The [installation journal](../../../build-numa-broad/campaign_20261011_broad/combine_waiters_install.json)
+and [build commands](../../../build-numa-broad/campaign_20261011_broad/combine_waiters_build_commands.json)
+preserve implementation provenance.
