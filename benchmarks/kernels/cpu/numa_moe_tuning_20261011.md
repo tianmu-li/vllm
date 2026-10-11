@@ -529,3 +529,44 @@ completed all 1,920 records over 40 layers for each of the four policies.
 Static, balanced and split matched captured outputs exactly; rows' maximum
 absolute error was 0.03125 within the existing tolerance.
 This validates captured outputs, rather than primary timing or serving throughput.
+
+## Caller participation in the fused pipeline
+
+The caller-participation trial parked the worker sharing the singleton caller's
+CPU and executed that logical worker slot on the caller. It retained the fused
+expert/combine callback, synchronous `function_ref` stages, all 32 barrier
+participants per team and the existing FP8 arithmetic. The runtime serviced
+pending caller work before waiting on any team. An additional last-team caller
+case exercised the otherwise consequential wait-order deadlock risk.
+
+All 11 NUMA tests passed, including caller migration, aliasing, shared runtime
+creation, eviction and sharding. Independent static review found no blocking
+protocol issue. These checks establish correctness, rather than performance.
+
+The [complete fixed-node-1 run](../../../build-numa-broad/campaign_20261011_broad/inline_fused_fixed_node1_seed0.json)
+used the same 80 ordered records, 64 cells, input placement, four policies,
+three single-node controls and ten rotated rounds of ten repeats as the
+committed synchronous-callback baseline. All numerical and routing checks
+passed.
+
+| Policy | Baseline replay | Caller participation | Small ≥2× | Large ≥2× |
+| --- | ---: | ---: | ---: | ---: |
+| Static | 764.50 ms | 765.68 ms | 22/28 | 20/24 |
+| Balanced | 778.34 ms | 786.76 ms | 20/28 | 20/24 |
+| Split | 778.15 ms | 786.53 ms | 19/28 | 21/24 |
+| Rows | 1090.04 ms | 1092.34 ms | 10/28 | 12/24 |
+
+Static still missed M3 Zipf, M3/M4/M5/M6 changing, M5 hot-eight,
+M256 hot-eight and M256/M512/M1024 changing. Compared descriptively across
+launches, static p95 increased by more than 10% for M2 Zipf/changing and
+M3 hot-eight/changing. These observations do not establish paired causal
+regressions, but provide no reason to retain the extra handoff protocol.
+
+Reject the candidate and its candidate-specific test case.
+The [restore journal](../../../build-numa-broad/campaign_20261011_broad/inline_fused_rejected_restored.json)
+confirms that native source, tests, header, benchmark and installed extension
+match the committed `1edaa1616c` baseline.
+The [installation identity](../../../build-numa-broad/campaign_20261011_broad/inline_fused_install.json),
+[build commands](../../../build-numa-broad/campaign_20261011_broad/inline_fused_build_commands.json)
+and [cell analysis](../../../build-numa-broad/campaign_20261011_broad/inline_fused_fixed_node1_seed0.analysis.json)
+preserve the rejected experiment. The broad 2× target remains unmet.
