@@ -85,6 +85,37 @@ Small changing M3/M4 expert execution averaged 0.046/0.053 ms, versus combine
 about 0.008 ms. These native-only profiles locate costs; they do not independently
 qualify speedups or establish their hardware cause.
 
+### Queue-cardinality and placement diagnostics
+
+The [56-cell static profile](../../../build-numa-broad/campaign_20261011_broad/profile_queue_cardinality_static_seed0.json)
+contains correctness checks at M4 and M129. It varies node 1's expert count G
+from 1 to 8, places the remaining 8-G experts on node 2, leaves node 3 empty,
+and keeps each node's expert IDs in ascending order. The [cold profile](../../../build-numa-broad/campaign_20261011_broad/profile_queue_cardinality_cold_static_seed0.json)
+repeats M4 and M512 for G=1..4. The M/G sweeps ran in ascending order without
+counterbalancing. These are placement-conditioned profiles, not intrinsic
+per-group cost curves; the frozen calibration fit excludes submit and combine
+time.
+
+| M512 groups on node 1 | Warm node 1 median | Cold node 1 median | Cold fit prediction |
+| ---: | ---: | ---: | ---: |
+| 2 | 0.37622 ms | 0.39683 ms | 0.27445 ms |
+| 3 | 0.56368 ms | 0.60512 ms | 0.40236 ms |
+| 4 | 0.63433 ms | 0.67459 ms | 0.53026 ms |
+
+The cold M4 profile grows by roughly 17–18 µs per added node-1 group, near the
+model's approximately 21 µs per group. M512 node-1 queue time, including
+dispatch, rises faster than the frozen fit predicts for these placements.
+
+The [14-cell placement-rotation diagnostic](../../../build-numa-broad/campaign_20261011_broad/profile_static_placement_rotation_seed0.json)
+permuted the full expert weight axis and remapped IDs outside the timer; three
+runtime contexts held nine physical weight copies. All rotated records passed
+numerical checks. Over ten paired rounds, offset 1 measured a 1.028224×
+aggregate speedup [1.023508, 1.032720] versus offset 0, while offset 2 measured
+0.992570× [0.985694, 0.998977]. Offset 1's M4 step 0 was 0.079309 ms versus
+0.076709 ms. This diagnostic did not meet the 5% target and is neither a
+complete-call qualification nor a new policy; it does not establish an
+intrinsic queue-cardinality curve.
+
 In the split M512-changing profile, node 2 took 0.611 ms versus its own
 0.388 ms prediction and was slowest in all 20 calls. Its four groups occupied
 [5,5,16,16] row blocks. Rectangular M slices crossed three experts there, versus
@@ -206,6 +237,7 @@ measurements are descriptive, not paired causal comparisons.
 | [Hierarchical counter, seed 0](../../../build-numa-broad/campaign_20261011_broad/hierarchical_counter_full64_seed0.json) | 762.18 ms | 24/28 | 20/24 |
 | [Whole-expert columns through 32 row blocks, both projections, seed 0](../../../build-numa-broad/campaign_20261011_broad/shared_input_columns_bounded32_full64_seed0.json) | 768.50 ms | 26/28 | 21/24 |
 | [Whole-expert columns through 32 row blocks, gate/up only, seed 0](../../../build-numa-broad/campaign_20261011_broad/shared_input_columns_up_only_full64_seed0.json) | 765.75 ms | 24/28 | 21/24 |
+| [Second-arriver activation, seed 0](../../../build-numa-broad/campaign_20261011_broad/second_arriver_activation_full64_seed0.json) | 790.61 ms | 23/28 | 20/24 |
 
 The seed-1 route-view result and same-seed retained control show why separate-run
 differences are not causal evidence: the static small-cell pass count was 6/28
@@ -219,6 +251,16 @@ M1024-changing was 1.80176×. Its 11 NUMA tests and 320 synthetic correctness
 checks passed. After rejecting the two column trials, source, test and binary
 were restored to the exact retained identities recorded in the
 [restoration record](../../../build-numa-broad/campaign_20261011_broad/shared_input_columns_trials_rejection_restored.json).
+
+The second-arriver trial used two acq_rel producer bits; the final writer
+computed SiLU on 32 columns and skipped the separate activation barrier for
+native calls with M≤4, at most four rows per group and eight groups per node.
+Calibration and sharded calls used the retained pipeline. Its 11 NUMA tests and 320
+synthetic comparisons passed, but M4-changing reached only 1.87448×. Static
+M3-changing had a 1.48572061 ms mean (0.0916×), versus a 0.069288 ms median and
+0.078121 ms p95; this outlier is not attributed to the source. The trial was
+not retained, and source, test and binary were restored to the retained identities
+in the [restoration record](../../../build-numa-broad/campaign_20261011_broad/second_arriver_activation_rejection_restored.json).
 
 Earlier rejected experiments remain in their original artifacts. Active waits,
 expert-aligned gangs, padded input rows, sparse-16 scheduling and caller-last
@@ -235,6 +277,6 @@ found zero recorded GC overlap across its native call windows. A separate
 [rusage trace](../../../build-numa-broad/campaign_20261011_broad/route_group_views_rusage_trace_seed1.rusage_trace.json)
 did not reproduce the roughly 100 ms stalls; its 3.23 ms outlier coincided
 with involuntary context switches and zero page faults. The cause remains
-unresolved because thread-level trace access was unavailable. These diagnostic
-captures are not promotion timing, and no historical artifacts were
+unresolved in these captures, which lack a thread-level timeline. These
+diagnostic captures are not promotion timing, and no historical artifacts were
 overwritten.
