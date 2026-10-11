@@ -1066,3 +1066,37 @@ performance acceptance or rejection. The
 [pending-trial restore journal](../../../build-numa-broad/campaign_20261011_broad/cached_buffer_pages_pending_restored.json)
 verifies restoration of the retained source and extension; candidate source,
 binary and build provenance remain available for a clean rerun.
+
+## Follow-up baseline and shared-socket interference
+
+After the compiler processes exited, a
+[fresh retained-binary baseline](../../../build-numa-broad/campaign_20261011_broad/clean_pages_baseline_fixed_node1_seed0.json)
+passed numerical checks. Split replay was 759.28 ms; 21/28 small and 23/24 large
+cells reached 2×. The misses were M3 zipf/changing, M4 changing, M5 hot8/changing,
+M6/M7 changing and M256 changing. Paired split/static speedup was 1.0059,
+CI [1.0030, 1.0087]. This reconfirms that neither broad target nor the
+5% static-ownership gate is met.
+
+The matching page-count candidate passed numerical checks, but a separate
+node-5 weight-prefetch benchmark began during its timed rounds. Its
+[process-start and affinity observation](../../../build-numa-broad/campaign_20261011_broad/clean_cached_buffer_pages_fixed_node1_seed0.host_prefetch_observation.json)
+records that overlap. Node 5 shares the socket/cache with node 3.
+No performance inference is made from this candidate run.
+
+A second retry added two-second process CPU sampling to the launcher.
+The [resource gate](../../../build-numa-broad/campaign_20261011_broad/sampled_cached_buffer_pages_fixed_node1_seed0.resource_gate.json)
+records 49 timed samples with external activity above 0.5 CPU, including another
+confirmed node-5 weight-prefetch process. Short-lived work can fall between
+samples; this is an overlap detector, not proof of exclusive host ownership.
+Correctness passed, performance remains ineligible, and the
+[restore journal](../../../build-numa-broad/campaign_20261011_broad/sampled_cached_buffer_pages_pending_restored.json)
+verifies the retained source and extension. An exclusive timing window is
+needed before evaluating the page-count candidate.
+
+Two execution ideas were screened without implementation. Input-gather reuse
+across cache panels removes no redundant gather for M3/M4 common routes:
+actual weighted callbacks span at most 1–3 columns, within one four-column
+panel. M>128 already stages its inputs. Caller-as-tid0 execution was also
+found in the archived `inline_fused_fixed_node1_seed0` trial, which was rejected
+for insufficient aggregate benefit and small-case tail regressions. Neither
+idea has new evidence supporting a repeat.
