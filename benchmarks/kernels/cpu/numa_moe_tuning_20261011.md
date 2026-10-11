@@ -809,3 +809,30 @@ code. The [restore journal](../../../build-numa-broad/campaign_20261011_broad/co
 verifies the committed source and retained nonzero-calibration extension.
 The [cell analysis](../../../build-numa-broad/campaign_20261011_broad/combine_unroll4_fixed_node1_seed0.analysis.json)
 preserves failures and tail ratios. The broad 2× objective remains unmet.
+
+## Rejected consumer-side activation
+
+The candidate removed the standalone SiLU stage for direct NUMA calls with
+N≤K, computing the same BF16 activation in each down-projection worker's
+private input scratch. The existing gate barrier, GEMMs, weighting and combine
+order remained. A callback-local row-block cache reused activation across
+consecutive columns; different workers and row-block revisits duplicated work.
+All 11 NUMA tests and synthetic correctness checks passed.
+
+The [64-cell diagnostic](../../../build-numa-broad/campaign_20261011_broad/consumer_activation_fixed_node1_seed0.json)
+was slower: split replay increased from 745.99 to 817.54 ms. Split passed
+21/28 small and 20/24 large cells; their geometric mean latencies increased
+6.25% and 10.60%. Static large latency also increased 9.73%.
+These separate-launch comparisons do not isolate causality, but provide no
+reason to retain duplicated activation. The
+[analysis](../../../build-numa-broad/campaign_20261011_broad/consumer_activation_fixed_node1_seed0.analysis.json)
+preserves every cell and tail ratio.
+
+Independent review identified a local restricted input pointer subsequently
+aliasing scratch written within the callback. No miscompile was observed, but
+the qualifier must be removed before any retest; this unresolved concern
+precludes treating the diagnostic as qualification evidence. Reject the
+candidate without a retest or captured-validation claim. The
+[restore journal](../../../build-numa-broad/campaign_20261011_broad/consumer_activation_rejected_restored.json)
+confirms committed source and retained extension identities. The broad target
+remains unmet.
