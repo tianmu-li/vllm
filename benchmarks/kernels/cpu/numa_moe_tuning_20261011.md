@@ -90,8 +90,22 @@ In the split M512-changing profile, node 2 took 0.611 ms versus its own
 [5,5,16,16] row blocks. Rectangular M slices crossed three experts there, versus
 at most two on the other nodes, adding weight-unpack sequences. Reordering
 whole expert groups could reduce those crossings without changing placement or
-within-group row blocks. This is a specific next experiment, not an established
-cause or a measured improvement.
+within-group row blocks. This motivated the ordering trial below; the profile
+does not establish the cause of the slowdown.
+
+The subsequent [ordering trial](../../../build-numa-broad/campaign_20261011_broad/expert_order_crossings_full64_seed0.json)
+searched at most 28 pair swaps and kept both projections' maximum crossing
+counts at or below their initial values. It passed 11 NUMA tests and synthetic
+correctness, but split
+replay remained 782.64 ms versus the retained seed-0 run's 782.75 ms.
+M512-changing split speedup was 1.841×; its absolute latency was about 1%
+higher in these separate runs. This does not establish a significant regression
+or an unpacking cause, and it does not justify retaining the search.
+The trial used native source `5adf6e150ffcce0b0a4edbea92474259eef2162fcf10d3b158a18e447eddfabb`
+and binary `715a33a658f4a6210df0442337c4cfdb5a91dcb1b25ed00b7a2af0a771386ec7`.
+Its near-INT32_MAX block-count overflow was outside campaign sizes; the widened
+candidate remains an unbuilt artifact. The trial code and its dedicated test
+case were removed, and the retained source and binary were restored exactly.
 
 The separate [counter run](../../../build-numa-broad/campaign_20261011_broad/shared_staged_ranges_counters_seed0.json)
 collected cycles, instructions, generic cache references and cache misses over
