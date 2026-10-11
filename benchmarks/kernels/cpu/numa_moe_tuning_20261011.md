@@ -294,3 +294,148 @@ This establishes caller preemption in that warmup delay, but does not explain
 the roughly 100 ms measured outliers: none reproduced in this capture.
 Worker off-CPU overlap cannot establish a critical-path delay without worker
 completion markers; a worker may already have finished its contribution.
+
+## Dense groups and worker scheduling follow-up
+
+These are synthetic diagnostics on the same 96 physical CPUs, with one shared
+worker pool and three weight replicas. They do not qualify serving integration.
+All runs retain FP8 microkernels, block scales and the original top-k addition
+order. Each full64 run uses 80 consecutive records, ten paired rotated rounds
+and ten sequence repeats, with three separately pinned single-node references.
+Historical artifacts and failed launch records remain intact.
+
+The dense-row selector requires every token to route once to each expert in the
+common set. Counts alone are insufficient: a duplicated-slot regression case
+has the same counts but must retain whole groups. Three-node row partitioning
+starts at M256 in `dense_rows`. The two-node diagnostic used replicas on nodes
+1 and 3 and retained the existing three-team completion/combine protocol.
+
+| Run / policy | Mean replay | Small ≥2× | Large ≥2× |
+| --- | ---: | ---: | ---: |
+| [Credit/row controls, seed 0](../../../build-numa-broad/campaign_20261011_broad/credit_rows2_full64_seed0.json): static | 761.38 ms | 26/28 | 20/24 |
+| Same run: static_credit | 760.82 ms | 27/28 | 20/24 |
+| Same run: dense_rows | 735.55 ms | 25/28 | 23/24 |
+| Same run: two-node rows | 829.67 ms | 25/28 | 15/24 |
+| [Credit/row controls, seed 1](../../../build-numa-broad/campaign_20261011_broad/credit_rows2_full64_seed1.json): static | 761.38 ms | 28/28 | 21/24 |
+| Same run: static_credit | 759.37 ms | 28/28 | 21/24 |
+| Same run: dense_rows | 734.76 ms | 27/28 | 22/24 |
+| Same run: two-node rows | 828.82 ms | 26/28 | 15/24 |
+
+Two-node row partitioning is rejected: paired speedups against static were
+0.91769× [0.91644, 0.91896] and 0.91863× [0.91731, 0.92006]. Credited one-dimensional
+barriers produced only 1.00073× [0.99890, 1.00284] and
+1.00264× [1.00092, 1.00426]. They are an experimental control, with no broad
+performance claim. Empty ranges carry no arrival count; a designated active
+worker credits them, while actual job completion still requires every worker.
+The preceding activation-only trial also missed the small-cell target.
+
+`dense_groups` assigns common-set experts by sorted group position, rather than
+logical ID modulo three. `dense_columns` adds weighted whole-group columns up to
+eight row blocks when M≤256, credited one-dimensional barriers, and three-node
+row partitioning for eligible common sets above 256. Non-common routes retain
+static expert placement, but eligible six-to-eight-block groups still use the
+widened executor. These selectors are diagnostic heuristics, rather than the
+calibrated 5%-makespan split policy.
+
+| Run / policy | Mean replay | Small ≥2× | Large ≥2× |
+| --- | ---: | ---: | ---: |
+| [Bounded columns, seed 0](../../../build-numa-broad/campaign_20261011_broad/dense_columns_full64_seed0.json): static | 759.00 ms | 24/28 | 20/24 |
+| Same run: dense_groups | 764.34 ms | 23/28 | 20/24 |
+| Same run: dense_columns | 731.94 ms | 24/28 | 23/24 |
+| [Bounded columns, seed 1](../../../build-numa-broad/campaign_20261011_broad/dense_columns_full64_seed1.json): static | 762.22 ms | 26/28 | 21/24 |
+| Same run: dense_groups | 766.60 ms | 25/28 | 20/24 |
+| Same run: dense_columns | 736.15 ms | 25/28 | 23/24 |
+
+Sorted-position assignment alone regressed aggregate time in both seeds.
+The combined column candidate saved 3.57%/3.42% versus static, with paired
+speedups 1.03697× [1.03492, 1.03922] and 1.03540× [1.03314, 1.03765].
+M256 hot-eight improved from 1.9429× to 2.0533× in seed0, but M256 changing
+remained at 1.9502×/1.9778×. Small changing-route cells also missed 2×.
+The broad target and the ≥5% aggregate promotion gate remain unmet.
+Both runs passed 320 numerical comparisons, four aliases and 320 routing checks.
+The installation identity is in the
+[column journal](../../../build-numa-broad/campaign_20261011_broad/dense_columns_install.json).
+
+The [credited switch capture](../../../build-numa-broad/campaign_20261011_broad/credited_switch_trace_seed1.switch_summary.json)
+completed correctly and recorded 110,377 events with no lost records.
+Five small calls took 2.6–4.0 ms; caller preemption occupied 2.57–3.86 ms.
+The captured process stream next showed worker CPU32 running, but does not
+establish whether that worker had just awakened or was already runnable.
+No roughly 100 ms outlier reproduced.
+
+An initial attempt to give only the shared worker `SCHED_BATCH` matched creation
+CPU34, while the timed caller later ran on CPU32. It is preserved as a placement
+mismatch, not evidence for the intended treatment. Subsequent all-worker Batch
+and Idle trials verified the actual 96 worker policies and affinities.
+The [Idle trial](../../../build-numa-broad/campaign_20261011_broad/idle_workers_full64_seed0.json)
+passed numerical checks, but regressed static to 766.54 ms and the column
+candidate to 741.42 ms. It is rejected.
+
+Starting with that trial, synthetic cells retain the already-collected native
+phase/node snapshots from the final timing round. These statistics are separate
+from the complete-call latency distribution over all ten rounds. For small
+changing routes, gather/combine included roughly 10–13 µs; it includes worker
+completion and caller wakeup, so that interval is not attributed solely to
+floating-point reduction. A further control divided top-8 reduction into
+32-channel blocks for M≤8, preserving one writer per output element and the
+original slot order, without adding workers.
+
+The [channel control](../../../build-numa-broad/campaign_20261011_broad/channel_columns_full64_seed0.json)
+passed correctness, but its 733.41 ms aggregate did not improve on the same
+run's dense-column control at 733.11 ms. Both passed only 26/28 small cells and
+23/24 large cells. M4 changing remained below 2×. Reducing this part of the
+combine work does not resolve the complete-call target.
+
+The [expanded boundary matrix](../../../build-numa-broad/campaign_20261011_broad/channel_edges_seed0.json)
+covered M={1,2,3,4,5,6,7,129,192,255,257,384,768,8192} with all four
+distributions and ten paired rounds. Dense columns passed 25/28 small and
+26/28 large cells; static passed 23/28 and 22/28. Although aggregate time
+fell from 871.21 to 814.55 ms in this different corpus, M257 hot-eight
+regressed from 2.077× to 1.865× against its fastest single-node reference.
+The threshold that selects row partitioning above M256 is therefore unsafe
+as a broad policy. At M8192 the dense-column diagnostic reached
+2.608×/3.004×/3.203× for Zipf/hot-eight/changing routes. These successes do
+not erase the boundary regression or qualify the original corpus.
+
+The separate [counter diagnostic](../../../build-numa-broad/campaign_20261011_broad/channel_counters_seed0.json)
+passed correctness and recorded all eight requested events in ten windows,
+with 100% running time and acknowledged enable/disable operations. Two rounds
+of ten full-sequence repeats gave the following totals for the native policies:
+
+| Counter | Static | Dense columns |
+| --- | ---: | ---: |
+| User cycles | 480.23 billion | 465.13 billion |
+| User instructions | 265.80 billion | 266.37 billion |
+| LLC misses / references | 31.52% | 32.55% |
+| IMC reads, sch0 + sch1 | 205,929.53 MiB | 223,946.17 MiB |
+| IMC writes, sch0 + sch1 | 40,384.36 MiB | 38,301.00 MiB |
+
+The candidate reduced cycles while increasing measured IMC reads by about
+8.8%. This does not establish a memory bottleneck or a causal traffic benefit:
+CPU events cover CPUs32–127 system-wide, including replay bookkeeping and the
+untimed statistics getter. IMC events have package scope and include unrelated
+traffic. Their PMU representative mask is 0,96; CPU96 lies in the collection
+set, but CPU0 does not. These totals are not a whole-machine bandwidth claim.
+The PMU supplied MiB units; modeled weight bytes were not used as measured
+bandwidth. Instrumented timing is excluded from promotion.
+
+Inspection of the installed Torch BF16×BF16 BRGEMM overload used by
+`gemm_fp8.cpp` found a thread-local kernel cache on its warm path, rather than
+an ATen global cache lock. Cache hits call `dnnl_brgemm_execute`; releasing the
+hardware context does not clear that map. This rules out that specific proposed
+lock explanation, while leaving oneDNN cache-miss internals unmeasured.
+
+The follow-up native candidates are rejected. Restore the previously retained
+runtime and its exact extension from the
+[installation journal](../../../build-numa-broad/campaign_20261011_broad/retained_after_channel_restore.json);
+keep only per-cell reporting of the existing final-round native statistics.
+Candidate source snapshots, binaries, raw timing, correctness and counter
+artifacts remain available for diagnosis. The broad 2× target remains unmet,
+and no serving promotion is justified.
+
+After restoration, all 11 existing NUMA tests passed. A
+[16-cell reporting smoke](../../../build-numa-broad/campaign_20261011_broad/retained_stats_smoke.json)
+at M={1,7,129,257} passed numerical/routing correctness with all three
+single-node references. Each cell's reported logical and physical routed-slot
+totals and final-round index were independently checked. This smoke validates
+reporting, not speedup. Pre-commit checks passed for both retained changed files.

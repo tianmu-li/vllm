@@ -1054,6 +1054,7 @@ def _synthetic_complete_call_summary(
     call_samples: dict[str, list[float]],
     timing_repeats: int,
     rounds: int,
+    latest_round_stats: dict[str, list[dict[str, Any]]],
 ) -> dict[str, Any]:
     cell_indices: dict[tuple[int, str], list[int]] = defaultdict(list)
     for index, record in enumerate(records):
@@ -1151,6 +1152,17 @@ def _synthetic_complete_call_summary(
                 ),
                 "two_x_status": status,
             }
+            snapshots = latest_round_stats.get(policy, [])
+            if snapshots:
+                cell_stats = _native_stats_summary(
+                    [
+                        snapshots[repeat * len(records) + index]
+                        for repeat in range(timing_repeats)
+                        for index in indices
+                    ]
+                )
+                cell_stats["timing_round_index"] = rounds
+                policy_results[policy]["native_stats_summary"] = cell_stats
 
         measured_statuses = [
             status for status in policy_statuses.values() if status in ("pass", "fail")
@@ -2748,6 +2760,7 @@ def _run_benchmark(args: argparse.Namespace) -> dict[str, Any]:
                 call_samples,
                 args.timing_repeats,
                 rounds,
+                latest_round_stats,
             )
             if args.mode == "synthetic"
             else None
