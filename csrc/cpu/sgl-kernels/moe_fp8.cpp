@@ -38,9 +38,24 @@ void fused_experts_fp_kernel_impl(
     float alpha,
     float limit,
     CPUActMethod act_func,
-    bool with_bias) {
+    bool with_bias,
+    CpuMoeExecutor* executor) {
   constexpr int64_t BLOCK_M = block_size_m();
   constexpr int64_t BLOCK_N = block_size_n();
+  auto team_2d = [&](int m, int n, const auto& f) {
+    if (executor) {
+      executor->for_2d(m, n, f);
+    } else {
+      parallel_2d(m, n, f);
+    }
+  };
+  auto team_1d = [&](int64_t n, const auto& f) {
+    if (executor) {
+      executor->for_1d(n, f);
+    } else {
+      at::parallel_for(0, n, 0, f);
+    }
+  };
 
   // stage 1: intermediate_cache0 = hidden_states @ w1
   const int64_t MB = div_up(num_tokens_post_pad, BLOCK_M);
@@ -63,9 +78,9 @@ void fused_experts_fp_kernel_impl(
   int64_t B_tmp_size_per_thread = MAX_CACHE_BLOCK_SIZE * BLOCK_N * std::max(K, N);
 
   // here we only parallel on half of 2N to fuse silu_and_mul with gemm
-  parallel_2d(MB, NB, [&](int64_t mb0, int64_t mb1, int64_t nb0, int64_t nb1) {
+  team_2d(MB, NB, [&](int64_t mb0, int64_t mb1, int64_t nb0, int64_t nb1) {
     // get local pointers
-    int tid = get_thread_num();
+    int tid = executor ? executor->thread_id() : get_thread_num();
     scalar_t* __restrict__ A = A_tmp + tid * BLOCK_M * K;
     bool use_brgemm = false;
 
@@ -126,13 +141,13 @@ void fused_experts_fp_kernel_impl(
 
   // stage 1.5: intermediate_cache1 = silu(intermediate_cache0)
   if (act_func == CPUActMethod::silu_and_mul) {
-    at::parallel_for(0, M * topk, 0, [&](int64_t begin, int64_t end) {
+    team_1d(M * topk, [&](int64_t begin, int64_t end) {
       for (int64_t m = begin; m < end; ++m) {
         silu_and_mul_stub(ic1 + m * N, ic0 + m * 2 * N, ic0 + m * 2 * N + N, N);
       }
     });
   } else if (act_func == CPUActMethod::swiglu) {
-    at::parallel_for(0, M * topk, 0, [&](int64_t begin, int64_t end) {
+    team_1d(M * topk, [&](int64_t begin, int64_t end) {
       for (int64_t m = begin; m < end; ++m) {
         clamp_sigmoid_and_mul_stub(ic1 + m * N, ic0 + m * 2 * N, N / 2, alpha, limit);
         clamp_sigmoid_and_mul_stub(ic1 + m * N + N / 2, ic0 + m * 2 * N + N, N / 2, alpha, limit);
@@ -152,8 +167,8 @@ void fused_experts_fp_kernel_impl(
   const int64_t stride_oc = packed_IC;
 
   // parallel on [MB2, NB2]
-  parallel_2d(MB2, NB2, [&](int64_t mb0, int64_t mb1, int64_t nb0, int64_t nb1) {
-    int tid = get_thread_num();
+  team_2d(MB2, NB2, [&](int64_t mb0, int64_t mb1, int64_t nb0, int64_t nb1) {
+    int tid = executor ? executor->thread_id() : get_thread_num();
     alignas(64) scalar_t C[BLOCK_M * BLOCK_K];
     bool use_brgemm = false;
 
@@ -215,11 +230,13 @@ void fused_experts_fp_kernel_impl(
   });
   // stage 3: out = intermediate_cache2.sum(dim=1)
   //   from [M, topk, K] to [M, K]
-  at::parallel_for(0, M, 0, [&](int64_t begin, int64_t end) {
-    for (int64_t m = begin; m < end; ++m) {
-      sum_stub(output + m * K, ic2 + m * topk * K, topk, K);
-    }
-  });
+  if (!executor || executor->reduce_output()) {
+    team_1d(M, [&](int64_t begin, int64_t end) {
+      for (int64_t m = begin; m < end; ++m) {
+        sum_stub(output + m * K, ic2 + m * topk * K, topk, K);
+      }
+    });
+  }
 }
 
 #define INSTANTIATE_MOE_FP_TEMPLATE(TYPE1, TYPE2, TYPE3, IS_MXFP4)           \
@@ -253,7 +270,8 @@ void fused_experts_fp_kernel_impl(
       float alpha,                                                           \
       float limit,                                                           \
       CPUActMethod act_func,                                                 \
-      bool with_bias)
+      bool with_bias,                                                       \
+      CpuMoeExecutor* executor)
 
 INSTANTIATE_MOE_FP_TEMPLATE(at::BFloat16, at::Float8_e4m3fn, float, false);
 INSTANTIATE_MOE_FP_TEMPLATE(at::Half, at::Float8_e4m3fn, float, false);

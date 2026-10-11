@@ -3,12 +3,15 @@
 """Tests for CPU quantized fused MoE kernels."""
 
 import math
+import os
 import sys
+from pathlib import Path
 
 import pytest
 import torch
 import torch.nn.functional as F
 
+from benchmarks.kernels.cpu.numa_moe_reference_cache import OracleCache
 from vllm.platforms import current_platform
 from vllm.utils.torch_utils import set_random_seed
 
@@ -162,6 +165,124 @@ def _make_fp8_moe_weights(
     return w1, w2, w1_s, w2_s
 
 
+def _parse_cpu_list(cpu_list: str) -> set[int]:
+    cpus: set[int] = set()
+    for item in cpu_list.strip().split(","):
+        if not item:
+            continue
+        bounds = item.split("-", maxsplit=1)
+        start = int(bounds[0])
+        end = int(bounds[1]) if len(bounds) == 2 else start
+        cpus.update(range(start, end + 1))
+    return cpus
+
+
+def _allowed_memory_nodes() -> set[int]:
+    status = Path("/proc/self/status").read_text()
+    for line in status.splitlines():
+        if line.startswith("Mems_allowed_list:"):
+            return _parse_cpu_list(line.split(":", maxsplit=1)[1])
+    return set()
+
+
+def _discover_cpu_numa_teams() -> tuple[list[int], list[int], int] | None:
+    """Return three allowed NUMA nodes and their non-SMT CPU teams."""
+    if hasattr(os, "sched_getaffinity"):
+        allowed_cpus = set(os.sched_getaffinity(0))
+    else:
+        allowed_cpus = set(range(os.cpu_count() or 0))
+    allowed_nodes = _allowed_memory_nodes()
+    teams: list[tuple[int, list[int]]] = []
+
+    for node_path in sorted(Path("/sys/devices/system/node").glob("node[0-9]*")):
+        try:
+            node = int(node_path.name.removeprefix("node"))
+            if allowed_nodes and node not in allowed_nodes:
+                continue
+            node_cpus = _parse_cpu_list((node_path / "cpulist").read_text())
+        except (OSError, ValueError):
+            continue
+
+        physical_cpus: dict[tuple[int, ...], int] = {}
+        for cpu in sorted(node_cpus & allowed_cpus):
+            sibling_path = (
+                Path("/sys/devices/system/cpu")
+                / f"cpu{cpu}"
+                / "topology/thread_siblings_list"
+            )
+            try:
+                siblings = tuple(
+                    sorted(
+                        _parse_cpu_list(sibling_path.read_text())
+                        & node_cpus
+                        & allowed_cpus
+                    )
+                )
+            except OSError:
+                continue
+            if siblings:
+                physical_cpus[siblings] = min(siblings)
+
+        cpus = sorted(physical_cpus.values())
+        if cpus and (node_path / "meminfo").exists():
+            teams.append((node, cpus))
+        if len(teams) == 3:
+            break
+
+    if len(teams) != 3:
+        return None
+
+    threads_per_node = min(2, *(len(cpus) for _, cpus in teams))
+    nodes = [node for node, _ in teams]
+    cpus = [cpu for _, node_cpus in teams for cpu in node_cpus[:threads_per_node]]
+    return cpus, nodes, threads_per_node
+
+
+def _fused_fp8_moe_output(
+    a: torch.Tensor,
+    packed_w1: torch.Tensor,
+    packed_w2: torch.Tensor,
+    topk_weight: torch.Tensor,
+    topk_ids: torch.Tensor,
+    w1_s: torch.Tensor,
+    w2_s: torch.Tensor,
+) -> torch.Tensor:
+    output = torch.empty_like(a)
+    ops.fused_experts_cpu(
+        output,
+        a,
+        packed_w1,
+        packed_w2,
+        topk_weight,
+        topk_ids,
+        ops.CPUQuantMethod.FP8_W8A16,
+        w1_s,
+        w2_s,
+        None,
+        None,
+        BLOCK_SIZE,
+        is_vnni=True,
+    )
+    return output
+
+
+def _assert_numa_moe_stats(
+    stats: dict[str, torch.Tensor],
+    topk_ids: torch.Tensor,
+    num_experts: int,
+    num_nodes: int,
+) -> torch.Tensor:
+    logical_counts = torch.bincount(
+        topk_ids.reshape(-1).to(torch.int64), minlength=num_experts
+    )
+    assert torch.equal(stats["logical_counts"], logical_counts)
+    physical_counts = stats["physical_counts"]
+    assert physical_counts.shape == (num_nodes, num_experts)
+    assert torch.equal(physical_counts.sum(dim=0), logical_counts)
+    assert stats["split_groups"].numel() == 1
+    return physical_counts
+
+
 FP8_NUM_TOKENS = [1, 2, 64, 121]
 FP8_MOE_CONFIGS = [
     (256, 512, 8, 2),
@@ -270,6 +391,304 @@ def test_w8a16_block_fp8_cpu_fused_moe_small_expert_blocks():
     )
 
     torch.testing.assert_close(ref_out.bfloat16(), out, atol=1e-2, rtol=1e-2)
+
+
+@pytest.mark.parametrize("intermediate_size,hidden_size", [(128, 128), (512, 2048)])
+def test_cpu_numa_fp8_moe_runtime_replays_routes_and_recreates(
+    intermediate_size, hidden_size
+):
+    """Check NUMA replay against the reference, including split and alias paths."""
+    op_names = (
+        "cpu_numa_moe_create",
+        "cpu_numa_moe_execute",
+        "cpu_numa_moe_stats",
+        "cpu_numa_moe_destroy",
+        "cpu_numa_moe_calibrate",
+    )
+    if any(not hasattr(torch.ops._C, name) for name in op_names):
+        pytest.skip("experimental CPU NUMA MoE operators are not available")
+    topology = _discover_cpu_numa_teams()
+    if topology is None:
+        pytest.skip("three allowed NUMA nodes with physical CPUs are required")
+        return
+    cpus, nodes, threads_per_node = topology
+
+    set_random_seed(0)
+    num_experts = 8
+    w1, w2, w1_s, w2_s = _make_fp8_moe_weights(
+        num_experts, intermediate_size, hidden_size, BLOCK_SIZE
+    )
+    # Keep the random down projection variance constant across expert widths.
+    w2_s *= math.sqrt(128 / intermediate_size)
+    packed_w1, packed_w2 = _prepack_experts(w1), _prepack_experts(w2)
+    runtime = torch.ops._C
+    handle = runtime.cpu_numa_moe_create(
+        packed_w1,
+        packed_w2,
+        w1_s,
+        w2_s,
+        cpus,
+        nodes,
+        threads_per_node,
+        BLOCK_SIZE[0],
+        BLOCK_SIZE[1],
+    )
+    try:
+        runtime.cpu_numa_moe_calibrate(handle, [1, 4, 8, 32, 64, 128])
+        multi_slot_hidden = torch.randn(
+            65, hidden_size, dtype=torch.bfloat16
+        ) / math.sqrt(hidden_size)
+        rows = torch.arange(65)
+        multi_slot_ids = torch.cat(
+            (
+                torch.zeros(65, 1, dtype=torch.int64),
+                1 + (rows[:, None] + torch.arange(7)) % (num_experts - 1),
+            ),
+            dim=1,
+        ).to(torch.int32)
+        multi_slot_weight = torch.softmax(
+            torch.randn(65, 8, dtype=torch.float32), dim=-1
+        )
+
+        hot_hidden = torch.randn(512, hidden_size, dtype=torch.bfloat16) / math.sqrt(
+            hidden_size
+        )
+        hot_ids = torch.zeros(512, 1, dtype=torch.int32)
+        hot_weight = torch.ones(512, 1, dtype=torch.float32)
+
+        changed_hidden = torch.randn(3, hidden_size, dtype=torch.bfloat16) / math.sqrt(
+            hidden_size
+        )
+        changed_ids = torch.tensor([[6, 7], [2, 5], [3, 4]], dtype=torch.int32)
+        changed_weight = torch.softmax(torch.randn(3, 2, dtype=torch.float32), dim=-1)
+
+        cases = (
+            (multi_slot_hidden, multi_slot_ids, multi_slot_weight),
+            (hot_hidden, hot_ids, hot_weight),
+            (changed_hidden, changed_ids, changed_weight),
+        )
+        references = []
+        for hidden, ids, weights in cases:
+            reference = ref_w8a16_block_fp8_moe(
+                hidden, w1, w2, w1_s, w2_s, weights, ids, BLOCK_SIZE
+            )
+            baseline = _fused_fp8_moe_output(
+                hidden, packed_w1, packed_w2, weights, ids, w1_s, w2_s
+            )
+            references.append((reference, baseline))
+
+        for layer_id, policy in enumerate(("static", "balanced", "split", "rows")):
+            for index, (hidden, ids, weights) in enumerate(cases):
+                output = torch.empty_like(hidden)
+                runtime.cpu_numa_moe_execute(
+                    handle, hidden, ids, weights, output, policy, layer_id
+                )
+                reference, baseline = references[index]
+                # Row partitioning can move a small tail onto BRGEMM.
+                tolerance = 1e-2 if policy == "rows" else 0
+                torch.testing.assert_close(
+                    output,
+                    baseline,
+                    atol=tolerance,
+                    rtol=tolerance,
+                    msg=lambda message, policy=policy, index=index: (
+                        f"{policy}, case {index}: {message}"
+                    ),
+                )
+                torch.testing.assert_close(reference, output, atol=1e-2, rtol=1e-2)
+
+                stats = runtime.cpu_numa_moe_stats(handle)
+                physical_counts = _assert_numa_moe_stats(
+                    stats, ids, num_experts, len(nodes)
+                )
+                if policy == "split" and index == 1:
+                    assert stats["split_groups"].item() > 0
+                    assert (physical_counts[:, 0] > 0).sum() >= 2
+                if policy in ("static", "balanced") and index == 1:
+                    assert (physical_counts[:, 0] > 0).sum() == 1
+                if policy == "rows" and index == 1:
+                    assert torch.all(physical_counts[:, 0] > 0)
+
+            aliased = changed_hidden.clone()
+            runtime.cpu_numa_moe_execute(
+                handle,
+                aliased,
+                changed_ids,
+                changed_weight,
+                aliased,
+                policy,
+                layer_id,
+            )
+            torch.testing.assert_close(aliased, references[2][1], atol=0, rtol=0)
+
+        workers_before_destroy = len(list(Path("/proc/self/task").iterdir()))
+        second_layer = runtime.cpu_numa_moe_create(
+            packed_w1, packed_w2, w1_s, w2_s, cpus, nodes, threads_per_node, *BLOCK_SIZE
+        )
+        try:
+            assert (
+                len(list(Path("/proc/self/task").iterdir())) == workers_before_destroy
+            )
+            # Grow shared scratch from another layer, then replay the first layer.
+            larger_hidden = hot_hidden.repeat(2, 1)
+            larger_output = torch.empty_like(larger_hidden)
+            runtime.cpu_numa_moe_execute(
+                second_layer,
+                larger_hidden,
+                hot_ids.repeat(2, 1),
+                hot_weight.repeat(2, 1),
+                larger_output,
+                "static",
+                1,
+            )
+            torch.testing.assert_close(
+                larger_output, references[1][1].repeat(2, 1), atol=0, rtol=0
+            )
+            output = torch.empty_like(changed_hidden)
+            runtime.cpu_numa_moe_execute(
+                handle,
+                changed_hidden,
+                changed_ids,
+                changed_weight,
+                output,
+                "static",
+                0,
+            )
+            torch.testing.assert_close(output, references[2][1], atol=0, rtol=0)
+            assert torch.equal(
+                runtime.cpu_numa_moe_stats(handle)["scratch_addresses"],
+                runtime.cpu_numa_moe_stats(second_layer)["scratch_addresses"],
+            )
+        finally:
+            runtime.cpu_numa_moe_destroy(second_layer)
+        assert len(list(Path("/proc/self/task").iterdir())) == workers_before_destroy
+        runtime.cpu_numa_moe_destroy(handle)
+        assert len(list(Path("/proc/self/task").iterdir())) == (
+            workers_before_destroy - len(cpus)
+        )
+        with pytest.raises(RuntimeError, match="Invalid NUMA MoE runtime handle"):
+            runtime.cpu_numa_moe_stats(handle)
+        handle = None
+        handle = runtime.cpu_numa_moe_create(
+            packed_w1,
+            packed_w2,
+            w1_s,
+            w2_s,
+            cpus,
+            nodes,
+            threads_per_node,
+            BLOCK_SIZE[0],
+            BLOCK_SIZE[1],
+        )
+        output = torch.empty_like(changed_hidden)
+        runtime.cpu_numa_moe_execute(
+            handle,
+            changed_hidden,
+            changed_ids,
+            changed_weight,
+            output,
+            "static",
+            0,
+        )
+        torch.testing.assert_close(output, references[2][1], atol=0, rtol=0)
+    finally:
+        if handle is not None:
+            runtime.cpu_numa_moe_destroy(handle)
+
+
+@pytest.mark.parametrize("K", [128, 2048])
+def test_cpu_numa_fp8_intermediate_slices_preserve_checkpoint_scales(K):
+    """Match native slice arithmetic and rotate the wider unequal slice."""
+    if not hasattr(torch.ops._C, "cpu_numa_moe_create"):
+        pytest.skip("experimental CPU NUMA MoE operators are not available")
+    topology = _discover_cpu_numa_teams()
+    if topology is None:
+        pytest.skip("three allowed NUMA nodes with physical CPUs are required")
+        return
+    cpus, nodes, threads = topology
+    set_random_seed(1)
+    E, N = 2, 512
+    w1, w2, s1, s2 = _make_fp8_moe_weights(E, N, K, BLOCK_SIZE)
+    hidden = torch.randn(17, K, dtype=torch.bfloat16) / math.sqrt(K)
+    ids = torch.tensor([[0, 1]], dtype=torch.int32).expand(17, -1).contiguous()
+    weights = torch.softmax(torch.randn(17, 2), dim=-1)
+    handle = torch.ops._C.cpu_numa_moe_create(
+        _prepack_experts(w1),
+        _prepack_experts(w2),
+        s1,
+        s2,
+        cpus,
+        nodes,
+        threads,
+        *BLOCK_SIZE,
+    )
+    try:
+        for policy, layer, widths in (
+            ("unequal", 0, (256, 128, 128)),
+            ("unequal", 1, (128, 256, 128)),
+            ("unequal", 2, (128, 128, 256)),
+            ("tp2_01", 0, (256, 256, 0)),
+            ("tp2_02", 0, (256, 0, 256)),
+            ("tp2_12", 0, (0, 256, 256)),
+        ):
+            begin = 0
+            partials = []
+            for width in widths:
+                if not width:
+                    continue
+                end = begin + width
+                sliced_w1 = torch.cat(
+                    (w1[:, begin:end], w1[:, N + begin : N + end]), dim=1
+                )
+                sliced_s1 = torch.cat(
+                    (
+                        s1[:, begin // 128 : end // 128],
+                        s1[:, (N + begin) // 128 : (N + end) // 128],
+                    ),
+                    dim=1,
+                )
+                partials.append(
+                    _fused_fp8_moe_output(
+                        hidden,
+                        _prepack_experts(sliced_w1),
+                        _prepack_experts(w2[:, :, begin:end].contiguous()),
+                        weights,
+                        ids,
+                        sliced_s1,
+                        s2[:, :, begin // 128 : end // 128].contiguous(),
+                    )
+                )
+                begin = end
+            expected = torch.stack(partials).float().sum(dim=0).to(torch.bfloat16)
+            output = hidden.clone()
+            torch.ops._C.cpu_numa_moe_execute(
+                handle, output, ids, weights, output, policy, layer
+            )
+            torch.testing.assert_close(output, expected, atol=0, rtol=0)
+            stats = torch.ops._C.cpu_numa_moe_stats(handle)
+            assert stats["intermediate_slices"].tolist() == list(widths)
+    finally:
+        torch.ops._C.cpu_numa_moe_destroy(handle)
+
+    w1, w2, s1, s2 = _make_fp8_moe_weights(E, N, 160, BLOCK_SIZE)
+    handle = torch.ops._C.cpu_numa_moe_create(
+        _prepack_experts(w1),
+        _prepack_experts(w2),
+        s1,
+        s2,
+        cpus,
+        nodes,
+        threads,
+        *BLOCK_SIZE,
+    )
+    try:
+        hidden = torch.zeros(1, 160, dtype=torch.bfloat16)
+        with pytest.raises(RuntimeError, match="aligned"):
+            torch.ops._C.cpu_numa_moe_execute(
+                handle, hidden, ids[:1], weights[:1], hidden, "unequal", 0
+            )
+    finally:
+        torch.ops._C.cpu_numa_moe_destroy(handle)
 
 
 # ===========================================================================
@@ -1310,6 +1729,98 @@ def test_fp8_w8a8_cpu_fused_moe(E: int, N: int, K: int, M: int, top_k: int):
         x_dequant, w13, w13_scale, w2, w2_scale, topk_weights, topk_ids.long(), N
     )
     torch.testing.assert_close(output.float(), ref.float(), atol=1e-2, rtol=1e-2)
+
+
+@pytest.mark.parametrize(
+    ("returncode", "acknowledged", "complete", "expected"),
+    [
+        (0, False, True, "measured"),
+        (-2, True, True, "measured"),
+        (-2, False, True, "unavailable"),
+        (-15, True, True, "unavailable"),
+        (-2, True, False, "unavailable"),
+    ],
+)
+def test_cpu_numa_moe_perf_accepts_only_complete_acknowledged_shutdown(
+    tmp_path, returncode, acknowledged, complete, expected
+):
+    """An owned SIGINT stop is valid only after disable and complete counters."""
+    from types import SimpleNamespace
+
+    from benchmarks.kernels.cpu.numa_moe_perf import PerfCounters
+
+    collector = PerfCounters(tmp_path / "sample", (32,), ["cycles", "instructions"])
+    collector.csv_path.write_text(
+        "100;;cycles;1000000;100.00;;\n"
+        + ("50;;instructions;1000000;100.00;;\n" if complete else "")
+    )
+    collector._process = SimpleNamespace(wait=lambda: returncode)
+    collector._disable_acknowledged = acknowledged
+    collector._finish_result()
+    assert collector.result["status"] == expected
+
+
+def test_cpu_numa_moe_reference_cache_round_trip(tmp_path):
+    identity = {
+        "checkpoint_sha256": "checkpoint",
+        "corpus_sha256": "corpus",
+        "source_sha256": "source",
+        "block_sizes": [128, 128],
+        "chunk_tokens": 32,
+        "torch_version": torch.__version__,
+    }
+    records = [
+        {
+            "layer": 4,
+            "hidden": torch.arange(6, dtype=torch.bfloat16).reshape(2, 3),
+        },
+        {
+            "layer": 4,
+            "hidden": torch.arange(9, dtype=torch.bfloat16).reshape(3, 3),
+        },
+    ]
+    outputs = [record["hidden"].clone() + 1 for record in records]
+    writer = OracleCache(tmp_path, identity)
+    reader = OracleCache(tmp_path, identity, read_only=True)
+
+    assert writer.load(4, records) is None
+    with pytest.raises(RuntimeError, match="missing layer"):
+        reader.load(4, records)
+    writer.store(4, records, outputs)
+    cached = reader.load(4, records)
+    assert cached is not None
+    assert len(cached) == len(outputs)
+    for actual, expected in zip(cached, outputs):
+        assert actual.dtype == torch.bfloat16
+        assert torch.equal(actual, expected)
+    with pytest.raises(RuntimeError, match="immutable"):
+        writer.store(4, records, outputs)
+
+
+def test_cpu_numa_moe_reference_cache_rejects_wrong_identity_and_corruption(
+    tmp_path,
+):
+    identity = {"corpus_sha256": "original", "chunk_tokens": 32}
+    records = [
+        {
+            "layer": 2,
+            "hidden": torch.arange(6, dtype=torch.bfloat16).reshape(2, 3),
+        }
+    ]
+    outputs = [records[0]["hidden"].clone()]
+    OracleCache(tmp_path, identity).store(2, records, outputs)
+
+    with pytest.raises(RuntimeError, match="identity"):
+        OracleCache(
+            tmp_path,
+            {"corpus_sha256": "different", "chunk_tokens": 32},
+            read_only=True,
+        )
+
+    (tmp_path / "layer-2.pt").write_bytes(b"corrupted archive")
+    reader = OracleCache(tmp_path, identity, read_only=True)
+    with pytest.raises(RuntimeError, match="checksum"):
+        reader.load(2, records)
 
 
 if __name__ == "__main__":

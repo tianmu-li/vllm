@@ -568,6 +568,7 @@ if (ENABLE_X86_ISA)
         "csrc/cpu/sgl-kernels/moe_int8.cpp"
         "csrc/cpu/sgl-kernels/moe_int4.cpp"
         "csrc/cpu/sgl-kernels/moe_fp8.cpp"
+        "csrc/cpu/sgl-kernels/moe_numa.cpp"
         "csrc/cpu/sgl-kernels/moe_fp8_w8a8.cpp"
         "csrc/cpu/sgl-kernels/bmm.cpp"
         "csrc/cpu/sgl-kernels/decode.cpp"

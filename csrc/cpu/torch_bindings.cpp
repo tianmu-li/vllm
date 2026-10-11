@@ -57,6 +57,20 @@ void shm_send_tensor_list(int64_t handle,
 std::vector<torch::Tensor> shm_recv_tensor_list(int64_t handle, int64_t src);
 
 // SGL CPU kernels
+int64_t cpu_numa_moe_create(const at::Tensor&, const at::Tensor&,
+                            const at::Tensor&, const at::Tensor&,
+                            std::vector<int64_t>, std::vector<int64_t>, int64_t,
+                            int64_t, int64_t);
+void cpu_numa_moe_execute(int64_t, const at::Tensor&, const at::Tensor&,
+                          const at::Tensor&, at::Tensor&, const std::string&,
+                          int64_t);
+c10::Dict<std::string, at::Tensor> cpu_numa_moe_stats(int64_t);
+void cpu_numa_moe_destroy(int64_t);
+void cpu_numa_moe_calibrate(int64_t, std::vector<int64_t>);
+at::Tensor cpu_numa_moe_local_copy(const at::Tensor&, int64_t);
+int64_t cpu_numa_moe_verify_local(const at::Tensor&, int64_t);
+void cpu_numa_moe_evict(int64_t);
+void cpu_numa_moe_evict_local(const at::Tensor&);
 
 void weight_packed_linear(at::Tensor& out, const at::Tensor& mat1,
                           const at::Tensor& mat2,
@@ -662,6 +676,28 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, ops) {
       "bool is_vnni) -> "
       "()");
   ops.impl("fused_experts_cpu", torch::kCPU, &fused_experts_cpu);
+  ops.def(
+      "cpu_numa_moe_create(Tensor w1, Tensor w2, Tensor s1, Tensor s2, "
+      "int[] cpus, int[] nodes, int threads_per_node, int block_n, "
+      "int block_k) -> int");
+  ops.impl("cpu_numa_moe_create", torch::kCPU, &cpu_numa_moe_create);
+  ops.def(
+      "cpu_numa_moe_execute(int handle, Tensor(a) hidden, Tensor ids, "
+      "Tensor weights, Tensor(a!) output, str policy, int layer) -> ()");
+  ops.impl("cpu_numa_moe_execute", torch::kCPU, &cpu_numa_moe_execute);
+  ops.def("cpu_numa_moe_stats(int handle) -> Dict(str, Tensor)",
+          &cpu_numa_moe_stats);
+  ops.def("cpu_numa_moe_destroy(int handle) -> ()", &cpu_numa_moe_destroy);
+  ops.def("cpu_numa_moe_calibrate(int handle, int[] rows) -> ()",
+          &cpu_numa_moe_calibrate);
+  ops.def("cpu_numa_moe_local_copy(Tensor input, int node) -> Tensor");
+  ops.impl("cpu_numa_moe_local_copy", torch::kCPU, &cpu_numa_moe_local_copy);
+  ops.def("cpu_numa_moe_verify_local(Tensor input, int node) -> int");
+  ops.impl("cpu_numa_moe_verify_local", torch::kCPU,
+           &cpu_numa_moe_verify_local);
+  ops.def("cpu_numa_moe_evict(int handle) -> ()", &cpu_numa_moe_evict);
+  ops.def("cpu_numa_moe_evict_local(Tensor input) -> ()");
+  ops.impl("cpu_numa_moe_evict_local", torch::kCPU, &cpu_numa_moe_evict_local);
   ops.def(
       "int8_scaled_mm_with_quant(Tensor mat1, Tensor mat2, Tensor scales2, "
       "Tensor? bias, ScalarType out_dtype, bool is_vnni) -> Tensor");

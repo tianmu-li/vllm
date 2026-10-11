@@ -6,6 +6,7 @@
 #pragma once
 #include "common.h"
 #include "blas_gemm.h"
+#include "moe_executor.h"
 
 #if defined(__AVX512F__) && defined(__AVX512BF16__) && defined(__AMX_BF16__)
 #define CPU_CAPABILITY_AVX512
@@ -197,7 +198,8 @@ void fused_experts_fp_kernel_impl(
     float alpha,
     float limit,
     CPUActMethod act_func,
-    bool with_bias);
+    bool with_bias,
+    CpuMoeExecutor* executor = nullptr);
 
 // shared expert implementation for int8 w8a8
 template <typename scalar_t>
