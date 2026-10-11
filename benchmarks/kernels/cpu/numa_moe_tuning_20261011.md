@@ -1034,3 +1034,35 @@ unequal and all three TP2 kernel controls. Numerical checks passed, diagnostic
 stats were separately labeled, and promotion remained unevaluated.
 The first launcher attempt failed argument parsing before execution because
 `--controls` had no value; its failure artifact is preserved.
+
+## Scheduler and metadata overhead trials
+
+The [per-call cost-reuse trial](../../../build-numa-broad/campaign_20261011_broad/group_cost_reuse_fixed_node1_seed0.json)
+cached each active expert's three calibrated costs during estimation and
+reused them for initial placement, reducing lookups from 7–8 to 3 per expert.
+Independent source review confirmed unchanged values, sorting, addition order,
+history preference and split thresholds. All 11 NUMA tests and replay checks
+passed. Split replay was 747.23 ms versus 740.91 ms in the retained seed-0
+launch; small/large geometric mean latency ratios were 1.0032/1.0051.
+Small p95 ratios exceeded 1.10 at M1 zipf, M4 changing, M5 hot8 and M7 changing.
+The result did not establish a consistent improvement; reject this added cache.
+The [restore journal](../../../build-numa-broad/campaign_20261011_broad/group_cost_reuse_rejected_restored.json)
+verifies the retained native source and extension hashes.
+
+The buffer-page-count trial cached the existing base-page count after successful
+allocation and cleared it on release, removing 39 page-size queries per call.
+Placement verification and huge-page counting units remained unchanged.
+Independent lifecycle review found no blocker; all 11 NUMA tests and
+[synthetic replay checks](../../../build-numa-broad/campaign_20261011_broad/cached_buffer_pages_fixed_node1_seed0.json)
+passed.
+
+Its performance is **ineligible**: an unrelated oneDNN build in `vllm_local_2`
+started during timing with CPU affinity 0–383. The
+[affinity observation](../../../build-numa-broad/campaign_20261011_broad/cached_buffer_pages_fixed_node1_seed0.host_build_observation.json)
+and [CPU observation](../../../build-numa-broad/campaign_20261011_broad/cached_buffer_pages_fixed_node1_seed0.host_cpu_observation.json)
+record the overlap. Observed compiler CPUs 256/288 are SMT siblings of benchmark
+CPUs 64/96. Preserve this as a shared-host correctness diagnostic, with no
+performance acceptance or rejection. The
+[pending-trial restore journal](../../../build-numa-broad/campaign_20261011_broad/cached_buffer_pages_pending_restored.json)
+verifies restoration of the retained source and extension; candidate source,
+binary and build provenance remain available for a clean rerun.
