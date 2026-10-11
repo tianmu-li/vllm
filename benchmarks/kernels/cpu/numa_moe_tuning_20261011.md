@@ -937,3 +937,73 @@ large changed +0.57% and −0.24%. Gains were inconsistent, and recorded p95
 ratios included M512 hot8 at 1.155 in seed 1. Reject the extra cache;
 the [restore journal](../../../build-numa-broad/campaign_20261011_broad/small_row_cost_cache_rejected_restored.json)
 confirms restoration before the ownership experiment.
+
+## Rejected shared-cost placement models
+
+The [large shared-cost LPT trial](../../../build-numa-broad/campaign_20261011_broad/shared_lpt_fixed_edges_node1_seed0.json)
+scored each candidate whole queue with the existing common-input calibration,
+retaining expert order, the 1% history preference and the 5% split gate.
+All 11 NUMA tests and replay correctness passed. Boundary split replay measured
+913.47 ms versus 912.80 ms; large pass count fell from 33/36 to 32/36.
+M257 changing reached 2.029×, but M257 hot8 selected a coordinated split and
+fell to 1.852×, with mean and p95 latency ratios 1.129 and 1.128.
+Reject this model change. Its
+[restore journal](../../../build-numa-broad/campaign_20261011_broad/shared_lpt_rejected_restored.json)
+confirms restoration of `eb43a323f0` source and retained extension.
+
+The small shared-cost trial measured true small-scratch common-input groups
+at fixed knots `{1,4,5,8}` and reused identical single-expert measurements.
+It used those frozen costs only for complete common routes at M≤8.
+The new curves and row axis were exported in stats and report metadata.
+All 11 NUMA tests passed, including public assertions for the omitted-5 knot.
+Independent source review found no semantic blocker. Matching-knot reuse,
+interpolation, fixture slots, and old calibration order were preserved.
+
+| Trial | Split replay | Small ≥2× | Large ≥2× | Small mean latency ratio |
+| --- | ---: | ---: | ---: | ---: |
+| [Seed 0](../../../build-numa-broad/campaign_20261011_broad/small_shared_fixed_node1_seed0.json) | 743.27 ms | 24/28 | 23/24 | 0.9723 |
+| [Seed 1](../../../build-numa-broad/campaign_20261011_broad/small_shared_fixed_node1_seed1.json) | 748.54 ms | 22/28 | 22/24 | 0.9904 |
+
+These mean ratios compare separate launches with corresponding owned-combine
+runs. No p95 ratio exceeded 1.10 in seed 0; seed 1 M7 hot8 reached 1.170.
+Its sixth round averaged 0.4740 ms versus about 0.10–0.11 ms in other rounds;
+the outlier is unexplained. The first split replay round was also an outlier.
+
+The [queue diagnosis](../../../build-numa-broad/campaign_20261011_broad/small_shared_m7_hot_queue_diagnosis.json)
+uses existing summed physical counts: M7 hot8's average whole-group placement
+changed from `[3,3,2]` to `[3,2,3]` in both seeds. Median latency increased
+from 96.13 to 102.97 µs and from 95.66 to 103.93 µs. Cold calibration favored
+the latter distribution, while the preceding warm replay's node-2 queue
+completed sooner. These observations expose a ranking mismatch without
+isolating its cause. Both sizes share placement history, so changing small
+owners can also affect later large calls within the existing 1% rule.
+Reject the policy rather than retain a better inner model with this tail risk.
+The [restore journal](../../../build-numa-broad/campaign_20261011_broad/small_shared_rejected_restored.json)
+verifies restoration of native source, benchmark, tests and extension.
+No captured-validation or primary-performance claim is made for either trial.
+
+## Small-boundary counter diagnostic
+
+The restored binary's [instrumented replay](../../../build-numa-broad/campaign_20261011_broad/owned_small_boundaries_counters_seed1.json)
+used M5/6/7/257, four routes, four native policies, three single-node controls,
+five rotated rounds and 100 sequence repeats. All 35 counter windows completed
+and correctness passed. Source and extension identity stayed fixed.
+This is a separate diagnostic, excluded from promotion.
+
+The [counter analysis](../../../build-numa-broad/campaign_20261011_broad/owned_small_boundaries_counters_seed1.analysis.json)
+reports median split-window time of 1,150.29 ms, with 672.13 ms summed calls;
+median time outside calls was 471.92 ms. Node-3 control had 1,914.22 ms windows,
+1,884.09 ms summed calls and 30.41 ms outside calls. Native replay converts
+full stats after every call, outside its latency timer. Control replay does
+less between calls. Native workers also poll for up to 5 ms after work.
+This bookkeeping gap could affect subsequent calls and warrants a separately
+labeled uninterrupted replay comparison.
+
+Split cycles/reference-cycles ratio was 1.2720 versus 1.2656 for node 3;
+these aggregate counters do not support a frequency-drop diagnosis.
+Split IPC was 0.602 versus 1.045, and LLC miss/reference ratio was 0.404 versus
+0.553. Counters cover requested CPUs, including polling, bookkeeping and other
+activity; these are not isolated GEMM metrics. No memory-controller events
+were collected, and no measured bandwidth claim follows from LLC counts.
+Reported migrations are system-wide events, not evidence of worker migration.
+The broad 2× and original promotion gates remain unmet.
