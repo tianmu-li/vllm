@@ -1053,6 +1053,26 @@ def test_varlen_with_paged_kv_fp8_large_prefill_amx() -> None:
     )
 
 
+@pytest.mark.skipif(not torch.cpu._is_amx_tile_supported(), reason="no AMX support.")
+@pytest.mark.parametrize("head_size", [96, 256])
+def test_varlen_with_paged_kv_fp8_q1_amx(head_size: int) -> None:
+    """FP8 AMX Q1 main-loop and tail scratch loads preserve output accuracy."""
+    varlen_with_paged_kv(
+        seq_lens=[(1, 2304)] * 2,
+        num_heads=(16, 2),
+        head_size=head_size,
+        sliding_window=None,
+        dtype=torch.bfloat16,
+        block_size=1152,
+        soft_cap=None,
+        num_blocks=2,
+        use_alibi=False,
+        use_sink=False,
+        isa="amx",
+        kv_cache_dtype="fp8_e4m3",
+    )
+
+
 @pytest.mark.parametrize("seq_lens", SEQ_LENS)
 @pytest.mark.parametrize("num_heads", NUM_HEADS)
 @pytest.mark.parametrize("head_size", HEAD_SIZES_VEC16)

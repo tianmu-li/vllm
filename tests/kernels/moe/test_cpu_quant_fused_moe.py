@@ -3,7 +3,10 @@
 """Tests for CPU quantized fused MoE kernels."""
 
 import math
+import os
+import subprocess
 import sys
+import textwrap
 
 import pytest
 import torch
@@ -1337,6 +1340,102 @@ def test_int8_w8a8_cpu_fused_moe_small_expert_blocks(dtype):
     )
 
     torch.testing.assert_close(ref_out, out, atol=2e-1, rtol=2e-1)
+
+
+def test_int8_w8a8_cpu_fused_moe_schedulers_preserve_result(tmp_path):
+    """Scheduler modes preserve sparse, skewed, and in-place MoE results."""
+    script = textwrap.dedent(
+        f"""
+        import os
+        import runpy
+        import torch
+
+        tests = runpy.run_path(
+            "tests/kernels/moe/test_cpu_quant_fused_moe.py"
+        )
+        ops = tests["ops"]
+        torch.set_num_threads(int(os.environ["OMP_NUM_THREADS"]))
+        torch.set_num_interop_threads(1)
+        tests["set_random_seed"](0)
+        block_sizes = (0, 3, 4, 5, 33)
+        n, k, experts = 128, 128, len(block_sizes)
+        x = torch.randn(sum(block_sizes), k, dtype=torch.bfloat16) / (
+            0.5 * k**0.5
+        )
+        w1, w2, s1, s2 = tests["_make_int8_moe_weights"](experts, n, k)
+        weights, ids = tests["_deterministic_expert_routes"](block_sizes)
+        reference = tests["_ref_int8_moe"](x, w1, w2, s1, s2, weights, ids)
+        packed_w1, packed_w2 = tests["_prepack_experts"](w1), tests[
+            "_prepack_experts"
+        ](w2)
+        outputs = []
+        for inplace in (False, True):
+            x_in = x.clone()
+            output = x_in if inplace else torch.empty_like(x_in)
+            ops.fused_experts_cpu(
+                output,
+                x_in,
+                packed_w1,
+                packed_w2,
+                weights,
+                ids,
+                ops.CPUQuantMethod.INT8_W8A8,
+                s1,
+                s2,
+                None,
+                None,
+                None,
+                is_vnni=True,
+            )
+            torch.testing.assert_close(
+                output, reference, atol=2e-1, rtol=2e-1
+            )
+            outputs.append(output)
+        torch.save(tuple(outputs), {str(tmp_path / "result.pt")!r})
+        """
+    )
+    outputs = {}
+    configurations = (
+        (6, None, None),
+        (6, "", "2,1,3"),
+        (6, "legacy", "2,1,3"),
+        (6, "round_robin", "2,1,3"),
+        (6, "spread_moe", "2,1,3"),
+        (6, "tile_moe", "2,1,3"),
+        (6, "spread_all", "2,1,3"),
+        (6, "spread_dense", "2,1,3"),
+        (7, None, None),
+        (7, "spread_moe", "2,2,3"),
+    )
+    for threads, scheduler, groups in configurations:
+        env = os.environ.copy()
+        env["OMP_NUM_THREADS"] = str(threads)
+        env["OMP_DYNAMIC"] = "FALSE"
+        env["OMP_THREAD_LIMIT"] = str(threads)
+        env.pop("VLLM_CPU_SGL_SCHEDULER", None)
+        env.pop("VLLM_CPU_SGL_THREAD_GROUPS", None)
+        if scheduler is not None:
+            env["VLLM_CPU_SGL_SCHEDULER"] = scheduler
+        if groups is not None:
+            env["VLLM_CPU_SGL_THREAD_GROUPS"] = groups
+        subprocess.run([sys.executable, "-c", script], check=True, env=env)
+        outputs[threads, scheduler or "unset", groups is not None] = torch.load(
+            tmp_path / "result.pt", weights_only=True
+        )
+
+    for threads in (6, 7):
+        baseline = outputs[threads, "unset", False]
+        for case in configurations:
+            case_threads, scheduler, groups = case
+            if case_threads == threads:
+                for baseline_result, configured_result in zip(
+                    baseline,
+                    outputs[threads, scheduler or "unset", groups is not None],
+                    strict=True,
+                ):
+                    torch.testing.assert_close(
+                        baseline_result, configured_result, rtol=0, atol=0
+                    )
 
 
 @pytest.mark.parametrize("M", [1, 64])

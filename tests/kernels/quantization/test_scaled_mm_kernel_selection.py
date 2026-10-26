@@ -6,6 +6,10 @@ Run `pytest tests/kernels/quantization/test_scaled_mm_kernel_selection.py`.
 """
 
 import inspect
+import os
+import subprocess
+import sys
+import textwrap
 from abc import ABC
 from unittest.mock import patch
 
@@ -322,6 +326,155 @@ def test_cpu_sgl_int8_linear_accepts_3d_input():
 
     assert out.shape == (2, 3, N)
     torch.testing.assert_close(out, ref.reshape(2, 3, N), rtol=0, atol=0)
+
+
+@pytest.mark.skipif(
+    not hasattr(torch.ops._C, "int8_scaled_mm_with_quant"),
+    reason="int8_scaled_mm_with_quant is not built",
+)
+def test_cpu_sgl_int8_schedulers_preserve_scaled_mm_result(tmp_path):
+    """SGL scheduler modes preserve bias-fused dense INT8 GEMM results."""
+    script = textwrap.dedent(
+        f"""
+        import os
+        import torch
+        import vllm._custom_ops
+
+        torch.set_num_threads(int(os.environ["OMP_NUM_THREADS"]))
+        torch.set_num_interop_threads(1)
+        torch.manual_seed(0)
+        outputs = []
+        for m, n, has_bias in ((128, 128, True), (33, 96, False)):
+            x = torch.randn(m, 64).bfloat16()
+            weight = torch.randint(-30, 31, (n, 64), dtype=torch.int8)
+            weight_scale = torch.rand(n, dtype=torch.float32) * 0.01
+            bias = torch.rand(n, dtype=torch.float32) if has_bias else None
+            result = torch.ops._C.int8_scaled_mm_with_quant(
+                x, weight, weight_scale, bias, x.dtype, False
+            )
+            input_scale = x.float().abs().amax(dim=-1).clamp_min(1e-7) / 127
+            qx = (x.float() / input_scale[:, None]).round().to(torch.int32)
+            reference = qx.float() @ weight.float().T
+            reference *= input_scale[:, None] * weight_scale[None, :]
+            if has_bias:
+                reference += bias[None, :]
+            torch.testing.assert_close(
+                result.float(), reference, atol=0.2, rtol=0.02
+            )
+            outputs.append(result)
+        torch.save(tuple(outputs), {str(tmp_path / "result.pt")!r})
+        """
+    )
+    outputs = {}
+    configurations = (
+        (6, None, None),
+        (6, "", "2,1,3"),
+        (6, "legacy", "2,1,3"),
+        (6, "round_robin", "2,1,3"),
+        (6, "spread_dense", "2,1,3"),
+        (6, "tile_dense", "2,1,3"),
+        (6, "spread_moe", "2,1,3"),
+        (6, "spread_all", "2,1,3"),
+        (6, "tile_all", "2,1,3"),
+        (7, None, None),
+        (7, "tile_dense", "2,2,3"),
+    )
+    for threads, scheduler, groups in configurations:
+        env = os.environ.copy()
+        env["OMP_NUM_THREADS"] = str(threads)
+        env["OMP_DYNAMIC"] = "FALSE"
+        env["OMP_THREAD_LIMIT"] = str(threads)
+        env.pop("VLLM_CPU_SGL_SCHEDULER", None)
+        env.pop("VLLM_CPU_SGL_THREAD_GROUPS", None)
+        if scheduler is not None:
+            env["VLLM_CPU_SGL_SCHEDULER"] = scheduler
+        if groups is not None:
+            env["VLLM_CPU_SGL_THREAD_GROUPS"] = groups
+        subprocess.run([sys.executable, "-c", script], check=True, env=env)
+        outputs[threads, scheduler or "unset", groups is not None] = torch.load(
+            tmp_path / "result.pt", weights_only=True
+        )
+
+    for threads in (6, 7):
+        baseline = outputs[threads, "unset", False]
+        for case in configurations:
+            case_threads, scheduler, groups = case
+            if case_threads == threads:
+                torch.testing.assert_close(
+                    baseline,
+                    outputs[threads, scheduler or "unset", groups is not None],
+                    rtol=0,
+                    atol=0,
+                )
+
+
+@pytest.mark.skipif(
+    not hasattr(torch.ops._C, "int8_scaled_mm_with_quant"),
+    reason="int8_scaled_mm_with_quant is not built",
+)
+@pytest.mark.parametrize(
+    ("scheduler", "groups", "thread_limit", "error"),
+    [
+        (None, "2,2", None, b"sums to"),
+        (
+            "round_robin",
+            "2,1,3",
+            "4",
+            b"requires fixed, non-nested OpenMP teams",
+        ),
+        ("not_a_scheduler", "2,1,3", None, b"VLLM_CPU_SGL_SCHEDULER"),
+        (
+            "spread_dense",
+            "",
+            None,
+            b"requires VLLM_CPU_SGL_THREAD_GROUPS",
+        ),
+        (
+            "tile_dense",
+            "2,1,3",
+            "4",
+            b"requires fixed, non-nested OpenMP teams",
+        ),
+    ],
+)
+def test_cpu_sgl_int8_scheduler_rejects_invalid_configuration(
+    scheduler, groups, thread_limit, error
+):
+    """Reject invalid modes, missing groups, mismatched teams, and limits."""
+    script = textwrap.dedent(
+        """
+import torch
+import vllm._custom_ops
+
+torch.set_num_threads(6)
+torch.set_num_interop_threads(1)
+x = torch.randn(128, 64).bfloat16()
+weight = torch.randint(-30, 31, (128, 64), dtype=torch.int8)
+scale = torch.ones(128)
+torch.ops._C.int8_scaled_mm_with_quant(x, weight, scale, None, x.dtype, False)
+        """
+    )
+    env = os.environ.copy()
+    env["OMP_NUM_THREADS"] = "6"
+    env["OMP_DYNAMIC"] = "FALSE"
+    env["OMP_THREAD_LIMIT"] = "6"
+    env.pop("VLLM_CPU_SGL_SCHEDULER", None)
+    env["VLLM_CPU_SGL_THREAD_GROUPS"] = groups
+    if scheduler is not None:
+        env["VLLM_CPU_SGL_SCHEDULER"] = scheduler
+    if thread_limit is None:
+        env.pop("OMP_THREAD_LIMIT", None)
+    else:
+        env["OMP_THREAD_LIMIT"] = thread_limit
+    result = subprocess.run(
+        [sys.executable, "-c", script],
+        check=False,
+        capture_output=True,
+        env=env,
+    )
+
+    assert result.returncode != 0
+    assert error in result.stderr
 
 
 class OOTInt8ScaledMMLinearKernel(Int8ScaledMMLinearKernel):

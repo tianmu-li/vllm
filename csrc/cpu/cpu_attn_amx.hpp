@@ -1,6 +1,8 @@
 #ifndef CPU_ATTN_AMX_HPP
 #define CPU_ATTN_AMX_HPP
 
+#include <atomic>
+
 #include "cpu_attn_fp8.hpp"
 #include "cpu_attn_impl.hpp"
 
@@ -158,6 +160,11 @@ class TileGemm224<c10::BFloat16, kv_cache_t> {
       const c10::BFloat16* load_2 = prepare_b_tile(b_tile_2, scratch_2);
       const c10::BFloat16* load_3 = prepare_b_tile(b_tile_3, scratch_3);
 
+      // GCC's AMX loads do not declare memory operands. Keep scratch writes
+      // before their loads, and prevent reuse until all loads have completed.
+      if constexpr (fp8_kv) {
+        std::atomic_signal_fence(std::memory_order_seq_cst);
+      }
       _tile_loadd(0, a_tile_0, a_tile_stride);
       _tile_stream_loadd(2, const_cast<c10::BFloat16*>(load_2), b_tile_stride);
       _tile_dpbf16ps(4, 0, 2);
@@ -166,6 +173,9 @@ class TileGemm224<c10::BFloat16, kv_cache_t> {
       _tile_loadd(1, a_tile_1, a_tile_stride);
       _tile_dpbf16ps(6, 1, 2);
       _tile_dpbf16ps(7, 1, 3);
+      if constexpr (fp8_kv) {
+        std::atomic_signal_fence(std::memory_order_seq_cst);
+      }
 
       // update ptrs
       if constexpr (phase == AttentionGemmPhase::QK) {
@@ -322,6 +332,10 @@ class TileGemm122<c10::BFloat16, kv_cache_t> {
       const c10::BFloat16* load_4 = prepare_b_tile(b_tile_4, scratch_4);
       const c10::BFloat16* load_5 = prepare_b_tile(b_tile_5, scratch_5);
 
+      // See TileGemm224: AMX loads need compiler barriers around scratch use.
+      if constexpr (fp8_kv) {
+        std::atomic_signal_fence(std::memory_order_seq_cst);
+      }
       _tile_loadd(0, a_tile_0, a_tile_stride);
       _tile_stream_loadd(2, const_cast<c10::BFloat16*>(load_2), b_stride);
       _tile_dpbf16ps(6, 0, 2);
@@ -332,6 +346,9 @@ class TileGemm122<c10::BFloat16, kv_cache_t> {
       _tile_dpbf16ps(6, 1, 4);
       _tile_stream_loadd(5, const_cast<c10::BFloat16*>(load_5), b_stride);
       _tile_dpbf16ps(7, 1, 5);
+      if constexpr (fp8_kv) {
+        std::atomic_signal_fence(std::memory_order_seq_cst);
+      }
 
       // update ptrs
       if constexpr (phase == AttentionGemmPhase::QK) {
@@ -353,11 +370,17 @@ class TileGemm122<c10::BFloat16, kv_cache_t> {
       const c10::BFloat16* load_2 = prepare_b_tile(b_tile_2, scratch_2);
       const c10::BFloat16* load_3 = prepare_b_tile(b_tile_3, scratch_3);
 
+      if constexpr (fp8_kv) {
+        std::atomic_signal_fence(std::memory_order_seq_cst);
+      }
       _tile_loadd(0, a_tile_0, a_tile_stride);
       _tile_stream_loadd(2, const_cast<c10::BFloat16*>(load_2), b_stride);
       _tile_dpbf16ps(6, 0, 2);
       _tile_stream_loadd(3, const_cast<c10::BFloat16*>(load_3), b_stride);
       _tile_dpbf16ps(7, 0, 3);
+      if constexpr (fp8_kv) {
+        std::atomic_signal_fence(std::memory_order_seq_cst);
+      }
     }
 
     _tile_stored(6, c_tile_6, c_stride);

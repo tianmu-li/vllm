@@ -3,7 +3,7 @@
 
 // clang-format off
 
-#include "common.h"
+#include "tile_scheduler.h"
 #include "gemm.h"
 #include "vec.h"
 
@@ -310,31 +310,33 @@ void int8_scaled_mm_kernel_impl(
   const int64_t packed_row_size = get_row_size<int8_t>(K);
 
   AT_DISPATCH_BOOL(bias != nullptr, has_bias, [&] {
-    parallel_2d(MB, NB, [&](int64_t mb0, int64_t mb1, int64_t nb0, int64_t nb1) {
+    parallel_sgl_dense(MB, NB, M, N, K, 1, [&](const auto& rectangles) {
       // for brgemm, use int32_t for accumulate
       alignas(64) int32_t Ctmp[BLOCK_M * BLOCK_N];
 
-      loop_2d<int8_t>(mb0, mb1, nb0, nb1, BLOCK_N * K, [&](int64_t mb, int64_t nb, int64_t nb_offset) {
-        int mb_start = mb * BLOCK_M;
-        int mb_size = std::min(M - mb_start, BLOCK_M);
-        int nb_start = nb * BLOCK_N;
-        int nb_size = std::min(N - nb_start, BLOCK_N);
+      rectangles([&](int64_t mb0, int64_t mb1, int64_t nb0, int64_t nb1) {
+        loop_2d<int8_t>(mb0, mb1, nb0, nb1, BLOCK_N * K, [&](int64_t mb, int64_t nb, int64_t nb_offset) {
+          int mb_start = mb * BLOCK_M;
+          int mb_size = std::min(M - mb_start, BLOCK_M);
+          int nb_start = nb * BLOCK_N;
+          int nb_size = std::min(N - nb_start, BLOCK_N);
 
-        tinygemm_kernel<scalar_t, has_bias>(
-            /*   A */ mat1 + mb_start * K,
-            /*   B */ mat2 + nb_start * packed_row_size /* nb * BLOCK_N * (K + 4) */,
-            /*   C */ out + mb_start * N + nb_start,
-            /* Ctmp*/ Ctmp,
-            /*  As */ scales1 + mb_start,
-            /*  Bs */ scales2 + nb_start,
-            /* bias*/ bias + nb_start,
-            /*   M */ mb_size,
-            /*   N */ nb_size,
-            /*   K */ K,
-            /* lda */ K,
-            /* ldb */ nb_size,
-            /* ldc */ N,
-            /* brg */ use_brgemm);
+          tinygemm_kernel<scalar_t, has_bias>(
+              /*   A */ mat1 + mb_start * K,
+              /*   B */ mat2 + nb_start * packed_row_size /* nb * BLOCK_N * (K + 4) */,
+              /*   C */ out + mb_start * N + nb_start,
+              /* Ctmp*/ Ctmp,
+              /*  As */ scales1 + mb_start,
+              /*  Bs */ scales2 + nb_start,
+              /* bias*/ bias + nb_start,
+              /*   M */ mb_size,
+              /*   N */ nb_size,
+              /*   K */ K,
+              /* lda */ K,
+              /* ldb */ nb_size,
+              /* ldc */ N,
+              /* brg */ use_brgemm);
+        });
       });
 
       if (use_brgemm) {

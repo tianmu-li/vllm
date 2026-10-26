@@ -26,6 +26,7 @@ steps:
   - tests/kernels/test_cpu_fused_sampling.py
   - tests/kernels/test_awq_int4_to_int8.py
   - tests/kernels/quantization/test_cpu_fp8_scaled_mm.py
+  - tests/kernels/quantization/test_scaled_mm_kernel_selection.py
   - tests/kernels/quantization/test_cpu_fp8_quant.py
   - vllm/model_executor/kernels/linear/scaled_mm/cpu.py
   - tests/kernels/quantization/test_zen_da8w4.py
@@ -55,6 +56,7 @@ steps:
       tests/kernels/test_cpu_fused_sampling.py \
       tests/kernels/test_awq_int4_to_int8.py \
       tests/kernels/quantization/test_cpu_fp8_scaled_mm.py \
+      tests/kernels/quantization/test_scaled_mm_kernel_selection.py \
       tests/kernels/quantization/test_cpu_fp8_quant.py \
       tests/kernels/quantization/test_zen_da8w4.py \
       tests/kernels/mamba/cpu/test_cpu_gdn_ops.py \
