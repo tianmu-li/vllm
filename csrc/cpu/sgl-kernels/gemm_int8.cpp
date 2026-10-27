@@ -3,7 +3,7 @@
 
 // clang-format off
 
-#include "tile_scheduler.h"
+#include "dense_scheduler.h"
 #include "gemm.h"
 #include "vec.h"
 
@@ -310,7 +310,7 @@ void int8_scaled_mm_kernel_impl(
   const int64_t packed_row_size = get_row_size<int8_t>(K);
 
   AT_DISPATCH_BOOL(bias != nullptr, has_bias, [&] {
-    parallel_sgl_dense(MB, NB, M, N, K, 1, [&](const auto& rectangles) {
+    parallel_sgl_dense(MB, NB, M, [&](const auto& rectangles) {
       // for brgemm, use int32_t for accumulate
       alignas(64) int32_t Ctmp[BLOCK_M * BLOCK_N];
 

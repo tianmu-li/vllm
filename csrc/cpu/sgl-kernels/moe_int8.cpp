@@ -3,8 +3,9 @@
 
 // clang-format off
 
-#include "tile_scheduler.h"
+#include "common.h"
 #include "gemm.h"
+#include "dense_scheduler.h"
 #include "moe.h"
 
 namespace {
@@ -492,7 +493,6 @@ void fused_experts_int8_kernel_impl(
 
   // strides for w1: [E, 2N, K]
   TORCH_CHECK(N % BLOCK_N == 0, "Fixme when N is not multiples of ", BLOCK_N);
-  const auto tile_plans = make_sgl_moe_plans(expert_ids, offsets, MB, N, K);
 
   // K and N are packed for int8
   const int64_t packed_K = get_row_size<int8_t>(K);
@@ -502,7 +502,7 @@ void fused_experts_int8_kernel_impl(
   const int64_t stride_n = packed_K;
 
   // here we only parallel on half of 2N to fuse silu_and_mul with gemm
-  parallel_sgl_moe(tile_plans.gate, MB, NB, [&](const auto& rectangles) {
+  parallel_2d(MB, NB, [&](int64_t mb0, int64_t mb1, int64_t nb0, int64_t nb1) {
     // get local pointers
     int tid = get_thread_num();
     uint8_t* __restrict__ A = A_tmp + tid * BLOCK_M * K;
@@ -512,111 +512,109 @@ void fused_experts_int8_kernel_impl(
 
     alignas(64) float As[BLOCK_M];
 
-    rectangles([&](int64_t mb0, int64_t mb1, int64_t nb0, int64_t nb1) {
-      loop_2d<int8_t>(mb0, mb1, nb0, nb1, BLOCK_N * K * 2, [&](int64_t mb, int64_t nb, int64_t nb_offset) {
-        // nb_upper from top half and nb_lower from bottom half
-        int64_t nb_upper = nb, nb_lower = nb + NB;
-        int64_t n_size = std::min(N - nb * BLOCK_N, BLOCK_N);
+    loop_2d<int8_t>(mb0, mb1, nb0, nb1, BLOCK_N * K * 2, [&](int64_t mb, int64_t nb, int64_t nb_offset) {
+      // nb_upper from top half and nb_lower from bottom half
+      int64_t nb_upper = nb, nb_lower = nb + NB;
+      int64_t n_size = std::min(N - nb * BLOCK_N, BLOCK_N);
 
-        // B shape [K, n_size] in vnni format
-        int32_t expert_id = expert_ids[mb];
-        const int8_t* __restrict__ B0 = packed_w1 + expert_id * stride_e + nb_upper * BLOCK_N * stride_n;
-        const int8_t* __restrict__ B1 = packed_w1 + expert_id * stride_e + nb_lower * BLOCK_N * stride_n;
-        const float* __restrict__ Bs0 = w1s + expert_id * 2 * N + nb_upper * BLOCK_N;
-        const float* __restrict__ Bs1 = w1s + expert_id * 2 * N + nb_lower * BLOCK_N;
+      // B shape [K, n_size] in vnni format
+      int32_t expert_id = expert_ids[mb];
+      const int8_t* __restrict__ B0 = packed_w1 + expert_id * stride_e + nb_upper * BLOCK_N * stride_n;
+      const int8_t* __restrict__ B1 = packed_w1 + expert_id * stride_e + nb_lower * BLOCK_N * stride_n;
+      const float* __restrict__ Bs0 = w1s + expert_id * 2 * N + nb_upper * BLOCK_N;
+      const float* __restrict__ Bs1 = w1s + expert_id * 2 * N + nb_lower * BLOCK_N;
 
-        int64_t m_size = offsets[mb + 1] - offsets[mb];
-        if (m_size == 0) {
-          return;
+      int64_t m_size = offsets[mb + 1] - offsets[mb];
+      if (m_size == 0) {
+        return;
+      }
+      const bool brg = can_use_brgemm<int8_t>(m_size, n_size);
+      use_brgemm |= brg;
+
+      if (nb_offset == 0) {
+        // 1.a load A
+        const int32_t* A_ids = sorted_ids + mb * BLOCK_M;
+        for (int64_t m = 0; m < m_size; ++m) {
+          int32_t index = A_ids[m] / topk;
+          copy_stub(A + m * K, Aq_tmp + index * K, K);
+          As[m] = As_tmp[index];
         }
-        const bool brg = can_use_brgemm<int8_t>(m_size, n_size);
-        use_brgemm |= brg;
+      }
 
-        if (nb_offset == 0) {
-          // 1.a load A
-          const int32_t* A_ids = sorted_ids + mb * BLOCK_M;
-          for (int64_t m = 0; m < m_size; ++m) {
-            int32_t index = A_ids[m] / topk;
-            copy_stub(A + m * K, Aq_tmp + index * K, K);
-            As[m] = As_tmp[index];
-          }
-        }
+      if (brg) {
+        // 1.b gemm: C0 = A @ B0
+        at::native::cpublas::brgemm(
+            /* M     */ m_size,
+            /* N     */ n_size,
+            /* K     */ K,
+            /* lda   */ K,
+            /* ldb   */ n_size,
+            /* ldc   */ BLOCK_N,
+            /* add_C */ false,
+            /* A     */ A,
+            /* B     */ B0,
+            /* C     */ C0);
 
-        if (brg) {
-          // 1.b gemm: C0 = A @ B0
-          at::native::cpublas::brgemm(
-              /* M     */ m_size,
-              /* N     */ n_size,
-              /* K     */ K,
-              /* lda   */ K,
-              /* ldb   */ n_size,
-              /* ldc   */ BLOCK_N,
-              /* add_C */ false,
-              /* A     */ A,
-              /* B     */ B0,
-              /* C     */ C0);
+        // 1.c gemm: C1 = A @ B1
+        at::native::cpublas::brgemm(
+            /* M     */ m_size,
+            /* N     */ n_size,
+            /* K     */ K,
+            /* lda   */ K,
+            /* ldb   */ n_size,
+            /* ldc   */ BLOCK_N,
+            /* add_C */ false,
+            /* A     */ A,
+            /* B     */ B1,
+            /* C     */ C1);
 
-          // 1.c gemm: C1 = A @ B1
-          at::native::cpublas::brgemm(
-              /* M     */ m_size,
-              /* N     */ n_size,
-              /* K     */ K,
-              /* lda   */ K,
-              /* ldb   */ n_size,
-              /* ldc   */ BLOCK_N,
-              /* add_C */ false,
-              /* A     */ A,
-              /* B     */ B1,
-              /* C     */ C1);
+        const int32_t* Bcomp0 = reinterpret_cast<const int32_t*>(B0 + block_size_n() * K);
+        const int32_t* Bcomp1 = reinterpret_cast<const int32_t*>(B1 + block_size_n() * K);
 
-          const int32_t* Bcomp0 = reinterpret_cast<const int32_t*>(B0 + block_size_n() * K);
-          const int32_t* Bcomp1 = reinterpret_cast<const int32_t*>(B1 + block_size_n() * K);
-
-          // 1.d silu and mul
-          const int64_t offset = offsets[mb];
-          if (act_func == CPUActMethod::gelu_tanh_and_mul) {
-            silu_and_mul<scalar_t, BLOCK_N, CPUActMethod::gelu_tanh_and_mul>(
-                ic1 + offset * N + nb * BLOCK_N, C0, C1, As, Bs0, Bs1, Bcomp0, Bcomp1, m_size, N);
-          } else {
-            silu_and_mul<scalar_t, BLOCK_N, CPUActMethod::silu_and_mul>(
-                ic1 + offset * N + nb * BLOCK_N, C0, C1, As, Bs0, Bs1, Bcomp0, Bcomp1, m_size, N);
-          }
+        // 1.d silu and mul
+        const int64_t offset = offsets[mb];
+        if (act_func == CPUActMethod::gelu_tanh_and_mul) {
+          silu_and_mul<scalar_t, BLOCK_N, CPUActMethod::gelu_tanh_and_mul>(
+              ic1 + offset * N + nb * BLOCK_N, C0, C1, As, Bs0, Bs1, Bcomp0, Bcomp1, m_size, N);
         } else {
-          // fused 1.bcd: silu_and_mul(A @ B0, A @ B1)
-          const int64_t offset = offsets[mb];
-          if (act_func == CPUActMethod::gelu_tanh_and_mul) {
-            tinygemm_kernel<scalar_t, CPUActMethod::gelu_tanh_and_mul>(
-                /* A     */ A,
-                /* B0    */ B0,
-                /* B1    */ B1,
-                /* C     */ ic1 + offset * N + nb * BLOCK_N,
-                /* As    */ As,
-                /* Bs0   */ Bs0,
-                /* Bs1   */ Bs1,
-                /* M     */ m_size,
-                /* N     */ n_size,
-                /* K     */ K,
-                /* lda   */ K,
-                /* ldb   */ n_size,
-                /* ldc   */ N);
-          } else {
-            tinygemm_kernel<scalar_t, CPUActMethod::silu_and_mul>(
-                /* A     */ A,
-                /* B0    */ B0,
-                /* B1    */ B1,
-                /* C     */ ic1 + offset * N + nb * BLOCK_N,
-                /* As    */ As,
-                /* Bs0   */ Bs0,
-                /* Bs1   */ Bs1,
-                /* M     */ m_size,
-                /* N     */ n_size,
-                /* K     */ K,
-                /* lda   */ K,
-                /* ldb   */ n_size,
-                /* ldc   */ N);
-          }
+          silu_and_mul<scalar_t, BLOCK_N, CPUActMethod::silu_and_mul>(
+              ic1 + offset * N + nb * BLOCK_N, C0, C1, As, Bs0, Bs1, Bcomp0, Bcomp1, m_size, N);
         }
-      });
+      } else {
+        // fused 1.bcd: silu_and_mul(A @ B0, A @ B1)
+        const int64_t offset = offsets[mb];
+        if (act_func == CPUActMethod::gelu_tanh_and_mul) {
+          tinygemm_kernel<scalar_t, CPUActMethod::gelu_tanh_and_mul>(
+              /* A     */ A,
+              /* B0    */ B0,
+              /* B1    */ B1,
+              /* C     */ ic1 + offset * N + nb * BLOCK_N,
+              /* As    */ As,
+              /* Bs0   */ Bs0,
+              /* Bs1   */ Bs1,
+              /* M     */ m_size,
+              /* N     */ n_size,
+              /* K     */ K,
+              /* lda   */ K,
+              /* ldb   */ n_size,
+              /* ldc   */ N);
+        } else {
+          tinygemm_kernel<scalar_t, CPUActMethod::silu_and_mul>(
+              /* A     */ A,
+              /* B0    */ B0,
+              /* B1    */ B1,
+              /* C     */ ic1 + offset * N + nb * BLOCK_N,
+              /* As    */ As,
+              /* Bs0   */ Bs0,
+              /* Bs1   */ Bs1,
+              /* M     */ m_size,
+              /* N     */ n_size,
+              /* K     */ K,
+              /* lda   */ K,
+              /* ldb   */ n_size,
+              /* ldc   */ N);
+        }
+      }
     });
 
     if (use_brgemm) {
@@ -641,74 +639,72 @@ void fused_experts_int8_kernel_impl(
   const int64_t stride_oc = packed_N;
 
   // parallel on [MB2, NB2]
-  parallel_sgl_moe(tile_plans.down, MB2, NB2, [&](const auto& rectangles) {
+  parallel_2d(MB2, NB2, [&](int64_t mb0, int64_t mb1, int64_t nb0, int64_t nb1) {
     // get local pointers
     int tid = get_thread_num();
     float* __restrict__ C = C_tmp + tid * 2 * BLOCK_M * BLOCK_N;
     int32_t* __restrict__ C32 = reinterpret_cast<int32_t*>(C + BLOCK_M * BLOCK_N);
     bool use_brgemm = false;
 
-    rectangles([&](int64_t mb0, int64_t mb1, int64_t nb0, int64_t nb1) {
-      loop_2d<int8_t>(mb0, mb1, nb0, nb1, BLOCK_N * IC, [&](int64_t mb, int64_t nb, int64_t nb_offset) {
-        int64_t m_size = offsets[mb + 1] - offsets[mb];
-        if (m_size == 0) {
-          return;
-        }
-        int64_t n_size = std::min(OC - nb * BLOCK_N, BLOCK_N);
-        const bool brg = can_use_brgemm<int8_t>(m_size, n_size);
-        use_brgemm |= brg;
+    loop_2d<int8_t>(mb0, mb1, nb0, nb1, BLOCK_N * IC, [&](int64_t mb, int64_t nb, int64_t nb_offset) {
+      int64_t m_size = offsets[mb + 1] - offsets[mb];
+      if (m_size == 0) {
+        return;
+      }
+      int64_t n_size = std::min(OC - nb * BLOCK_N, BLOCK_N);
+      const bool brg = can_use_brgemm<int8_t>(m_size, n_size);
+      use_brgemm |= brg;
 
-        // A ptr from ic1 of [M * topk, N] in sorted order
-        // so as to avoid copy A to tmp buffer again
-        const uint8_t* __restrict__ A = Aq_tmp + offsets[mb] * N;
-        const float* __restrict__ As = As_tmp + offsets[mb];
-        const int32_t* A_ids = sorted_ids + mb * BLOCK_M;
+      // A ptr from ic1 of [M * topk, N] in sorted order
+      // so as to avoid copy A to tmp buffer again
+      const uint8_t* __restrict__ A = Aq_tmp + offsets[mb] * N;
+      const float* __restrict__ As = As_tmp + offsets[mb];
+      const int32_t* A_ids = sorted_ids + mb * BLOCK_M;
 
-        // B shape [IC, n_size] in vnni format
-        int32_t expert_id = expert_ids[mb];
-        const int8_t* __restrict__ B = packed_w2 + expert_id * stride_e2 + nb * BLOCK_N * stride_oc;
-        const float* __restrict__ Bs = w2s + expert_id * K + nb * BLOCK_N;
+      // B shape [IC, n_size] in vnni format
+      int32_t expert_id = expert_ids[mb];
+      const int8_t* __restrict__ B = packed_w2 + expert_id * stride_e2 + nb * BLOCK_N * stride_oc;
+      const float* __restrict__ Bs = w2s + expert_id * K + nb * BLOCK_N;
 
-        // 2.a gemm: C = A @ B
-        if (brg) {
-          at::native::cpublas::brgemm(
-              /* M     */ m_size,
-              /* N     */ n_size,
-              /* K     */ IC,
-              /* lda   */ IC,
-              /* ldb   */ n_size,
-              /* ldc   */ BLOCK_N,
-              /* add_C */ false,
-              /* A     */ A,
-              /* B     */ B,
-              /* C     */ C32);
+      // 2.a gemm: C = A @ B
+      if (brg) {
+        at::native::cpublas::brgemm(
+            /* M     */ m_size,
+            /* N     */ n_size,
+            /* K     */ IC,
+            /* lda   */ IC,
+            /* ldb   */ n_size,
+            /* ldc   */ BLOCK_N,
+            /* add_C */ false,
+            /* A     */ A,
+            /* B     */ B,
+            /* C     */ C32);
 
-          // apply scales
-          const int32_t* Bcomp = reinterpret_cast<const int32_t*>(B + block_size_n() * IC);
-          scale_C<BLOCK_N>(C, C32, As, Bs, Bcomp, m_size);
-        } else {
-          tinygemm_kernel<scalar_t>(
-              /* A     */ A,
-              /* B     */ B,
-              /* C     */ C,
-              /* As    */ As,
-              /* Bs    */ Bs,
-              /* M     */ m_size,
-              /* N     */ n_size,
-              /* K     */ IC,
-              /* lda   */ IC,
-              /* ldb   */ n_size,
-              /* ldc   */ BLOCK_N);
-        }
+        // apply scales
+        const int32_t* Bcomp = reinterpret_cast<const int32_t*>(B + block_size_n() * IC);
+        scale_C<BLOCK_N>(C, C32, As, Bs, Bcomp, m_size);
+      } else {
+        tinygemm_kernel<scalar_t>(
+            /* A     */ A,
+            /* B     */ B,
+            /* C     */ C,
+            /* As    */ As,
+            /* Bs    */ Bs,
+            /* M     */ m_size,
+            /* N     */ n_size,
+            /* K     */ IC,
+            /* lda   */ IC,
+            /* ldb   */ n_size,
+            /* ldc   */ BLOCK_N);
+      }
 
-        // 2.b copy from C to ic2 in original order
-        //   and also mul topk_weights in float32
-        for (int64_t m = 0; m < m_size; ++m) {
-          int32_t index = A_ids[m];
-          float weight = topk_weights[index];
-          copy_mul_stub(ic2 + index * K + nb * BLOCK_N, C + m * BLOCK_N, weight, n_size);
-        }
-      });
+      // 2.b copy from C to ic2 in original order
+      //   and also mul topk_weights in float32
+      for (int64_t m = 0; m < m_size; ++m) {
+        int32_t index = A_ids[m];
+        float weight = topk_weights[index];
+        copy_mul_stub(ic2 + index * K + nb * BLOCK_N, C + m * BLOCK_N, weight, n_size);
+      }
     });
 
     if (use_brgemm) {
@@ -797,7 +793,7 @@ void shared_expert_int8_kernel_impl(
   const bool apply_scaling_factor = fused_experts_out != nullptr;
 
   // here we only parallel on half of 2N to fuse silu_and_mul with gemm
-  parallel_sgl_dense(MB, NB, M, N, K, 2, [&](const auto& rectangles) {
+  parallel_sgl_dense(MB, NB, M, [&](const auto& rectangles) {
     // get local pointers
     int tid = get_thread_num();
     int32_t* __restrict__ C0 = reinterpret_cast<int32_t*>(C_tmp) + tid * 2 * BLOCK_M * BLOCK_N;
@@ -894,7 +890,7 @@ void shared_expert_int8_kernel_impl(
   const int64_t stride_oc = packed_N;
 
   // parallel on [MB2, NB2]
-  parallel_sgl_dense(MB2, NB2, M, OC, IC, 1, [&](const auto& rectangles) {
+  parallel_sgl_dense(MB2, NB2, M, [&](const auto& rectangles) {
     // get local pointers
     int tid = get_thread_num();
     float* __restrict__ C = C_tmp + tid * 2 * BLOCK_M * BLOCK_N;

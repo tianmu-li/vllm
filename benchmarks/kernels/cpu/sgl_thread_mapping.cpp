@@ -2,687 +2,672 @@
 // SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 #include "common.h"
-#include "tile_scheduler.h"
+#include "dense_scheduler.h"
 
-#include <array>
+#include <algorithm>
 #include <chrono>
 #include <cstdint>
-#include <iomanip>
 #include <iostream>
-#include <map>
+#include <limits>
+#include <optional>
 #include <sched.h>
-#include <set>
-#include <sstream>
+#include <string>
 #include <tuple>
+#include <utility>
+#include <vector>
 
 namespace {
 
+constexpr int kLogicalWorkers = 96;
+constexpr int64_t kMBlockSize = 32;
+constexpr int kTimingIterations = 100;
+#if defined(_OPENMP)
+constexpr bool kOpenMP = true;
+#else
+constexpr bool kOpenMP = false;
+#endif
+
+using Scheduler = SGLDenseSchedule;
+
 struct Config {
   int threads;
-  int m_blocks;
-  int n_blocks;
-  std::string kind = "dense";
-  std::string phase = "gate";
-  bool timing = false;
-  int64_t k = 2048;
-  int64_t rows = -1;
-  int64_t columns = -1;
-  std::vector<int64_t> expert_rows;
+  int64_t mb;
+  int64_t nb;
+  int64_t actual_m;
+  Scheduler scheduler = Scheduler::Legacy;
+  bool timing;
 };
 
-struct Observation {
+struct Rectangle {
+  int64_t m0;
+  int64_t m1;
+  int64_t n0;
+  int64_t n1;
+};
+
+struct WorkerLog {
   int cpu = -1;
-  int work_id = -1;
-  int tile = -1;
-  int physical_tile = -1;
   int team_size = 0;
-  std::vector<int> task_ids;
-  std::vector<std::array<int64_t, 4>> rectangles;
+  bool entered = false;
+  std::vector<Rectangle> rectangles;
 };
 
-std::string require_value(int& index, int argc, char** argv) {
-  TORCH_CHECK(index + 1 < argc, "Missing value for ", argv[index]);
-  return argv[++index];
+struct Task {
+  int id;
+  int worker;
+  int cpu;
+  Rectangle rectangle;
+  int64_t logical_owner;
+  int64_t flat_task_id;
+  bool overflow;
+  bool empty;
+};
+
+const char* scheduler_name(Scheduler scheduler) {
+  switch (scheduler) {
+    case Scheduler::Legacy:
+      return "legacy";
+    case Scheduler::Logical96:
+      return "logical96_dense";
+    case Scheduler::Flat32:
+      return "flat_32x32";
+    case Scheduler::Flat128x64:
+      return "flat_128x64";
+    case Scheduler::Flat128x128:
+      return "flat_128x128";
+  }
+  TORCH_CHECK(false, "Unknown dense scheduler.");
 }
 
-int64_t parse_integer(const std::string& value, const std::string& name) {
+bool is_flat_schedule(Scheduler scheduler) {
+  return scheduler == Scheduler::Flat32 || scheduler == Scheduler::Flat128x64 ||
+         scheduler == Scheduler::Flat128x128;
+}
+
+int parse_int(const char* value, const char* name) {
+  size_t end = 0;
+  const auto parsed = std::stol(value, &end);
+  TORCH_CHECK(end == std::string(value).size(), "Invalid ", name, ": ", value);
+  TORCH_CHECK(parsed > 0 && parsed <= std::numeric_limits<int>::max(), name,
+              " must be a positive integer.");
+  return static_cast<int>(parsed);
+}
+
+int64_t parse_int64(const char* value, const char* name) {
   size_t end = 0;
   const auto parsed = std::stoll(value, &end);
-  TORCH_CHECK(end == value.size(), "Invalid integer for ", name, ": ", value);
+  TORCH_CHECK(end == std::string(value).size(), "Invalid ", name, ": ", value);
+  TORCH_CHECK(parsed >= 0, name, " must be nonnegative.");
   return parsed;
 }
 
-std::vector<int64_t> parse_expert_rows(const std::string& value) {
-  std::vector<int64_t> rows;
-  std::stringstream input(value);
-  std::string item;
-  while (std::getline(input, item, ',')) {
-    const int64_t count = parse_integer(item, "--expert-rows");
-    TORCH_CHECK(count >= 0, "Expert row counts must be nonnegative.");
-    rows.push_back(count);
-  }
-  TORCH_CHECK(!rows.empty(), "--expert-rows must contain at least one count.");
-  return rows;
-}
-
 Config parse_config(int argc, char** argv) {
-  TORCH_CHECK(argc >= 4,
-              "Expected positional arguments: threads, M blocks, N blocks");
-  Config config{std::stoi(argv[1]), std::stoi(argv[2]), std::stoi(argv[3])};
-  for (int i = 4; i < argc; ++i) {
+  TORCH_CHECK(argc >= 5,
+              "Expected arguments: threads, M blocks, N blocks, scheduler");
+  const std::string scheduler_arg(argv[4]);
+  Scheduler scheduler = SGLDenseSchedule::Legacy;
+  if (scheduler_arg == "legacy") {
+    scheduler = Scheduler::Legacy;
+  } else if (scheduler_arg == "logical96_dense") {
+    scheduler = Scheduler::Logical96;
+  } else if (scheduler_arg == "flat_32x32") {
+    scheduler = Scheduler::Flat32;
+  } else if (scheduler_arg == "flat_128x64") {
+    scheduler = Scheduler::Flat128x64;
+  } else if (scheduler_arg == "flat_128x128") {
+    scheduler = Scheduler::Flat128x128;
+  } else {
+    TORCH_CHECK(false, "Unknown scheduler: ", scheduler_arg);
+  }
+  const auto threads = parse_int(argv[1], "threads");
+  const auto mb = parse_int64(argv[2], "M blocks");
+  const auto nb = parse_int64(argv[3], "N blocks");
+  TORCH_CHECK(mb <= std::numeric_limits<int>::max() &&
+                  nb <= std::numeric_limits<int>::max(),
+              "Block counts must fit in int for the legacy scheduler.");
+  Config config{threads, mb, nb, mb * kMBlockSize, scheduler, false};
+  for (int i = 5; i < argc; ++i) {
     const std::string option(argv[i]);
     if (option == "--timing") {
       config.timing = true;
-    } else if (option == "--kind") {
-      config.kind = require_value(i, argc, argv);
-    } else if (option == "--phase") {
-      config.phase = require_value(i, argc, argv);
-    } else if (option == "--rows") {
-      config.rows = parse_integer(require_value(i, argc, argv), option);
-    } else if (option == "--columns") {
-      config.columns = parse_integer(require_value(i, argc, argv), option);
-    } else if (option == "--k") {
-      config.k = parse_integer(require_value(i, argc, argv), option);
-    } else if (option == "--expert-rows") {
-      config.expert_rows = parse_expert_rows(require_value(i, argc, argv));
+    } else if (option == "--m") {
+      TORCH_CHECK(i + 1 < argc, "Missing value for --m.");
+      config.actual_m = parse_int64(argv[++i], "actual M");
     } else {
       TORCH_CHECK(false, "Unknown option: ", option);
     }
   }
-  TORCH_CHECK(config.threads > 0 && config.m_blocks > 0 &&
-                  config.n_blocks > 0 && config.k > 0,
-              "Threads, block counts, and K must be positive.");
-  TORCH_CHECK(config.kind == "dense" || config.kind == "moe",
-              "--kind must be dense or moe.");
-  TORCH_CHECK(config.phase == "gate" || config.phase == "down",
-              "--phase must be gate or down.");
-  TORCH_CHECK(config.rows == -1 || config.rows > 0, "--rows must be positive.");
-  TORCH_CHECK(config.columns == -1 || config.columns > 0,
-              "--columns must be positive.");
-  TORCH_CHECK(config.kind != "dense" ||
-                  (config.phase == "gate" && config.expert_rows.empty()),
-              "--phase and --expert-rows only apply to MoE.");
-  TORCH_CHECK(config.kind != "moe" || config.rows == -1,
-              "--rows only applies to dense; use --expert-rows for MoE.");
+  const auto expected_mb =
+      config.actual_m / kMBlockSize + (config.actual_m % kMBlockSize != 0);
+  TORCH_CHECK(expected_mb == config.mb,
+              "Actual M must satisfy M blocks = ceil(M / 32).");
   return config;
 }
 
-const char* schedule_name(SGLSchedule mode) {
-  switch (mode) {
-    case SGLSchedule::Legacy:
-      return "legacy";
-    case SGLSchedule::RoundRobin:
-      return "round_robin";
-    case SGLSchedule::Spread:
-      return "spread";
-    case SGLSchedule::Tile:
-      return "tile";
-  }
-  return "unknown";
+int current_worker_id() {
+#if defined(_OPENMP)
+  return omp_get_thread_num();
+#else
+  return 0;
+#endif
 }
 
-int tile_for_worker(int worker, const std::vector<int>& group_sizes) {
-  int begin = 0;
-  for (size_t group = 0; group < group_sizes.size(); ++group) {
-    begin += group_sizes[group];
-    if (worker < begin) {
-      return static_cast<int>(group);
-    }
-  }
-  return -1;
+int current_team_size() {
+#if defined(_OPENMP)
+  return omp_get_num_threads();
+#else
+  return 1;
+#endif
 }
 
-void add_rectangle(std::vector<int>& coverage, int64_t mb, int64_t nb,
-                   const std::array<int64_t, 4>& rectangle) {
-  const auto [mb0, mb1, nb0, nb1] = rectangle;
-  TORCH_CHECK(mb0 >= 0 && mb0 <= mb1 && mb1 <= mb && nb0 >= 0 && nb0 <= nb1 &&
-                  nb1 <= nb,
-              "Scheduled rectangle lies outside the matrix blocks.");
-  for (int64_t m = mb0; m < mb1; ++m) {
-    for (int64_t n = nb0; n < nb1; ++n) {
-      ++coverage[static_cast<size_t>(m) * nb + n];
-    }
-  }
+WorkerLog& enter_worker(std::vector<WorkerLog>& logs) {
+  const int worker = current_worker_id();
+  TORCH_CHECK(worker >= 0 && worker < static_cast<int>(logs.size()),
+              "OpenMP worker exceeds the configured team size.");
+  auto& log = logs[worker];
+  TORCH_CHECK(!log.entered, "Worker entered the diagnostic more than once.");
+  log.entered = true;
+  log.cpu = sched_getcpu();
+  log.team_size = current_team_size();
+  return log;
 }
 
-void check_coverage(const std::vector<int>& coverage, int64_t mb, int64_t nb,
-                    const std::vector<int32_t>& offsets, bool dense) {
-  for (int64_t m = 0; m < mb; ++m) {
-    const bool active = dense || offsets[m + 1] > offsets[m];
-    for (int64_t n = 0; n < nb; ++n) {
-      const int expected = active ? 1 : 0;
-      TORCH_CHECK(coverage[static_cast<size_t>(m) * nb + n] == expected,
-                  "Matrix block (", m, ", ", n,
-                  ") has unexpected task coverage.");
-    }
-  }
+void append_rectangle(WorkerLog& log, int64_t m0, int64_t m1, int64_t n0,
+                      int64_t n1) {
+  log.rectangles.push_back({m0, m1, n0, n1});
 }
 
-std::vector<int64_t> effective_expert_rows(const Config& config) {
-  if (!config.expert_rows.empty()) {
-    return config.expert_rows;
+std::vector<Task> reconstruct_tasks(const std::vector<WorkerLog>& logs,
+                                    int actual_team_size, bool logical96,
+                                    const DenseLogical96Grid* grid,
+                                    int primary_workers,
+                                    const DenseFlatGrid* flat_grid) {
+  std::vector<Task> tasks;
+  for (int worker = 0; worker < actual_team_size; ++worker) {
+    const auto& log = logs[worker];
+    for (const auto& rectangle : log.rectangles) {
+      const bool empty =
+          rectangle.m0 >= rectangle.m1 || rectangle.n0 >= rectangle.n1;
+      TORCH_CHECK(!logical96 || empty || grid != nullptr,
+                  "Logical96 grid is missing for a nonempty matrix.");
+      TORCH_CHECK(flat_grid == nullptr || empty || flat_grid->rows > 0,
+                  "Flat grid is missing rows for a nonempty matrix.");
+      const int64_t logical_owner =
+          logical96 && !empty && grid != nullptr
+              ? (rectangle.m0 / grid->bm) * grid->pn + rectangle.n0 / grid->bn
+              : -1;
+      const int64_t flat_task_id =
+          flat_grid != nullptr && !empty
+              ? (rectangle.n0 / flat_grid->bn) * flat_grid->rows +
+                    rectangle.m0 / flat_grid->bm
+              : -1;
+      tasks.push_back({static_cast<int>(tasks.size()), worker, log.cpu,
+                       rectangle, logical_owner, flat_task_id,
+                       logical96 && logical_owner >= primary_workers, empty});
+    }
   }
-  return std::vector<int64_t>(config.m_blocks, 4);
+  return tasks;
 }
 
-void pack_expert_blocks(const std::vector<int64_t>& rows,
-                        std::vector<int32_t>& expert_ids,
-                        std::vector<int32_t>& offsets) {
-  offsets.push_back(0);
-  int64_t total_rows = 0;
-  for (size_t expert = 0; expert < rows.size(); ++expert) {
-    int64_t remaining = rows[expert];
-    total_rows += remaining;
-    TORCH_CHECK(total_rows <= INT32_MAX,
-                "Total expert rows exceed the supported offset range.");
-    while (remaining > 0) {
-      const int32_t block_rows =
-          static_cast<int32_t>(std::min<int64_t>(32, remaining));
-      expert_ids.push_back(static_cast<int32_t>(expert));
-      offsets.push_back(offsets.back() + block_rows);
-      remaining -= block_rows;
-    }
-  }
+void run_without_logging(int64_t mb, int64_t nb, int64_t actual_m) {
+  parallel_sgl_dense(mb, nb, actual_m, [&](const auto& rectangles) {
+    volatile int64_t token = 0;
+    rectangles([&](int64_t m0, int64_t m1, int64_t n0, int64_t n1) {
+      token = m0 ^ m1 ^ n0 ^ n1;
+    });
+    const int64_t observed_token = token;
+    (void)observed_token;
+  });
 }
 
-void write_cost(const SGLTileCost& cost) {
-  std::cout << "{\"bytes\":" << cost.bytes << ",\"ops\":" << cost.ops << '}';
-}
-
-void write_histogram(const std::vector<int64_t>& rows) {
-  std::map<int64_t, int> histogram;
-  for (int64_t count : rows) {
-    ++histogram[count];
+void validate_coverage(
+    const std::vector<Task>& tasks, int64_t mb, int64_t nb, bool logical96,
+    const DenseLogical96Grid* grid, int primary_workers,
+    std::vector<std::tuple<int64_t, int64_t, int64_t>>& overflow_claims,
+    int& empty_rectangles) {
+  if (mb == 0 || nb == 0) {
+    TORCH_CHECK(tasks.empty(),
+                "An empty matrix must not produce scheduled rectangles.");
+    return;
   }
-  std::cout << "\"row_histogram\":{";
-  bool first = true;
-  for (const auto& [count, experts] : histogram) {
-    if (!first) {
-      std::cout << ',';
+  TORCH_CHECK(static_cast<uint64_t>(mb) <= std::numeric_limits<size_t>::max() /
+                                               static_cast<uint64_t>(nb),
+              "Matrix block count exceeds addressable coverage storage.");
+  TORCH_CHECK(!logical96 || (grid != nullptr && grid->pm > 0 && grid->pn > 0 &&
+                             grid->bm > 0 && grid->bn > 0),
+              "Logical96 grid dimensions must be positive.");
+  std::vector<int> coverage(static_cast<size_t>(mb) * static_cast<size_t>(nb));
+  for (const auto& task : tasks) {
+    const auto& rect = task.rectangle;
+    if (task.empty) {
+      ++empty_rectangles;
+      continue;
     }
-    first = false;
-    std::cout << '"' << count << "\":" << experts;
-  }
-  std::cout << "},\"expert_rows\":[";
-  for (size_t i = 0; i < rows.size(); ++i) {
-    if (i != 0) {
-      std::cout << ',';
-    }
-    std::cout << rows[i];
-  }
-  std::cout << ']';
-}
-
-uint64_t plan_hash(const SGLTilePlan& plan) {
-  std::ostringstream canonical;
-  canonical << std::setprecision(17);
-  for (int size : plan.group_sizes) {
-    canonical << size << ',';
-  }
-  canonical << ';';
-  for (const auto& task : plan.tasks) {
-    canonical << task.mb0 << ',' << task.mb1 << ',' << task.nb0 << ','
-              << task.nb1 << ',' << task.expert << ',' << task.group << ','
-              << task.cost.bytes << ',' << task.cost.ops << ';';
-  }
-  canonical << '|';
-  for (int value : plan.worker_offsets) {
-    canonical << value << ',';
-  }
-  canonical << ';';
-  for (int value : plan.task_indices) {
-    canonical << value << ',';
-  }
-  uint64_t hash = 14695981039346656037ULL;
-  for (unsigned char byte : canonical.str()) {
-    hash ^= byte;
-    hash *= 1099511628211ULL;
-  }
-  return hash;
-}
-
-void write_panel_report(const SGLTilePlan& plan,
-                        const std::vector<Observation>& observations,
-                        const std::vector<int>& task_workers,
-                        const std::vector<int>& task_cpus,
-                        const std::vector<int>& task_physical_tiles) {
-  const int nth =
-      std::accumulate(plan.group_sizes.begin(), plan.group_sizes.end(), 0);
-  SGLTileCost total;
-  std::vector<SGLTileCost> tile_costs(plan.group_sizes.size());
-  std::vector<SGLTileCost> physical_tile_costs(plan.group_sizes.size());
-  for (const auto& task : plan.tasks) {
-    total += task.cost;
-    tile_costs[task.group] += task.cost;
-  }
-  using Panel = std::tuple<int, int64_t, int64_t>;
-  std::map<Panel, double> panel_bytes;
-  std::map<Panel, std::set<int>> logical_panel_tiles;
-  std::map<Panel, std::set<int>> physical_panel_tiles;
-  for (size_t i = 0; i < plan.tasks.size(); ++i) {
-    const auto& task = plan.tasks[i];
-    const Panel panel{task.expert, task.nb0, task.nb1};
-    panel_bytes.try_emplace(panel, task.cost.bytes);
-    logical_panel_tiles[panel].insert(task.group);
-    physical_panel_tiles[panel].insert(task_physical_tiles[i]);
-    physical_tile_costs[task_physical_tiles[i]] += task.cost;
-  }
-  std::vector<int> logical_panels_by_tile(plan.group_sizes.size());
-  std::vector<int> physical_panels_by_tile(plan.group_sizes.size());
-  int logical_panel_instances = 0;
-  int physical_panel_instances = 0;
-  int physical_replicated_panels = 0;
-  int extra_physical_replicas = 0;
-  double logical_panel_touch_bytes = 0;
-  double physical_panel_touch_bytes = 0;
-  for (const auto& [panel, bytes] : panel_bytes) {
-    const auto& logical_owners = logical_panel_tiles[panel];
-    const auto& physical_owners = physical_panel_tiles[panel];
-    logical_panel_instances += logical_owners.size();
-    physical_panel_instances += physical_owners.size();
-    logical_panel_touch_bytes += bytes * logical_owners.size();
-    physical_panel_touch_bytes += bytes * physical_owners.size();
-    if (physical_owners.size() > 1) {
-      ++physical_replicated_panels;
-      extra_physical_replicas += physical_owners.size() - 1;
-    }
-    for (int owner : logical_owners) {
-      ++logical_panels_by_tile[owner];
-    }
-    for (int owner : physical_owners) {
-      ++physical_panels_by_tile[owner];
-    }
-  }
-  const double max_tile_load = [&] {
-    double load = 0;
-    for (size_t tile = 0; tile < tile_costs.size(); ++tile) {
-      load =
-          std::max(load, sgl_cost_score(tile_costs[tile], total,
-                                        double(plan.group_sizes[tile]) / nth));
-    }
-    return load;
-  }();
-  const double max_physical_tile_load = [&] {
-    double load = 0;
-    for (size_t tile = 0; tile < physical_tile_costs.size(); ++tile) {
-      load =
-          std::max(load, sgl_cost_score(physical_tile_costs[tile], total,
-                                        double(plan.group_sizes[tile]) / nth));
-    }
-    return load;
-  }();
-  const double max_worker_load = [&] {
-    double load = 0;
-    for (const auto& cost : plan.worker_costs) {
-      load = std::max(load, sgl_cost_score(cost, total, 1.0 / nth));
-    }
-    return load;
-  }();
-
-  std::ostringstream hash_text;
-  hash_text << std::hex << plan_hash(plan);
-  std::cout << "\"plan_hash\":\"" << hash_text.str()
-            << "\",\"tile_group_sizes\":[";
-  for (size_t i = 0; i < plan.group_sizes.size(); ++i) {
-    if (i != 0) {
-      std::cout << ',';
-    }
-    std::cout << plan.group_sizes[i];
-  }
-  std::cout << "],\"panels\":{\"unique\":" << panel_bytes.size()
-            << ",\"logical_tile_copies\":" << logical_panel_instances
-            << ",\"physical_tile_copies\":" << physical_panel_instances
-            << ",\"physical_replicated\":" << physical_replicated_panels
-            << ",\"extra_physical_replicas\":" << extra_physical_replicas
-            << ",\"estimated_panel_touch_bytes\":" << physical_panel_touch_bytes
-            << ",\"estimated_logical_panel_touch_bytes\":"
-            << logical_panel_touch_bytes << ",\"logical_by_tile\":[";
-  for (size_t i = 0; i < logical_panels_by_tile.size(); ++i) {
-    if (i != 0) {
-      std::cout << ',';
-    }
-    std::cout << logical_panels_by_tile[i];
-  }
-  std::cout << "],\"physical_by_tile\":[";
-  for (size_t i = 0; i < physical_panels_by_tile.size(); ++i) {
-    if (i != 0) {
-      std::cout << ',';
-    }
-    std::cout << physical_panels_by_tile[i];
-  }
-  std::cout << "]},\"cost_balance\":{\"max_tile_load\":" << max_tile_load
-            << ",\"max_physical_tile_load\":" << max_physical_tile_load
-            << ",\"max_worker_load\":" << max_worker_load
-            << ",\"task_bytes_semantics\":\"summed per planned rectangle\""
-            << ",\"owner_tiles\":[";
-  for (size_t i = 0; i < tile_costs.size(); ++i) {
-    if (i != 0) {
-      std::cout << ',';
-    }
-    std::cout << "{\"tile\":" << i << ",\"threads\":" << plan.group_sizes[i]
-              << ",\"load\":"
-              << sgl_cost_score(tile_costs[i], total,
-                                double(plan.group_sizes[i]) / nth)
-              << ",\"cost\":";
-    write_cost(tile_costs[i]);
-    std::cout << '}';
-  }
-  std::cout << "],\"physical_tiles\":[";
-  for (size_t i = 0; i < physical_tile_costs.size(); ++i) {
-    if (i != 0) {
-      std::cout << ',';
-    }
-    std::cout << "{\"tile\":" << i << ",\"threads\":" << plan.group_sizes[i]
-              << ",\"load\":"
-              << sgl_cost_score(physical_tile_costs[i], total,
-                                double(plan.group_sizes[i]) / nth)
-              << ",\"cost\":";
-    write_cost(physical_tile_costs[i]);
-    std::cout << '}';
-  }
-  std::cout << "],\"workers\":[";
-  for (int worker = 0; worker < nth; ++worker) {
-    if (worker != 0) {
-      std::cout << ',';
-    }
-    std::cout << "{\"worker\":" << worker
-              << ",\"tile\":" << tile_for_worker(worker, plan.group_sizes)
-              << ",\"load\":"
-              << sgl_cost_score(plan.worker_costs[worker], total, 1.0 / nth)
-              << ",\"cost\":";
-    write_cost(plan.worker_costs[worker]);
-    std::cout << '}';
-  }
-  std::cout << "]},\"assignments\":[";
-  for (size_t tid = 0; tid < observations.size(); ++tid) {
-    if (tid != 0) {
-      std::cout << ',';
-    }
-    const auto& observation = observations[tid];
-    std::cout << "{\"thread\":" << tid << ",\"cpu\":" << observation.cpu
-              << ",\"work_id\":" << observation.work_id
-              << ",\"tile\":" << observation.tile
-              << ",\"physical_tile\":" << observation.physical_tile
-              << ",\"tasks\":[";
-    for (size_t i = 0; i < observation.task_ids.size(); ++i) {
-      if (i != 0) {
-        std::cout << ',';
+    TORCH_CHECK(rect.m0 >= 0 && rect.m0 <= rect.m1 && rect.m1 <= mb &&
+                    rect.n0 >= 0 && rect.n0 <= rect.n1 && rect.n1 <= nb,
+                "Scheduled rectangle lies outside the matrix blocks.");
+    if (logical96) {
+      const int64_t m_tile = rect.m0 / grid->bm;
+      const int64_t n_tile = rect.n0 / grid->bn;
+      const int64_t owner = m_tile * grid->pn + n_tile;
+      const int64_t expected_m0 = m_tile * grid->bm;
+      const int64_t expected_m1 = std::min(expected_m0 + grid->bm, mb);
+      const int64_t expected_n0 = n_tile * grid->bn;
+      const int64_t expected_n1 = std::min(expected_n0 + grid->bn, nb);
+      TORCH_CHECK(rect.m0 == expected_m0 && rect.m1 == expected_m1,
+                  "Logical96 task must cover one complete M grid range.");
+      TORCH_CHECK(owner == task.logical_owner &&
+                      task.overflow == (owner >= primary_workers),
+                  "Logical96 task has an invalid grid owner.");
+      if (!task.overflow) {
+        TORCH_CHECK(rect.n0 == expected_n0 && rect.n1 == expected_n1 &&
+                        task.worker == owner,
+                    "Primary task must match its owner's full grid rectangle.");
+      } else {
+        TORCH_CHECK(
+            rect.n0 >= expected_n0 && rect.n1 == rect.n0 + 1 &&
+                rect.n1 <= expected_n1,
+            "Overflow tasks must cover one N block in their grid range.");
+        overflow_claims.emplace_back(owner, rect.m0, rect.n0);
       }
-      std::cout << observation.task_ids[i];
+      TORCH_CHECK(owner >= 0 && owner < grid->pm * grid->pn,
+                  "Logical96 grid owner is outside the logical grid.");
+      if (!task.overflow) {
+        TORCH_CHECK(task.worker < kLogicalWorkers,
+                    "Primary worker ID must be below 96.");
+      }
     }
-    std::cout << "]}";
+    for (int64_t m = rect.m0; m < rect.m1; ++m) {
+      for (int64_t n = rect.n0; n < rect.n1; ++n) {
+        ++coverage[static_cast<size_t>(m) * static_cast<size_t>(nb) +
+                   static_cast<size_t>(n)];
+      }
+    }
   }
-  std::cout << "],\"tasks\":[";
-  for (size_t task_id = 0; task_id < plan.tasks.size(); ++task_id) {
-    if (task_id != 0) {
-      std::cout << ',';
+  std::sort(overflow_claims.begin(), overflow_claims.end());
+  TORCH_CHECK(
+      std::adjacent_find(overflow_claims.begin(), overflow_claims.end()) ==
+          overflow_claims.end(),
+      "An overflow N block was claimed more than once.");
+  for (int64_t m = 0; m < mb; ++m) {
+    for (int64_t n = 0; n < nb; ++n) {
+      TORCH_CHECK(coverage[static_cast<size_t>(m) * static_cast<size_t>(nb) +
+                           static_cast<size_t>(n)] == 1,
+                  "Matrix block (", m, ", ", n,
+                  ") does not have exact-once task coverage.");
     }
-    const auto& task = plan.tasks[task_id];
-    std::cout << "{\"id\":" << task_id << ",\"m\":[" << task.mb0 << ','
-              << task.mb1 << "],\"n\":[" << task.nb0 << ',' << task.nb1
-              << "],\"expert\":";
-    if (task.expert < 0) {
-      std::cout << "null";
-    } else {
-      std::cout << task.expert;
-    }
-    std::cout << ",\"tile_owner\":" << task.group
-              << ",\"worker\":" << task_workers[task_id]
-              << ",\"cpu\":" << task_cpus[task_id]
-              << ",\"physical_tile\":" << task_physical_tiles[task_id]
-              << ",\"cost\":";
-    write_cost(task.cost);
-    std::cout << '}';
   }
-  std::cout << ']';
+}
+
+void validate_flat_mapping(const std::vector<Task>& tasks,
+                           const DenseFlatGrid& grid, int64_t mb, int64_t nb,
+                           int actual_team_size,
+                           const std::vector<int>& worker_task_counts) {
+  const int64_t task_count = grid.tasks();
+  TORCH_CHECK(
+      task_count > 0 && task_count <= std::numeric_limits<size_t>::max(),
+      "Flat task count must fit in addressable diagnostic storage.");
+  TORCH_CHECK(static_cast<int64_t>(tasks.size()) == task_count,
+              "Flat scheduler must emit each superblock exactly once.");
+
+  const int64_t quotient = task_count / actual_team_size;
+  const int64_t remainder = task_count % actual_team_size;
+  std::vector<int> expected_worker(static_cast<size_t>(task_count), -1);
+  int64_t begin = 0;
+  for (int worker = 0; worker < actual_team_size; ++worker) {
+    const int64_t count = quotient + (worker < remainder);
+    TORCH_CHECK(worker_task_counts[worker] == count,
+                "Flat worker load differs from its balanced static range.");
+    for (int64_t task_id = begin; task_id < begin + count; ++task_id) {
+      expected_worker[task_id] = worker;
+    }
+    begin += count;
+  }
+  TORCH_CHECK(begin == task_count,
+              "Flat worker ranges do not cover all superblocks.");
+
+  std::vector<int> seen(static_cast<size_t>(task_count));
+  for (const auto& task : tasks) {
+    const auto& rect = task.rectangle;
+    TORCH_CHECK(
+        !task.empty && task.flat_task_id >= 0 && task.flat_task_id < task_count,
+        "Flat scheduler emitted an empty or invalid superblock.");
+    const int64_t task_id = task.flat_task_id;
+    const int64_t row = task_id % grid.rows;
+    const int64_t column = task_id / grid.rows;
+    const int64_t m0 = row * grid.bm;
+    const int64_t n0 = column * grid.bn;
+    TORCH_CHECK(rect.m0 == m0 && rect.m1 == std::min(mb, m0 + grid.bm) &&
+                    rect.n0 == n0 && rect.n1 == std::min(nb, n0 + grid.bn),
+                "Flat task does not match its clipped M-fast superblock.");
+    TORCH_CHECK(expected_worker[task_id] == task.worker,
+                "Flat task is assigned outside its worker's static range.");
+    TORCH_CHECK(++seen[task_id] == 1,
+                "Flat superblock was emitted more than once.");
+  }
+  TORCH_CHECK(std::all_of(seen.begin(), seen.end(),
+                          [](int count) { return count == 1; }),
+              "Flat superblock coverage is not exact-once.");
+}
+
+void write_rectangle(const Rectangle& rect) {
+  std::cout << "{\"m\":[" << rect.m0 << ',' << rect.m1 << "],\"n\":[" << rect.n0
+            << ',' << rect.n1 << "]}";
 }
 
 }  // namespace
 
-// Build as a standalone executable linked to torch_cpu and c10.
-// Positional arguments remain: configured threads, M blocks, N blocks.
 int main(int argc, char** argv) {
   try {
     const Config config = parse_config(argc, argv);
     at::set_num_threads(config.threads);
+    const auto selected_schedule = sgl_dense_schedule();
+    TORCH_CHECK(selected_schedule == config.scheduler,
+                "Scheduler argument differs from "
+                "VLLM_CPU_SGL_SCHEDULER.");
 
-    const bool dense = config.kind == "dense";
-    const auto kind = dense ? SGLKernelKind::Dense : SGLKernelKind::MoE;
-    const SGLSchedule mode = sgl_schedule(kind);
-    const bool panel_mode = sgl_panel_schedule(mode);
-    const int64_t rows =
-        config.rows == -1 ? int64_t(32) * config.m_blocks : config.rows;
-    const int64_t columns =
-        config.columns == -1 ? int64_t(32) * config.n_blocks : config.columns;
-    const auto expert_rows =
-        dense ? std::vector<int64_t>{} : effective_expert_rows(config);
-    std::vector<int32_t> expert_ids;
-    std::vector<int32_t> offsets;
-    if (!dense) {
-      pack_expert_blocks(expert_rows, expert_ids, offsets);
+    const bool empty_matrix = config.mb == 0 || config.nb == 0;
+    const bool logical96 =
+        kOpenMP && !empty_matrix && selected_schedule == Scheduler::Logical96;
+    const bool flat_selected = is_flat_schedule(selected_schedule);
+    std::optional<DenseFlatGrid> flat_grid;
+    if (flat_selected) {
+      flat_grid.emplace(config.mb, config.nb, selected_schedule);
     }
+    const bool flat_eligible =
+        flat_selected && !empty_matrix && flat_grid->eligible(config.actual_m);
+    const bool flat_effective = flat_eligible;
+    const bool legacy_fallback =
+        !empty_matrix && flat_selected && !flat_eligible;
+    const bool legacy_effective =
+        !empty_matrix &&
+        (selected_schedule == Scheduler::Legacy || legacy_fallback);
+    const char* effective_schedule =
+        empty_matrix                                            ? "empty"
+        : !kOpenMP && selected_schedule == Scheduler::Logical96 ? "serial"
+        : flat_selected && !flat_eligible                       ? "legacy"
+                                          : scheduler_name(selected_schedule);
+    const int legacy_required_team_size =
+#if defined(_OPENMP)
+        config.mb == 1 ? config.threads : std::max(1, (config.threads / 2) * 2);
+#else
+        1;
+#endif
 
-    const int64_t mb = dense ? div_up(rows, int64_t(32)) : expert_ids.size();
-    const int64_t nb =
-        dense
-            ? div_up(columns, int64_t(32))
-            : div_up(config.phase == "gate" ? columns : config.k, int64_t(32));
-    const int64_t matrix_columns = config.phase == "gate" ? columns : config.k;
-    const int64_t matrix_rows =
-        dense ? rows
-              : std::accumulate(expert_rows.begin(), expert_rows.end(),
-                                int64_t(0));
-    SGLTilePlan plan;
-    int64_t plan_build_ns = 0;
-    if (panel_mode) {
-      const auto build_start = std::chrono::steady_clock::now();
-      if (dense) {
-        plan = make_sgl_dense_plan(mb, nb, rows, columns, config.k, 1);
-      } else {
-        auto plans = make_sgl_moe_plans(expert_ids.data(), offsets.data(), mb,
-                                        columns, config.k);
-        plan = config.phase == "gate" ? std::move(plans.gate)
-                                      : std::move(plans.down);
-      }
-      if (config.timing) {
-        plan_build_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
-                            std::chrono::steady_clock::now() - build_start)
-                            .count();
-      }
+    std::vector<WorkerLog> logs(config.threads);
+    std::optional<DenseLogical96Grid> grid;
+    if (!empty_matrix) {
+      grid.emplace(config.mb, config.nb);
     }
-
-    std::vector<int> coverage(static_cast<size_t>(mb) * nb);
-    int active_workers = 0;
-    int actual_team_size = 0;
-    int64_t worker_finish_ns = 0;
-    std::vector<Observation> observations;
-    std::vector<int> task_workers;
-    std::vector<int> task_cpus;
-    std::vector<int> task_physical_tiles;
-    if (panel_mode) {
-      const int nth =
-          std::accumulate(plan.group_sizes.begin(), plan.group_sizes.end(), 0);
-      observations.resize(nth);
-      std::vector<int> cursor_by_thread(nth);
-      std::vector<int> team_sizes(nth);
-      std::vector<uint8_t> overflow(nth);
-      const auto& groups = sgl_tile_groups();
-      for (int tid = 0; tid < nth; ++tid) {
-        const int worker =
-            mode == SGLSchedule::Spread ? groups.full_work_ids[tid] : tid;
-        observations[tid].work_id = worker;
-        observations[tid].tile = tile_for_worker(worker, plan.group_sizes);
-        observations[tid].physical_tile =
-            tile_for_worker(tid, plan.group_sizes);
-        observations[tid].task_ids.reserve(plan.worker_offsets[worker + 1] -
-                                           plan.worker_offsets[worker]);
-      }
-      const auto worker_start = std::chrono::steady_clock::now();
-      sgl_run_tile_plan(plan, mode, [&](const auto& rectangles) {
-        const int tid = omp_get_thread_num();
-        const int worker = observations[tid].work_id;
-        auto& observation = observations[tid];
-        observation.cpu = sched_getcpu();
-        observation.team_size = omp_get_num_threads();
-        team_sizes[tid] = observation.team_size;
-        int cursor = plan.worker_offsets[worker];
-        rectangles([&](int64_t mb0, int64_t mb1, int64_t nb0, int64_t nb1) {
-          if (cursor >= plan.worker_offsets[worker + 1]) {
-            overflow[tid] = 1;
-            return;
-          }
-          const int task_id = plan.task_indices[cursor++];
-          observation.task_ids.push_back(task_id);
-          observation.rectangles.push_back({mb0, mb1, nb0, nb1});
+    parallel_sgl_dense(
+        config.mb, config.nb, config.actual_m, [&](const auto& rectangles) {
+          auto& log = enter_worker(logs);
+          rectangles([&](int64_t m0, int64_t m1, int64_t n0, int64_t n1) {
+            append_rectangle(log, m0, m1, n0, n1);
+          });
         });
-        cursor_by_thread[tid] = cursor;
-      });
-      if (config.timing) {
-        worker_finish_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
-                               std::chrono::steady_clock::now() - worker_start)
-                               .count();
+    int actual_team_size = 0;
+    if (empty_matrix) {
+      for (const auto& log : logs) {
+        TORCH_CHECK(!log.entered && log.team_size == 0,
+                    "An empty matrix must not enter an OpenMP team.");
       }
-      actual_team_size = nth;
-      std::vector<int> task_seen(plan.tasks.size());
-      task_workers.assign(plan.tasks.size(), -1);
-      task_cpus.assign(plan.tasks.size(), -1);
-      task_physical_tiles.assign(plan.tasks.size(), -1);
-      for (int tid = 0; tid < nth; ++tid) {
-        auto& observation = observations[tid];
-        const int worker = observation.work_id;
-        TORCH_CHECK(observation.cpu >= 0 && team_sizes[tid] == nth,
-                    "Observed an incomplete OpenMP team.");
-        TORCH_CHECK(!overflow[tid] && cursor_by_thread[tid] ==
-                                          plan.worker_offsets[worker + 1],
-                    "Task executor differed from the prepared worker bins.");
-        for (size_t i = 0; i < observation.task_ids.size(); ++i) {
-          const int task_id = observation.task_ids[i];
-          const auto& task = plan.tasks[task_id];
-          const auto& rectangle = observation.rectangles[i];
-          TORCH_CHECK(task.mb0 == rectangle[0] && task.mb1 == rectangle[1] &&
-                          task.nb0 == rectangle[2] && task.nb1 == rectangle[3],
-                      "Executed rectangle differs from its planned task.");
-          ++task_seen[task_id];
-          task_workers[task_id] = worker;
-          task_cpus[task_id] = observation.cpu;
-          task_physical_tiles[task_id] = observation.physical_tile;
-          add_rectangle(coverage, mb, nb, rectangle);
-        }
-        active_workers += !observation.task_ids.empty();
-      }
-      TORCH_CHECK(std::all_of(task_seen.begin(), task_seen.end(),
-                              [](int count) { return count == 1; }),
-                  "Planned tasks must execute exactly once.");
     } else {
-      if (mb > 0) {
-        const int nth = adjust_num_threads(mb);
-        observations.resize(nth);
-        std::vector<std::array<int, 6>> assignments(nth);
-        std::vector<int> team_sizes(nth);
-        const bool remap = mode == SGLSchedule::RoundRobin;
-        const auto* work_ids = remap ? sgl_work_ids(nth) : nullptr;
-        const auto worker_start = std::chrono::steady_clock::now();
-        parallel_2d(
-            mb, nb,
-            [&](int mb0, int mb1, int nb0, int nb1) {
-              const int tid = omp_get_thread_num();
-              const int work_id = work_ids ? (*work_ids)[tid] : tid;
-              assignments[tid] = {sched_getcpu(), work_id, mb0, mb1, nb0, nb1};
-              observations[tid].cpu = assignments[tid][0];
-              observations[tid].work_id = work_id;
-              observations[tid].team_size = omp_get_num_threads();
-              team_sizes[tid] = observations[tid].team_size;
-            },
-            remap);
-        if (config.timing) {
-          worker_finish_ns =
-              std::chrono::duration_cast<std::chrono::nanoseconds>(
-                  std::chrono::steady_clock::now() - worker_start)
-                  .count();
-        }
-        actual_team_size = nth;
-        std::vector<int> seen(nth);
-        for (int tid = 0; tid < nth; ++tid) {
-          const auto& assignment = assignments[tid];
-          TORCH_CHECK(team_sizes[tid] == nth,
-                      "Actual OpenMP team is smaller than requested.");
-          TORCH_CHECK(assignment[1] >= 0 && assignment[1] < nth,
-                      "Work ID outside team.");
-          ++seen[assignment[1]];
-          const std::array<int64_t, 4> rectangle{assignment[2], assignment[3],
-                                                 assignment[4], assignment[5]};
-          observations[tid].rectangles.push_back(rectangle);
-          add_rectangle(coverage, mb, nb, rectangle);
-          active_workers +=
-              rectangle[0] < rectangle[1] && rectangle[2] < rectangle[3];
-        }
-        TORCH_CHECK(std::all_of(seen.begin(), seen.end(),
-                                [](int count) { return count == 1; }),
-                    "Work mapping is not a permutation.");
+      TORCH_CHECK(!logs.empty() && logs[0].team_size > 0,
+                  "The diagnostic did not observe an OpenMP team.");
+      actual_team_size = logs[0].team_size;
+      TORCH_CHECK(actual_team_size <= config.threads,
+                  "Observed team exceeds the configured thread count.");
+      for (int worker = 0; worker < actual_team_size; ++worker) {
+        TORCH_CHECK(
+            logs[worker].entered && logs[worker].team_size == actual_team_size,
+            "Observed an incomplete or inconsistent OpenMP team.");
+      }
+      for (int worker = actual_team_size; worker < config.threads; ++worker) {
+        TORCH_CHECK(!logs[worker].entered,
+                    "Worker log exists outside the actual OpenMP team.");
       }
     }
-    check_coverage(coverage, mb, nb, offsets, dense);
 
-    std::cout << std::setprecision(12);
-    std::cout << "{\"team_size\":" << actual_team_size
-              << ",\"active_workers\":" << active_workers << ",\"kind\":\""
-              << config.kind << "\",\"phase\":\""
-              << (dense ? "dense" : config.phase) << "\",\"scheduler\":\""
-              << schedule_name(mode)
-              << "\",\"matrix\":{\"rows\":" << matrix_rows
-              << ",\"columns\":" << matrix_columns << ",\"k\":" << config.k
-              << ",\"mb\":" << mb << ",\"nb\":" << nb << ",\"intermediate_n\":";
-    if (dense) {
-      std::cout << "null";
-    } else {
-      std::cout << columns;
+    if (legacy_effective) {
+      TORCH_CHECK(actual_team_size == legacy_required_team_size,
+                  "Cannot check exact-once coverage for legacy scheduling with "
+                  "a reduced OpenMP team: configured legacy team is ",
+                  legacy_required_team_size, ", actual team is ",
+                  actual_team_size,
+                  ". Configure matching OMP thread limits or use an eligible "
+                  "flat schedule for constrained-team diagnostics.");
     }
-    std::cout << "},\"actual_cpus\":[";
-    for (size_t tid = 0; tid < observations.size(); ++tid) {
-      if (tid != 0) {
+
+    const int primary_workers = std::min(actual_team_size, kLogicalWorkers);
+    const auto tasks = reconstruct_tasks(
+        logs, actual_team_size, logical96, grid ? &*grid : nullptr,
+        primary_workers, flat_effective ? &*flat_grid : nullptr);
+    std::vector<std::tuple<int64_t, int64_t, int64_t>> overflow_claims;
+    int empty_rectangles = 0;
+    validate_coverage(tasks, config.mb, config.nb, logical96,
+                      grid ? &*grid : nullptr, primary_workers, overflow_claims,
+                      empty_rectangles);
+    if (logical96 && config.mb == 1 && (config.nb == 192 || config.nb == 288)) {
+      TORCH_CHECK(grid->pm == 1 && grid->pn == 96 &&
+                      grid->bn == div_up(config.nb, int64_t(96)),
+                  "QKV decode must use a 1x96 logical96 grid.");
+    }
+    if (logical96 && config.mb == 1 && (config.nb == 32 || config.nb == 64)) {
+      TORCH_CHECK(grid->pm == 2 && grid->pn == 48 &&
+                      grid->bn == div_up(config.nb, int64_t(48)),
+                  "Output projection must use a 2x48 logical96 grid.");
+    }
+    if (logical96 && config.mb == 3 && config.nb == 1 &&
+        actual_team_size == 1) {
+      TORCH_CHECK(grid->pm == 16 && grid->pn == 6 && !overflow_claims.empty() &&
+                      std::get<0>(overflow_claims.front()) == 6,
+                  "The first nonempty overflow owner should follow empty "
+                  "logical96 segments.");
+    }
+
+    int useful_workers = 0;
+    int useful_tasks = 0;
+    std::vector<int> worker_task_counts(actual_team_size);
+    for (const auto& task : tasks) {
+      if (!task.empty) {
+        if (worker_task_counts[task.worker] == 0) {
+          ++useful_workers;
+        }
+        ++worker_task_counts[task.worker];
+        ++useful_tasks;
+      }
+    }
+    if (flat_effective) {
+      validate_flat_mapping(tasks, *flat_grid, config.mb, config.nb,
+                            actual_team_size, worker_task_counts);
+    }
+    if (logical96 && config.mb == 1 && (config.nb == 32 || config.nb == 64) &&
+        actual_team_size >= 90) {
+      TORCH_CHECK(overflow_claims.empty() && useful_tasks == 32,
+                  "Output projection should have 32 primary tasks and no "
+                  "overflow claims.");
+    }
+
+    double scheduler_mean_us = 0;
+    if (config.timing && !empty_matrix) {
+      run_without_logging(config.mb, config.nb, config.actual_m);
+      const auto start = std::chrono::steady_clock::now();
+      for (int iteration = 0; iteration < kTimingIterations; ++iteration) {
+        run_without_logging(config.mb, config.nb, config.actual_m);
+      }
+      const auto elapsed_ns =
+          std::chrono::duration_cast<std::chrono::nanoseconds>(
+              std::chrono::steady_clock::now() - start)
+              .count();
+      scheduler_mean_us = double(elapsed_ns) / (kTimingIterations * 1000.0);
+    }
+
+    std::cout << "{\"selected_schedule\":\""
+              << scheduler_name(selected_schedule)
+              << "\",\"effective_schedule\":\"" << effective_schedule
+              << "\",\"legacy_fallback\":"
+              << (legacy_fallback ? "true" : "false")
+              << ",\"legacy_schedule_active\":"
+              << (legacy_effective ? "true" : "false")
+              << ",\"legacy_expected_team_size\":";
+    if (legacy_effective) {
+      std::cout << legacy_required_team_size;
+    } else {
+      std::cout << "null";
+    }
+    std::cout << ",\"scheduler_eligibility\":{\"eligible\":";
+    if (flat_selected) {
+      std::cout << (flat_eligible ? "true" : "false");
+    } else {
+      std::cout << "null";
+    }
+    std::cout << ",\"reason\":\"";
+    if (empty_matrix) {
+      std::cout << "empty_matrix";
+    } else if (!flat_selected) {
+      std::cout << "not_applicable";
+    } else if (config.actual_m < 128) {
+      std::cout << "M_below_128";
+    } else if (!flat_eligible) {
+      std::cout << "superblock_tasks_below_192";
+    } else {
+      std::cout << "eligible";
+    }
+    std::cout << "\"},\"legacy_team_constraint\":";
+    if (legacy_effective) {
+      std::cout << "{\"expected_team_size\":" << legacy_required_team_size
+                << ",\"actual_team_size\":" << actual_team_size
+                << ",\"satisfied\":true}";
+    } else {
+      std::cout << "null";
+    }
+    std::cout << ",\"scheduler\":\"" << scheduler_name(selected_schedule)
+              << "\",\"matrix\":{\"MB\":" << config.mb
+              << ",\"NB\":" << config.nb << ",\"M\":" << config.actual_m
+              << "},\"empty_matrix\":" << (empty_matrix ? "true" : "false")
+              << ",\"actual_team_size\":" << actual_team_size
+              << ",\"useful_workers\":" << useful_workers
+              << ",\"useful_tasks\":" << useful_tasks
+              << ",\"empty_rectangles\":" << empty_rectangles
+              << ",\"overflow_claim_count\":" << overflow_claims.size()
+              << ",\"overflow_claims_unique\":true,\"overflow_claims\":[";
+    for (size_t i = 0; i < overflow_claims.size(); ++i) {
+      if (i != 0) {
         std::cout << ',';
       }
-      std::cout << observations[tid].cpu;
+      std::cout << "{\"owner\":" << std::get<0>(overflow_claims[i])
+                << ",\"m0\":" << std::get<1>(overflow_claims[i])
+                << ",\"n0\":" << std::get<2>(overflow_claims[i]) << '}';
     }
-    std::cout << "],";
-    if (panel_mode) {
-      write_panel_report(plan, observations, task_workers, task_cpus,
-                         task_physical_tiles);
+    std::cout << "],\"coverage\":{\"exact_once\":true},";
+    if (flat_selected) {
+      std::cout << "\"flat_grid\":{\"bm\":" << flat_grid->bm
+                << ",\"bn\":" << flat_grid->bn
+                << ",\"rows\":" << flat_grid->rows
+                << ",\"columns\":" << flat_grid->columns
+                << ",\"candidate_task_count\":" << flat_grid->tasks()
+                << ",\"task_order\":\"M_fast\""
+                << ",\"effective\":" << (flat_effective ? "true" : "false")
+                << "},";
+    }
+    if (logical96 && !empty_matrix) {
+      const int64_t active_m = div_up(config.mb, grid->bm);
+      const int64_t active_n = div_up(config.nb, grid->bn);
+      std::cout << "\"logical96_grid\":{\"pm\":" << grid->pm
+                << ",\"pn\":" << grid->pn << ",\"bm\":" << grid->bm
+                << ",\"bn\":" << grid->bn << ",\"empty_grid_cells\":"
+                << grid->pm * grid->pn - active_m * active_n << "},";
+    }
+    std::cout << "\"actual_cpus\":[";
+    for (int worker = 0; worker < actual_team_size; ++worker) {
+      if (worker != 0) {
+        std::cout << ',';
+      }
+      std::cout << logs[worker].cpu;
+    }
+    std::cout << "],\"worker_load\":{\"minimum_tasks\":";
+    if (worker_task_counts.empty()) {
+      std::cout << "null,\"maximum_tasks\":null,\"idle_workers\":0},";
     } else {
-      std::cout << "\"assignments\":[";
-      for (size_t tid = 0; tid < observations.size(); ++tid) {
-        if (tid != 0) {
+      const auto [minimum, maximum] = std::minmax_element(
+          worker_task_counts.begin(), worker_task_counts.end());
+      const int idle_workers = static_cast<int>(
+          std::count(worker_task_counts.begin(), worker_task_counts.end(), 0));
+      std::cout << *minimum << ",\"maximum_tasks\":" << *maximum
+                << ",\"idle_workers\":" << idle_workers << "},";
+    }
+    std::cout << "\"assignments\":[";
+    for (int worker = 0; worker < actual_team_size; ++worker) {
+      if (worker != 0) {
+        std::cout << ',';
+      }
+      std::cout << "{\"worker\":" << worker << ",\"cpu\":" << logs[worker].cpu
+                << ",\"worker_class\":\"";
+      if (flat_effective) {
+        std::cout << "flat";
+      } else if (!logical96) {
+        std::cout << "legacy";
+      } else {
+        std::cout << (worker < kLogicalWorkers ? "below_96" : "above_95");
+      }
+      std::cout << "\",\"useful_tasks\":" << worker_task_counts[worker]
+                << ",\"tasks\":[";
+      bool first_task = true;
+      for (const auto& task : tasks) {
+        if (task.worker != worker) {
+          continue;
+        }
+        if (!first_task) {
           std::cout << ',';
         }
-        const auto& assignment = observations[tid];
-        const auto& rectangle = assignment.rectangles.front();
-        std::cout << "{\"thread\":" << tid << ",\"cpu\":" << assignment.cpu
-                  << ",\"work_id\":" << assignment.work_id << ",\"m\":["
-                  << rectangle[0] << ',' << rectangle[1] << "],\"n\":["
-                  << rectangle[2] << ',' << rectangle[3] << "]}";
+        first_task = false;
+        std::cout << task.id;
       }
-      std::cout << "],\"tasks\":[";
-      for (size_t tid = 0; tid < observations.size(); ++tid) {
-        if (tid != 0) {
-          std::cout << ',';
-        }
-        const auto& rectangle = observations[tid].rectangles.front();
-        std::cout << "{\"id\":" << tid << ",\"m\":[" << rectangle[0] << ','
-                  << rectangle[1] << "],\"n\":[" << rectangle[2] << ','
-                  << rectangle[3]
-                  << "],\"worker\":" << observations[tid].work_id
-                  << ",\"cpu\":" << observations[tid].cpu
-                  << ",\"tile_owner\":null}";
+      std::cout << "]}";
+    }
+    std::cout << "],\"tasks\":[";
+    for (size_t i = 0; i < tasks.size(); ++i) {
+      if (i != 0) {
+        std::cout << ',';
       }
-      std::cout << ']';
+      const auto& task = tasks[i];
+      std::cout << "{\"id\":" << task.id << ",\"worker\":" << task.worker
+                << ",\"cpu\":" << task.cpu << ",\"role\":\"";
+      if (flat_effective) {
+        std::cout << "flat";
+      } else if (!logical96) {
+        std::cout << "legacy";
+      } else {
+        std::cout << (task.overflow ? "overflow" : "primary");
+      }
+      std::cout << "\",\"logical_owner\":";
+      if (task.logical_owner < 0) {
+        std::cout << "null";
+      } else {
+        std::cout << task.logical_owner;
+      }
+      std::cout << ",\"flat_task_id\":";
+      if (task.flat_task_id < 0) {
+        std::cout << "null";
+      } else {
+        std::cout << task.flat_task_id;
+      }
+      std::cout << ",\"empty\":" << (task.empty ? "true" : "false")
+                << ",\"rectangle\":";
+      write_rectangle(task.rectangle);
+      std::cout << '}';
     }
-    if (!dense) {
-      std::cout << ',';
-      write_histogram(expert_rows);
-    }
+    std::cout << ']';
     if (config.timing) {
-      std::cout << ",\"plan_build_ns\":" << plan_build_ns
-                << ",\"worker_finish_ns\":" << worker_finish_ns;
+      std::cout << ",\"scheduler_timing_iterations\":"
+                << (empty_matrix ? 0 : kTimingIterations)
+                << ",\"scheduler_mean_us\":";
+      if (empty_matrix) {
+        std::cout << "null";
+      } else {
+        std::cout << scheduler_mean_us;
+      }
     }
     std::cout << "}\n";
   } catch (const std::exception& error) {

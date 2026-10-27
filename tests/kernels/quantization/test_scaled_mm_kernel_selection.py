@@ -332,29 +332,63 @@ def test_cpu_sgl_int8_linear_accepts_3d_input():
     not hasattr(torch.ops._C, "int8_scaled_mm_with_quant"),
     reason="int8_scaled_mm_with_quant is not built",
 )
-def test_cpu_sgl_int8_schedulers_preserve_scaled_mm_result(tmp_path):
-    """SGL scheduler modes preserve bias-fused dense INT8 GEMM results."""
+def test_cpu_sgl_int8_dense_schedulers_preserve_scaled_mm_result(tmp_path):
+    """Dense SGL INT8 scheduler modes preserve exact GEMM results."""
     script = textwrap.dedent(
-        f"""
+        """
         import os
+        import sys
         import torch
         import vllm._custom_ops
+        from vllm.model_executor.kernels.linear.scaled_mm.cpu import (
+            CPUInt8ScaledMMLinearKernel,
+            Int8ScaledMMLinearLayerConfig,
+        )
 
         torch.set_num_threads(int(os.environ["OMP_NUM_THREADS"]))
         torch.set_num_interop_threads(1)
         torch.manual_seed(0)
+        case_group = sys.argv[2]
+        cases = {
+            "base": (
+                (127, 320, False, False),
+                (128, 320, True, True),
+                (1, 32, False, False),
+                (33, 96, False, True),
+                (1, 32, True, False),
+                (128, 320, False, False),
+                (1, 6144, False, True),
+                (128, 32, False, True),
+            ),
+            "flat32": (
+                (127, 320, False, False),
+                (128, 320, True, True),
+            ),
+            "flat128x64": (
+                (385, 3072, False, True),
+                (385, 3008, False, False),
+            ),
+            "flat128x128": (
+                (385, 6144, False, True),
+                (385, 5952, False, False),
+            ),
+            "flat128x128_eligible": ((385, 6144, False, True),),
+        }[case_group]
         outputs = []
-        for m, n, has_bias in ((128, 128, True), (33, 96, False)):
+        for m, n, has_bias, is_vnni in cases:
             x = torch.randn(m, 64).bfloat16()
             weight = torch.randint(-30, 31, (n, 64), dtype=torch.int8)
+            reference_weight = weight.float()
+            if is_vnni:
+                weight = torch.ops._C.convert_weight_packed(weight)
             weight_scale = torch.rand(n, dtype=torch.float32) * 0.01
             bias = torch.rand(n, dtype=torch.float32) if has_bias else None
             result = torch.ops._C.int8_scaled_mm_with_quant(
-                x, weight, weight_scale, bias, x.dtype, False
+                x, weight, weight_scale, bias, x.dtype, is_vnni
             )
             input_scale = x.float().abs().amax(dim=-1).clamp_min(1e-7) / 127
             qx = (x.float() / input_scale[:, None]).round().to(torch.int32)
-            reference = qx.float() @ weight.float().T
+            reference = qx.float() @ reference_weight.T
             reference *= input_scale[:, None] * weight_scale[None, :]
             if has_bias:
                 reference += bias[None, :]
@@ -362,110 +396,172 @@ def test_cpu_sgl_int8_schedulers_preserve_scaled_mm_result(tmp_path):
                 result.float(), reference, atol=0.2, rtol=0.02
             )
             outputs.append(result)
-        torch.save(tuple(outputs), {str(tmp_path / "result.pt")!r})
+        if case_group == "base":
+            # Unsupported column tails use the existing oneDNN layer fallback.
+            torch.set_default_dtype(torch.bfloat16)
+            layer = torch.nn.Module()
+            layer.weight = torch.nn.Parameter(
+                torch.randint(-30, 31, (33, 64), dtype=torch.int8),
+                requires_grad=False,
+            )
+            layer.weight_scale = torch.nn.Parameter(
+                torch.rand(33, 1, dtype=torch.float32) * 0.01,
+                requires_grad=False,
+            )
+            layer.bias = torch.nn.Parameter(torch.randn(33), requires_grad=False)
+            layer.logical_widths = [33]
+            layer.input_scale = None
+            layer.input_zero_point = None
+            kernel = CPUInt8ScaledMMLinearKernel(
+                Int8ScaledMMLinearLayerConfig(
+                    is_channelwise=True,
+                    is_static_input_scheme=False,
+                    input_symmetric=True,
+                ),
+                (
+                    "weight",
+                    "weight_scale",
+                    "input_scale",
+                    "input_zero_point",
+                    "azp_adj",
+                ),
+            )
+            kernel.process_weights_after_loading(layer)
+            outputs.append(
+                kernel.apply_weights(layer, torch.randn(2, 3, 64), layer.bias)
+            )
+        torch.save(tuple(outputs), sys.argv[1])
         """
     )
-    outputs = {}
-    configurations = (
-        (6, None, None),
-        (6, "", "2,1,3"),
-        (6, "legacy", "2,1,3"),
-        (6, "round_robin", "2,1,3"),
-        (6, "spread_dense", "2,1,3"),
-        (6, "tile_dense", "2,1,3"),
-        (6, "spread_moe", "2,1,3"),
-        (6, "spread_all", "2,1,3"),
-        (6, "tile_all", "2,1,3"),
-        (7, None, None),
-        (7, "tile_dense", "2,2,3"),
-    )
-    for threads, scheduler, groups in configurations:
+
+    def run(
+        scheduler,
+        requested_threads,
+        thread_limit,
+        output_path,
+        case_group="base",
+    ):
         env = os.environ.copy()
-        env["OMP_NUM_THREADS"] = str(threads)
+        env["OMP_NUM_THREADS"] = str(requested_threads)
         env["OMP_DYNAMIC"] = "FALSE"
-        env["OMP_THREAD_LIMIT"] = str(threads)
-        env.pop("VLLM_CPU_SGL_SCHEDULER", None)
-        env.pop("VLLM_CPU_SGL_THREAD_GROUPS", None)
-        if scheduler is not None:
-            env["VLLM_CPU_SGL_SCHEDULER"] = scheduler
-        if groups is not None:
-            env["VLLM_CPU_SGL_THREAD_GROUPS"] = groups
-        subprocess.run([sys.executable, "-c", script], check=True, env=env)
-        outputs[threads, scheduler or "unset", groups is not None] = torch.load(
-            tmp_path / "result.pt", weights_only=True
+        env["OMP_THREAD_LIMIT"] = str(thread_limit)
+        env["VLLM_CPU_SGL_SCHEDULER"] = scheduler
+        subprocess.run(
+            [sys.executable, "-c", script, str(output_path), case_group],
+            check=True,
+            env=env,
+        )
+        return torch.load(output_path, weights_only=True)
+
+    legacy_outputs = {}
+    for actual_threads in (2, 95, 96, 97):
+        # Set the requested team to the actual team size for the legacy
+        # reference. A constrained logical96_dense run below uses a larger
+        # request, but is compared against this correctly sized reference.
+        legacy_outputs[actual_threads] = run(
+            "legacy",
+            actual_threads,
+            actual_threads,
+            tmp_path / f"legacy-{actual_threads}.pt",
         )
 
-    for threads in (6, 7):
-        baseline = outputs[threads, "unset", False]
-        for case in configurations:
-            case_threads, scheduler, groups = case
-            if case_threads == threads:
-                torch.testing.assert_close(
-                    baseline,
-                    outputs[threads, scheduler or "unset", groups is not None],
-                    rtol=0,
-                    atol=0,
-                )
+    for actual_threads in (95, 96, 97):
+        logical_outputs = run(
+            "logical96_dense",
+            actual_threads,
+            actual_threads,
+            tmp_path / f"logical96-dense-{actual_threads}.pt",
+        )
+        for legacy, logical in zip(
+            legacy_outputs[actual_threads], logical_outputs, strict=True
+        ):
+            torch.testing.assert_close(legacy, logical, rtol=0, atol=0)
+
+    constrained_outputs = run(
+        "logical96_dense",
+        requested_threads=128,
+        thread_limit=2,
+        output_path=tmp_path / "logical96-dense-128-2.pt",
+    )
+    for legacy, logical in zip(legacy_outputs[2], constrained_outputs, strict=True):
+        torch.testing.assert_close(legacy, logical, rtol=0, atol=0)
+
+    flat32_outputs = run(
+        "flat_32x32",
+        95,
+        95,
+        tmp_path / "flat32.pt",
+        "flat32",
+    )
+    for legacy, flat in zip(legacy_outputs[95][:2], flat32_outputs, strict=True):
+        torch.testing.assert_close(legacy, flat, rtol=0, atol=0)
+
+    for scheduler, case_group, actual_threads in (
+        ("flat_128x64", "flat128x64", 97),
+        ("flat_128x128", "flat128x128", 95),
+    ):
+        legacy_outputs_for_shape = run(
+            "legacy",
+            actual_threads,
+            actual_threads,
+            tmp_path / f"legacy-{case_group}.pt",
+            case_group,
+        )
+        flat_outputs = run(
+            scheduler,
+            actual_threads,
+            actual_threads,
+            tmp_path / f"{scheduler}.pt",
+            case_group,
+        )
+        for legacy, flat in zip(legacy_outputs_for_shape, flat_outputs, strict=True):
+            torch.testing.assert_close(legacy, flat, rtol=0, atol=0)
+
+    legacy_eligible_128 = run(
+        "legacy",
+        2,
+        2,
+        tmp_path / "legacy-flat128x128-2.pt",
+        "flat128x128_eligible",
+    )
+    flat_eligible_128 = run(
+        "flat_128x128",
+        requested_threads=128,
+        thread_limit=2,
+        output_path=tmp_path / "flat128x128-128-2.pt",
+        case_group="flat128x128_eligible",
+    )
+    for legacy, flat in zip(legacy_eligible_128, flat_eligible_128, strict=True):
+        torch.testing.assert_close(legacy, flat, rtol=0, atol=0)
 
 
 @pytest.mark.skipif(
     not hasattr(torch.ops._C, "int8_scaled_mm_with_quant"),
     reason="int8_scaled_mm_with_quant is not built",
 )
-@pytest.mark.parametrize(
-    ("scheduler", "groups", "thread_limit", "error"),
-    [
-        (None, "2,2", None, b"sums to"),
-        (
-            "round_robin",
-            "2,1,3",
-            "4",
-            b"requires fixed, non-nested OpenMP teams",
-        ),
-        ("not_a_scheduler", "2,1,3", None, b"VLLM_CPU_SGL_SCHEDULER"),
-        (
-            "spread_dense",
-            "",
-            None,
-            b"requires VLLM_CPU_SGL_THREAD_GROUPS",
-        ),
-        (
-            "tile_dense",
-            "2,1,3",
-            "4",
-            b"requires fixed, non-nested OpenMP teams",
-        ),
-    ],
-)
-def test_cpu_sgl_int8_scheduler_rejects_invalid_configuration(
-    scheduler, groups, thread_limit, error
-):
-    """Reject invalid modes, missing groups, mismatched teams, and limits."""
+@pytest.mark.parametrize("scheduler", ["flat_dense", "not_a_scheduler"])
+def test_cpu_sgl_int8_rejects_removed_or_unknown_scheduler(scheduler):
+    """Reject removed scheduler names with a clear configuration error."""
     script = textwrap.dedent(
         """
-import torch
-import vllm._custom_ops
+        import torch
+        import vllm._custom_ops
 
-torch.set_num_threads(6)
-torch.set_num_interop_threads(1)
-x = torch.randn(128, 64).bfloat16()
-weight = torch.randint(-30, 31, (128, 64), dtype=torch.int8)
-scale = torch.ones(128)
-torch.ops._C.int8_scaled_mm_with_quant(x, weight, scale, None, x.dtype, False)
+        torch.set_num_threads(2)
+        torch.set_num_interop_threads(1)
+        x = torch.randn(1, 64).bfloat16()
+        weight = torch.randint(-30, 31, (32, 64), dtype=torch.int8)
+        scale = torch.ones(32)
+        torch.ops._C.int8_scaled_mm_with_quant(
+            x, weight, scale, None, x.dtype, False
+        )
         """
     )
     env = os.environ.copy()
-    env["OMP_NUM_THREADS"] = "6"
+    env["OMP_NUM_THREADS"] = "2"
+    env["OMP_THREAD_LIMIT"] = "2"
     env["OMP_DYNAMIC"] = "FALSE"
-    env["OMP_THREAD_LIMIT"] = "6"
-    env.pop("VLLM_CPU_SGL_SCHEDULER", None)
-    env["VLLM_CPU_SGL_THREAD_GROUPS"] = groups
-    if scheduler is not None:
-        env["VLLM_CPU_SGL_SCHEDULER"] = scheduler
-    if thread_limit is None:
-        env.pop("OMP_THREAD_LIMIT", None)
-    else:
-        env["OMP_THREAD_LIMIT"] = thread_limit
+    env["VLLM_CPU_SGL_SCHEDULER"] = scheduler
     result = subprocess.run(
         [sys.executable, "-c", script],
         check=False,
@@ -474,7 +570,8 @@ torch.ops._C.int8_scaled_mm_with_quant(x, weight, scale, None, x.dtype, False)
     )
 
     assert result.returncode != 0
-    assert error in result.stderr
+    assert b"VLLM_CPU_SGL_SCHEDULER" in result.stderr
+    assert scheduler.encode() in result.stderr
 
 
 class OOTInt8ScaledMMLinearKernel(Int8ScaledMMLinearKernel):

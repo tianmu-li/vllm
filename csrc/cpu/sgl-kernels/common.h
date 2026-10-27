@@ -20,11 +20,7 @@
 #include <ATen/ATen.h>
 #include <ATen/Dispatch.h>
 #include <ATen/Parallel.h>
-#include <cerrno>
-#include <climits>
-#include <cstdlib>
 #include <cstring>
-#include <vector>
 
 #if defined(_OPENMP)
 #include <omp.h>
@@ -324,98 +320,10 @@ int inline adjust_num_threads(int m) {
   return std::max(1, (actual_nth >> 1) * 2);
 }
 
-struct SGLThreadGroups {
-  int total = 0;
-  std::vector<int> sizes;
-  std::vector<int> full_work_ids;
-  std::vector<int> rounded_work_ids;
-
-  SGLThreadGroups() {
-    const char* value = std::getenv("VLLM_CPU_SGL_THREAD_GROUPS");
-    if (value == nullptr || *value == '\0') {
-      return;
-    }
-    while (true) {
-      char* end;
-      errno = 0;
-      long size = std::strtol(value, &end, 10);
-      TORCH_CHECK(
-          *value >= '0' && *value <= '9' && end != value && errno != ERANGE &&
-              size > 0 && size <= INT_MAX - total && (*end == ',' || *end == '\0'),
-          "VLLM_CPU_SGL_THREAD_GROUPS must be comma-separated positive integers.");
-      sizes.push_back(static_cast<int>(size));
-      total += static_cast<int>(size);
-      if (*end == '\0') {
-        break;
-      }
-      value = end + 1;
-    }
-    TORCH_CHECK(
-        total == at::get_num_threads(),
-        "VLLM_CPU_SGL_THREAD_GROUPS sums to ", total,
-        ", but the configured OpenMP thread count is ", at::get_num_threads(), ".");
-    full_work_ids = make_work_ids(sizes, total);
-    if (total > 1 && total % 2 != 0) {
-      rounded_work_ids = make_work_ids(sizes, total - 1);
-    }
-  }
-
-  static std::vector<int> make_work_ids(const std::vector<int>& sizes, int nth) {
-    std::vector<int> counts;
-    int remaining = nth;
-    int max_count = 0;
-    for (int size : sizes) {
-      int count = std::min(size, remaining);
-      counts.push_back(count);
-      remaining -= count;
-      max_count = std::max(max_count, count);
-    }
-    std::vector<int> work_ids(nth);
-    int work_id = 0;
-    // Invert the round-robin physical-thread sequence into physical -> work IDs.
-    for (int row = 0; row < max_count; ++row) {
-      int offset = 0;
-      for (int count : counts) {
-        if (row < count) {
-          work_ids[offset + row] = work_id++;
-        }
-        offset += count;
-      }
-    }
-    return work_ids;
-  }
-
-  const std::vector<int>* work_ids(int nth) const {
-    if (total == 0) {
-      return nullptr;
-    }
-    TORCH_CHECK(
-        total == at::get_num_threads(),
-        "VLLM_CPU_SGL_THREAD_GROUPS sums to ", total,
-        ", but the configured OpenMP thread count is ", at::get_num_threads(), ".");
-#if defined(_OPENMP)
-    TORCH_CHECK(
-        !omp_get_dynamic() && !omp_in_parallel() && omp_get_thread_limit() >= nth,
-        "VLLM_CPU_SGL_THREAD_GROUPS requires fixed, non-nested OpenMP teams.");
-#endif
-    return nth == total ? &full_work_ids : &rounded_work_ids;
-  }
-};
-
-inline const SGLThreadGroups& sgl_thread_groups() {
-  static const SGLThreadGroups groups;
-  return groups;
-}
-
-inline const std::vector<int>* sgl_work_ids(int nth) {
-  return sgl_thread_groups().work_ids(nth);
-}
-
 template <typename func_t>
-inline void parallel_2d(int m, int n, const func_t& f, bool remap_threads = false) {
+inline void parallel_2d(int m, int n, const func_t& f) {
   // make sure we have even num_threads
   int nth = adjust_num_threads(m);
-  const auto* work_ids = remap_threads ? sgl_work_ids(nth) : nullptr;
 
   // [NOTE] thread blocking:
   //
@@ -443,10 +351,6 @@ inline void parallel_2d(int m, int n, const func_t& f, bool remap_threads = fals
 #pragma omp parallel num_threads(nth)
   {
     int ith = omp_get_thread_num();
-    if (work_ids != nullptr) {
-      // Scratch buffers still use the original omp_get_thread_num().
-      ith = (*work_ids)[ith];
-    }
     int ith_m = ith / nth_n;
     int ith_n = ith % nth_n;
 

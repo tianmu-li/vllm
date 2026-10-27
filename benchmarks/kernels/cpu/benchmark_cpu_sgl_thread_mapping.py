@@ -1,13 +1,11 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""Build and run the native SGL work-assignment diagnostic.
+"""Build and run the SGL dense thread mapping diagnostic.
 
-Run with the serving LD_PRELOAD and affinity settings to inspect real CPU
-placement. Dense and synthetic routed-MoE modes report scheduler plans,
-physical CPU placement, tile ownership, estimated work balance, and exact-once
-matrix-block coverage. Optional timings cover planning and worker completion;
-they are diagnostic only, not kernel performance measurements. Estimated
-panel-byte counts do not measure DRAM traffic or identify memory homes.
+The diagnostic records worker placement and rectangles, then checks exact-once
+matrix-block coverage for legacy, logical96, and flat dense schedules. Optional
+scheduler timings use an untimed warmup and no-log callbacks; they measure
+callback and OpenMP scheduling overhead, not kernel performance.
 """
 
 import argparse
@@ -22,86 +20,64 @@ import torch
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--threads", type=int, default=90)
-    parser.add_argument("--groups", default="")
     parser.add_argument(
         "--scheduler",
         choices=(
-            "",
             "legacy",
-            "round_robin",
-            "spread_moe",
-            "spread_dense",
-            "spread_all",
-            "tile_moe",
-            "tile_dense",
-            "tile_all",
+            "logical96_dense",
+            "flat_32x32",
+            "flat_128x64",
+            "flat_128x128",
         ),
-        default="",
-        help="scheduler override; empty preserves the native automatic behavior",
+        default="logical96_dense",
     )
-    parser.add_argument(
-        "--kind",
-        choices=("dense", "moe"),
-        default="dense",
-        help="diagnostic plan to inspect",
-    )
-    parser.add_argument(
-        "--phase",
-        choices=("gate", "down"),
-        help="MoE phase; down uses K as its output width",
-    )
+    parser.add_argument("--threads", type=int, default=96)
     parser.add_argument(
         "--m-blocks",
         type=int,
-        default=256,
-        help="dense M blocks; MoE expert count when rows are omitted",
+        default=1,
+        help="number of M microtiles (32 rows each)",
+    )
+    parser.add_argument(
+        "--m",
+        type=int,
+        help="actual M rows; defaults to --m-blocks times 32",
     )
     parser.add_argument(
         "--n-blocks",
         type=int,
-        default=16,
-        help="default column blocks; also supplies MoE intermediate N",
+        default=192,
+        help="number of N microtiles (32 columns each)",
     )
-    parser.add_argument("--rows", type=int, help="dense row count")
     parser.add_argument(
-        "--columns",
+        "--thread-limit",
         type=int,
-        help="column count or MoE intermediate N",
-    )
-    parser.add_argument("--k", type=int, default=2048, help="reduction width")
-    parser.add_argument(
-        "--expert-rows",
-        help="comma-separated routed rows per expert; zero-row experts are allowed",
+        help="set OMP_THREAD_LIMIT to exercise a smaller actual team",
     )
     parser.add_argument(
         "--timing",
         action="store_true",
-        help="include plan-build and worker-finish wall times in the report",
+        help="measure mean scheduler overhead across 100 no-log invocations",
     )
     parser.add_argument(
         "--build-dir", type=Path, default=Path("/tmp/vllm-sgl-thread-mapping")
     )
     parser.add_argument("--output", type=Path)
     args = parser.parse_args()
-    if args.kind == "moe" and args.rows is not None:
-        parser.error("--rows applies to dense; use --expert-rows for MoE")
-    if args.kind == "dense" and (
-        args.phase is not None or args.expert_rows is not None
-    ):
-        parser.error("--phase and --expert-rows apply only to MoE")
-    if args.kind == "dense" and args.rows is not None and args.rows <= 0:
-        parser.error("--rows must be positive")
-    if args.columns is not None and args.columns <= 0:
-        parser.error("--columns must be positive")
-    if args.k <= 0:
-        parser.error("--k must be positive")
-    if args.m_blocks <= 0 or args.n_blocks <= 0 or args.threads <= 0:
-        parser.error("thread and block counts must be positive")
+    if args.threads <= 0 or args.m_blocks < 0 or args.n_blocks < 0:
+        parser.error("threads must be positive and block counts nonnegative")
+    actual_m = args.m if args.m is not None else args.m_blocks * 32
+    if actual_m < 0:
+        parser.error("--m must be nonnegative")
+    if (actual_m + 31) // 32 != args.m_blocks:
+        parser.error("--m-blocks must equal ceil(--m / 32)")
+    if args.thread_limit is not None and args.thread_limit <= 0:
+        parser.error("--thread-limit must be positive")
+
     root = Path(__file__).resolve().parents[3]
     source = Path(__file__).with_name("sgl_thread_mapping.cpp")
     common_header = root / "csrc/cpu/sgl-kernels/common.h"
-    scheduler_header = root / "csrc/cpu/sgl-kernels/tile_scheduler.h"
+    dense_header = root / "csrc/cpu/sgl-kernels/dense_scheduler.h"
     torch_dir = Path(torch.__file__).parent
     args.build_dir.mkdir(parents=True, exist_ok=True)
     executable = args.build_dir / "sgl_thread_mapping"
@@ -123,27 +99,22 @@ def main():
         str(executable),
     ]
     subprocess.run(command, check=True)
+
     environment = os.environ.copy()
-    environment["VLLM_CPU_SGL_THREAD_GROUPS"] = args.groups
     environment["VLLM_CPU_SGL_SCHEDULER"] = args.scheduler
+    environment["OMP_NUM_THREADS"] = str(args.threads)
+    environment["OMP_DYNAMIC"] = "FALSE"
+    if args.thread_limit is not None:
+        environment["OMP_THREAD_LIMIT"] = str(args.thread_limit)
     native_args = [
         str(executable),
         str(args.threads),
         str(args.m_blocks),
         str(args.n_blocks),
-        "--kind",
-        args.kind,
-        "--k",
-        str(args.k),
+        args.scheduler,
     ]
-    if args.phase is not None:
-        native_args.extend(("--phase", args.phase))
-    if args.rows is not None:
-        native_args.extend(("--rows", str(args.rows)))
-    if args.columns is not None:
-        native_args.extend(("--columns", str(args.columns)))
-    if args.expert_rows is not None:
-        native_args.extend(("--expert-rows", args.expert_rows))
+    if args.m is not None:
+        native_args.extend(("--m", str(actual_m)))
     if args.timing:
         native_args.append("--timing")
     result = subprocess.run(
@@ -155,13 +126,13 @@ def main():
     )
     report = json.loads(result.stdout)
     report.update(
-        groups=args.groups,
-        configured_scheduler=args.scheduler,
-        configured_kind=args.kind,
-        configured_phase=args.phase or ("gate" if args.kind == "moe" else None),
+        configured_threads=args.threads,
+        actual_m=actual_m,
+        configured_thread_limit=args.thread_limit
+        or environment.get("OMP_THREAD_LIMIT"),
         source_sha256=hashlib.sha256(source.read_bytes()).hexdigest(),
         common_sha256=hashlib.sha256(common_header.read_bytes()).hexdigest(),
-        tile_scheduler_sha256=hashlib.sha256(scheduler_header.read_bytes()).hexdigest(),
+        dense_scheduler_sha256=hashlib.sha256(dense_header.read_bytes()).hexdigest(),
         compile_command=command,
     )
     text = json.dumps(report, indent=2) + "\n"

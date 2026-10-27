@@ -54,7 +54,6 @@ if TYPE_CHECKING:
     VLLM_CPU_OMP_THREADS_BIND: str = "auto"
     VLLM_CPU_NUM_OF_RESERVED_CPU: int | None = None
     VLLM_CPU_SGL_SCHEDULER: str = ""
-    VLLM_CPU_SGL_THREAD_GROUPS: str = ""
     VLLM_CPU_CI_ENV: bool = False
     VLLM_CPU_ATTN_SPLIT_KV: bool = True
     VLLM_ZENTORCH_WEIGHT_PREPACK: bool = True
@@ -909,11 +908,10 @@ environment_variables: dict[str, Callable[[], Any]] = {
         if "VLLM_CPU_NUM_OF_RESERVED_CPU" in os.environ
         else None
     ),
-    # (Experimental CPU backend only) work assignment in SGL INT8 kernels.
+    # (Experimental CPU backend only) scheduling for dense SGL INT8 projections
+    # and native shared experts. Flat modes target large-M GEMMs.
+    # Unset, empty, or legacy uses existing scheduling. Restart after changes.
     "VLLM_CPU_SGL_SCHEDULER": lambda: os.getenv("VLLM_CPU_SGL_SCHEDULER", ""),
-    # (Experimental CPU backend only) physical OpenMP thread group sizes for
-    # SGL INT8 kernel work assignment.
-    "VLLM_CPU_SGL_THREAD_GROUPS": lambda: os.getenv("VLLM_CPU_SGL_THREAD_GROUPS", ""),
     # (CPU backend only) whether vLLM is running in a CI environment.
     "VLLM_CPU_CI_ENV": lambda: bool(int(os.getenv("VLLM_CPU_CI_ENV", "0"))),
     # (CPU backend only) whether to enable attention spilt KV.
@@ -2436,7 +2434,6 @@ def compile_factors() -> dict[str, object]:
         "VLLM_CPU_KVCACHE_SPACE",
         # Native work assignment does not change compiled graph code.
         "VLLM_CPU_SGL_SCHEDULER",
-        "VLLM_CPU_SGL_THREAD_GROUPS",
         "VLLM_CPU_MOE_PREPACK",
         "VLLM_ZENTORCH_WEIGHT_PREPACK",
         "VLLM_TEST_FORCE_LOAD_FORMAT",
