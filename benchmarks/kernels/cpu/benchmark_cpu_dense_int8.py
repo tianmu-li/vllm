@@ -25,6 +25,7 @@ parser.add_argument(
         "flat_32x32",
         "flat_128x64",
         "flat_128x128",
+        "flat_auto",
     ),
     default="legacy",
 )
@@ -34,6 +35,11 @@ selection.add_argument(
     action="append",
     metavar="PROJECTION:M",
     help="run one projection at M rows; may be repeated",
+)
+selection.add_argument(
+    "--shape",
+    metavar="M:K:N",
+    help="run one custom dense shape with positive M and K/N multiples of 32",
 )
 selection.add_argument(
     "--projection",
@@ -65,10 +71,21 @@ if args.samples < 1:
     parser.error("--samples must be positive")
 if args.sample_ms <= 0:
     parser.error("--sample-ms must be positive")
-if args.case and args.m_values is not None:
-    parser.error("--case cannot be combined with --m-values")
+if (args.case or args.shape) and args.m_values is not None:
+    parser.error("--case and --shape cannot be combined with --m-values")
 if args.m_values is not None and any(m < 1 for m in args.m_values):
     parser.error("--m-values must be positive")
+custom_shape = None
+if args.shape:
+    try:
+        m, k, n = (int(dimension) for dimension in args.shape.split(":"))
+    except ValueError:
+        parser.error(f"invalid --shape {args.shape!r}; expected M:K:N")
+    if m < 1 or k < 1 or n < 1:
+        parser.error(f"invalid --shape {args.shape!r}; dimensions must be positive")
+    if k % 32 != 0 or n % 32 != 0:
+        parser.error(f"invalid --shape {args.shape!r}; K and N must be multiples of 32")
+    custom_shape = (m, k, n)
 
 os.environ["OMP_NUM_THREADS"] = str(args.threads)
 os.environ["OMP_THREAD_LIMIT"] = str(args.threads)
@@ -95,6 +112,10 @@ FLAT_SCHEDULE_GEOMETRY = {
 }
 TARGET_WEIGHT_BYTES = int(1.5 * 1024**3)
 WEIGHT_CHUNK_SIZE = 8
+FLAT_AUTO_TEAM_NOTE = (
+    "Python metadata assumes the configured thread count; the actual OpenMP "
+    "team is not measured by this benchmark."
+)
 
 
 def cpu_model():
@@ -151,7 +172,7 @@ def runtime_metadata():
     }
 
 
-def schedule_metadata(m, n):
+def schedule_metadata(m, n, k):
     m_blocks = math.ceil(m / 32)
     n_blocks = math.ceil(n / 32)
     metadata = {
@@ -168,7 +189,38 @@ def schedule_metadata(m, n):
         "scheduler_eligible": None,
         "eligibility_reason": "not_applicable",
     }
-    if args.scheduler not in FLAT_SCHEDULE_GEOMETRY:
+    selected_geometry = args.scheduler
+    auto_selection = None
+    if args.scheduler == "flat_auto":
+        m_blocks = math.ceil(m / 32)
+        n_blocks = math.ceil(n / 32)
+        grouped = m >= 0.25 * (n_blocks * 32)
+        wide_task_count = math.ceil(m_blocks / 4) * math.ceil(n_blocks / 2)
+        wide_eligible = (
+            not grouped
+            and m >= 128
+            and m % 128 == 0
+            and n % 64 == 0
+            and wide_task_count >= 192
+            and (
+                wide_task_count % args.threads == 0
+                or wide_task_count // args.threads >= 8
+            )
+        )
+        selected_geometry = (
+            "flat_32x32" if grouped or not wide_eligible else "flat_128x64"
+        )
+        auto_selection = {
+            "chosen_geometry": selected_geometry,
+            "grouped_policy": grouped,
+            "grouped_threshold": 0.25,
+            "wide_128x64_base_task_count": wide_task_count,
+            "wide_128x64_eligible": wide_eligible,
+            "assumed_team_size": args.threads,
+            "team_size_source": "configured threads",
+        }
+
+    if selected_geometry not in FLAT_SCHEDULE_GEOMETRY:
         if args.scheduler == "legacy":
             metadata.update(
                 legacy_expected_team_size=(
@@ -180,7 +232,7 @@ def schedule_metadata(m, n):
             )
         return metadata
 
-    bm, bn = FLAT_SCHEDULE_GEOMETRY[args.scheduler]
+    bm, bn = FLAT_SCHEDULE_GEOMETRY[selected_geometry]
     task_count = math.ceil(m_blocks / bm) * math.ceil(n_blocks / bn)
     eligible = m >= 128 and (bm == 1 or task_count >= 192)
     if m < 128:
@@ -189,7 +241,7 @@ def schedule_metadata(m, n):
         reason = "superblock_tasks_below_192"
     else:
         reason = "eligible"
-    effective_schedule = args.scheduler if eligible else "legacy"
+    effective_schedule = selected_geometry if eligible else "legacy"
     legacy_schedule_active = effective_schedule == "legacy"
     metadata.update(
         effective_schedule=effective_schedule,
@@ -216,7 +268,180 @@ def schedule_metadata(m, n):
         flat_superblock_m_blocks=bm,
         flat_superblock_n_blocks=bn,
     )
+    if auto_selection is not None:
+        auto_selection.update(
+            effective_schedule=effective_schedule,
+            wide_128x64_selected=selected_geometry == "flat_128x64",
+            base_geometry={"bm": bm, "bn": bn},
+            base_task_count=task_count,
+            fallback_eligible=eligible,
+            fallback_reason=reason,
+        )
+        metadata.update(
+            auto_selection=auto_selection,
+            auto_selection_note=FLAT_AUTO_TEAM_NOTE,
+        )
+    if eligible:
+        traversal = flat_traversal_metadata(
+            m_blocks,
+            n_blocks,
+            m,
+            args.threads,
+            bm,
+            bn,
+            # Ordinary dense INT8 uses one K panel.
+            k=k,
+            panels=1,
+        )
+        metadata.update(flat_traversal=traversal)
     return metadata
+
+
+def flat_traversal_metadata(mb, nb, m, nth, bm, bn, *, k, panels):
+    """Mirror the dense scheduler's traversal and ownership selection."""
+    threshold = 0.25
+    max_group_n = max(bn, (1024 * 1024) // (32 * k * panels))
+    max_group_m = max(bm, (1024 * 1024) // (32 * k))
+    groupable = m >= threshold * (nb * 32) * panels
+    partial_m = groupable and m % 32 != 0 and mb > 1
+    base_task_count = math.ceil(mb / bm) * math.ceil(nb / bn)
+    max_product = 1
+    if groupable:
+        max_product = max(1, base_task_count // nth)
+        max_product = 1 << (max_product.bit_length() - 1)
+
+    selected = None
+    target_aspect = 2.0
+    product = max_product
+    while product >= 1 and selected is None:
+        target_aspect = (
+            min(4.0, max(2.0, k / 1024.0))
+            if groupable and not partial_m and bm * bn * product <= 16
+            else 2.0
+        )
+        candidates = []
+        for gm in range(1, product + 1):
+            if product % gm:
+                continue
+            gn = product // gm
+            group_m = bm * gm
+            group_n = bn * gn
+            if (
+                group_m > mb
+                or group_m > max_group_m
+                or group_n > nb
+                or group_n > max_group_n
+            ):
+                continue
+            physical_aspect = group_m / group_n
+            score = abs(math.log2(physical_aspect / target_aspect))
+            candidates.append((score, -group_n, group_m, group_n))
+        if candidates:
+            best_score = min(candidate[0] for candidate in candidates)
+            tied_candidates = [
+                candidate
+                for candidate in candidates
+                if candidate[0] <= best_score + 1e-12
+            ]
+            _, _, group_m, group_n = min(
+                tied_candidates,
+                key=lambda candidate: (candidate[1], candidate[2]),
+            )
+            selected = (group_m, group_n)
+        product //= 2
+
+    if selected is None:
+        group_m, group_n = min(bm, mb), min(bn, nb)
+    else:
+        group_m, group_n = selected
+    column_rows = 0
+    column_joint_budget = None
+    if groupable and not partial_m and group_m * group_n <= 16 and mb % group_m == 0:
+        column_rows = group_m
+        if k > 2048:
+            column_joint_budget = 2 * max(1, (1024 * 1024) // (32 * k))
+            max_work = column_rows * ((mb // column_rows * nb + nth - 1) // nth)
+            for candidate in range(column_rows + bm, min(mb, max_work) + 1, bm):
+                if mb % candidate:
+                    continue
+                columns = (mb // candidate * nb + nth - 1) // nth
+                if (
+                    candidate * columns <= max_work
+                    and candidate + columns * panels <= column_joint_budget
+                ):
+                    column_rows = candidate
+    column_width = 1
+    if column_rows and groupable and k > 2048:
+        candidate_width = (mb // column_rows * nb + nth - 1) // nth
+        if (mb // column_rows) * ((nb + candidate_width - 1) // candidate_width) <= nth:
+            column_width = candidate_width
+    column_peak_work = (
+        column_rows * ((mb // column_rows * nb + nth - 1) // nth)
+        if column_rows
+        else None
+    )
+    column_chunks_per_m_band = (
+        (nb + column_width - 1) // column_width if column_rows else None
+    )
+    interleaved_m_rows = 0
+    if groupable and not column_rows:
+        interleaved_m_rows = mb % group_m
+        if interleaved_m_rows == 0 and partial_m:
+            interleaved_m_rows = 1
+    if interleaved_m_rows:
+        task_order = "N_fast_groups_with_interleaved_M_edge"
+    elif groupable and column_rows:
+        task_order = (
+            "M_group_columns_N_chunks" if column_width > 1 else "M_group_columns_N_fast"
+        )
+    elif groupable:
+        task_order = "N_fast_groups_then_microtiles"
+    else:
+        task_order = "M_fast_base_superblocks"
+    ownership_unit = (
+        "M_group_columns"
+        if groupable and column_rows
+        else "compute_tile"
+        if groupable
+        else "base_superblocks"
+    )
+    ownership_rank_count = (
+        (mb // column_rows) * column_chunks_per_m_band
+        if column_rows
+        else mb * nb
+        if groupable
+        else base_task_count
+    )
+    return {
+        "base_group_m": bm,
+        "base_group_n": bn,
+        "group_m": group_m,
+        "group_n": group_n,
+        "grouped": groupable,
+        "partial_m": partial_m,
+        "partial_m_rows": m % 32 if partial_m else 0,
+        "column_rows": column_rows,
+        "column_width": column_width,
+        "column_chunks_per_m_band": column_chunks_per_m_band,
+        "column_joint_budget": column_joint_budget,
+        "column_peak_work": column_peak_work,
+        "interleaved_m_rows": interleaved_m_rows,
+        "ownership_unit": ownership_unit,
+        "ownership_rank_count": ownership_rank_count,
+        "rank_partition": (
+            "proportional_floor" if column_rows else "prefix_quotient_remainder"
+        ),
+        "task_order": task_order,
+        "tail_order": "interleaved" if interleaved_m_rows else "regular",
+        "assumed_team_size": nth,
+        "team_size_source": "requested threads; actual OpenMP team unmeasured",
+        "max_group_m": min(mb, max_group_m),
+        "max_group_n": min(nb, max_group_n),
+        "group_n_cache_bytes": group_n * 32 * k * panels,
+        "group_n_packed_weight_bytes": group_n * 32 * (k + 4) * panels,
+        "target_aspect": target_aspect,
+        "threshold": threshold,
+    }
 
 
 def selected_cases():
@@ -234,6 +459,9 @@ def selected_cases():
                 )
             cases.setdefault(projection, []).append(m)
         return cases
+
+    if custom_shape is not None:
+        return {"custom": [custom_shape]}
 
     projections = args.projection or DEFAULT_PROJECTIONS
     m_values = args.m_values or DEFAULT_M_VALUES
@@ -253,7 +481,12 @@ args.output_dir.mkdir(parents=True, exist_ok=True)
 
 with torch.inference_mode():
     for projection, m_values in cases_by_projection.items():
-        k, n = PROJECTIONS[projection]
+        if projection == "custom":
+            ((m, k, n),) = m_values
+            m_values = (m,)
+        else:
+            k, n = PROJECTIONS[projection]
+
         packed_matrix_bytes = n * (k + 4)
         depth = 1 + math.ceil(TARGET_WEIGHT_BYTES / packed_matrix_bytes)
         packed = torch.empty((depth, n, k + 4), dtype=torch.int8)
@@ -347,7 +580,7 @@ with torch.inference_mode():
                 "m": m,
                 "k": k,
                 "n": n,
-                **schedule_metadata(m, n),
+                **schedule_metadata(m, n, k),
                 "weight_bank_bytes": packed_bank_bytes,
                 "packed_weight_matrix_bytes": packed_matrix_bytes,
                 "rotating_weight_matrices": depth,

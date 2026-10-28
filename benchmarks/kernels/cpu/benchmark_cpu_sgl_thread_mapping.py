@@ -28,10 +28,13 @@ def main():
             "flat_32x32",
             "flat_128x64",
             "flat_128x128",
+            "flat_auto",
         ),
         default="logical96_dense",
     )
     parser.add_argument("--threads", type=int, default=96)
+    parser.add_argument("--k", type=int, default=64)
+    parser.add_argument("--panels", type=int, default=1)
     parser.add_argument(
         "--m-blocks",
         type=int,
@@ -50,6 +53,11 @@ def main():
         help="number of N microtiles (32 columns each)",
     )
     parser.add_argument(
+        "--n",
+        type=int,
+        help="actual N columns; defaults to --n-blocks times 32",
+    )
+    parser.add_argument(
         "--thread-limit",
         type=int,
         help="set OMP_THREAD_LIMIT to exercise a smaller actual team",
@@ -64,13 +72,26 @@ def main():
     )
     parser.add_argument("--output", type=Path)
     args = parser.parse_args()
-    if args.threads <= 0 or args.m_blocks < 0 or args.n_blocks < 0:
-        parser.error("threads must be positive and block counts nonnegative")
+    if (
+        args.threads <= 0
+        or args.k <= 0
+        or args.panels <= 0
+        or args.m_blocks < 0
+        or args.n_blocks < 0
+    ):
+        parser.error(
+            "threads, K, and panels must be positive; block counts must be nonnegative"
+        )
     actual_m = args.m if args.m is not None else args.m_blocks * 32
     if actual_m < 0:
         parser.error("--m must be nonnegative")
     if (actual_m + 31) // 32 != args.m_blocks:
         parser.error("--m-blocks must equal ceil(--m / 32)")
+    actual_n = args.n if args.n is not None else args.n_blocks * 32
+    if actual_n < 0:
+        parser.error("--n must be nonnegative")
+    if (actual_n + 31) // 32 != args.n_blocks:
+        parser.error("--n-blocks must equal ceil(--n / 32)")
     if args.thread_limit is not None and args.thread_limit <= 0:
         parser.error("--thread-limit must be positive")
 
@@ -112,9 +133,15 @@ def main():
         str(args.m_blocks),
         str(args.n_blocks),
         args.scheduler,
+        "--k",
+        str(args.k),
+        "--panels",
+        str(args.panels),
     ]
     if args.m is not None:
         native_args.extend(("--m", str(actual_m)))
+    if args.n is not None:
+        native_args.extend(("--n", str(actual_n)))
     if args.timing:
         native_args.append("--timing")
     result = subprocess.run(
@@ -128,6 +155,9 @@ def main():
     report.update(
         configured_threads=args.threads,
         actual_m=actual_m,
+        actual_n=actual_n,
+        k=args.k,
+        panels=args.panels,
         configured_thread_limit=args.thread_limit
         or environment.get("OMP_THREAD_LIMIT"),
         source_sha256=hashlib.sha256(source.read_bytes()).hexdigest(),

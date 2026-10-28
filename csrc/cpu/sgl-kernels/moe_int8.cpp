@@ -793,7 +793,7 @@ void shared_expert_int8_kernel_impl(
   const bool apply_scaling_factor = fused_experts_out != nullptr;
 
   // here we only parallel on half of 2N to fuse silu_and_mul with gemm
-  parallel_sgl_dense(MB, NB, M, [&](const auto& rectangles) {
+  parallel_sgl_dense(MB, NB, M, N, K, 2, [&](const auto& rectangles) {
     // get local pointers
     int tid = get_thread_num();
     int32_t* __restrict__ C0 = reinterpret_cast<int32_t*>(C_tmp) + tid * 2 * BLOCK_M * BLOCK_N;
@@ -890,7 +890,7 @@ void shared_expert_int8_kernel_impl(
   const int64_t stride_oc = packed_N;
 
   // parallel on [MB2, NB2]
-  parallel_sgl_dense(MB2, NB2, M, [&](const auto& rectangles) {
+  parallel_sgl_dense(MB2, NB2, M, OC, IC, 1, [&](const auto& rectangles) {
     // get local pointers
     int tid = get_thread_num();
     float* __restrict__ C = C_tmp + tid * 2 * BLOCK_M * BLOCK_N;

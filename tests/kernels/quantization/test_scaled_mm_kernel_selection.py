@@ -353,6 +353,7 @@ def test_cpu_sgl_int8_dense_schedulers_preserve_scaled_mm_result(tmp_path):
             "base": (
                 (127, 320, False, False),
                 (128, 320, True, True),
+                (512, 1024, False, False),
                 (1, 32, False, False),
                 (33, 96, False, True),
                 (1, 32, True, False),
@@ -363,7 +364,9 @@ def test_cpu_sgl_int8_dense_schedulers_preserve_scaled_mm_result(tmp_path):
             "flat32": (
                 (127, 320, False, False),
                 (128, 320, True, True),
+                (512, 1024, False, False),
             ),
+            "flat32_uniform": ((512, 1024, False, False),),
             "flat128x64": (
                 (385, 3072, False, True),
                 (385, 3008, False, False),
@@ -373,9 +376,22 @@ def test_cpu_sgl_int8_dense_schedulers_preserve_scaled_mm_result(tmp_path):
                 (385, 5952, False, False),
             ),
             "flat128x128_eligible": ((385, 6144, False, True),),
+            "flat128x128_tall": (
+                (3105, 1056, False, False),
+                (3071, 1056, False, False),
+            ),
+            "flat_auto": (
+                (127, 320, False, False),  # legacy below the flat-mode threshold
+                (768, 6144, False, False),  # aligned, ungrouped wide workload
+                (768, 6176, False, False),  # N tail keeps the 32x32 base
+                (769, 6144, False, False),  # M tail keeps the 32x32 base
+                (768, 2048, False, False),  # grouped shape keeps existing groups
+            ),
+            "flat_auto_wide": ((768, 6144, False, False),),
         }[case_group]
         outputs = []
         for m, n, has_bias, is_vnni in cases:
+            torch.manual_seed(m + n)
             x = torch.randn(m, 64).bfloat16()
             weight = torch.randint(-30, 31, (n, 64), dtype=torch.int8)
             reference_weight = weight.float()
@@ -440,11 +456,14 @@ def test_cpu_sgl_int8_dense_schedulers_preserve_scaled_mm_result(tmp_path):
         thread_limit,
         output_path,
         case_group="base",
+        max_active_levels=None,
     ):
         env = os.environ.copy()
         env["OMP_NUM_THREADS"] = str(requested_threads)
         env["OMP_DYNAMIC"] = "FALSE"
         env["OMP_THREAD_LIMIT"] = str(thread_limit)
+        if max_active_levels is not None:
+            env["OMP_MAX_ACTIVE_LEVELS"] = str(max_active_levels)
         env["VLLM_CPU_SGL_SCHEDULER"] = scheduler
         subprocess.run(
             [sys.executable, "-c", script, str(output_path), case_group],
@@ -493,7 +512,44 @@ def test_cpu_sgl_int8_dense_schedulers_preserve_scaled_mm_result(tmp_path):
         tmp_path / "flat32.pt",
         "flat32",
     )
-    for legacy, flat in zip(legacy_outputs[95][:2], flat32_outputs, strict=True):
+    for legacy, flat in zip(legacy_outputs[95][:3], flat32_outputs, strict=True):
+        torch.testing.assert_close(legacy, flat, rtol=0, atol=0)
+
+    flat32_constrained_outputs = run(
+        "flat_32x32",
+        requested_threads=128,
+        thread_limit=2,
+        output_path=tmp_path / "flat32-128-2.pt",
+        case_group="flat32_uniform",
+    )
+    for legacy, flat in zip(
+        legacy_outputs[2][2:3], flat32_constrained_outputs, strict=True
+    ):
+        torch.testing.assert_close(legacy, flat, rtol=0, atol=0)
+
+    flat32_mismatched_outputs = run(
+        "flat_32x32",
+        requested_threads=2,
+        thread_limit=1,
+        output_path=tmp_path / "flat32-2-1.pt",
+        case_group="flat32_uniform",
+    )
+    for legacy, flat in zip(
+        legacy_outputs[2][2:3], flat32_mismatched_outputs, strict=True
+    ):
+        torch.testing.assert_close(legacy, flat, rtol=0, atol=0)
+
+    flat32_serialized_outputs = run(
+        "flat_32x32",
+        requested_threads=2,
+        thread_limit=2,
+        output_path=tmp_path / "flat32-2-serialized.pt",
+        case_group="flat32_uniform",
+        max_active_levels=0,
+    )
+    for legacy, flat in zip(
+        legacy_outputs[2][2:3], flat32_serialized_outputs, strict=True
+    ):
         torch.testing.assert_close(legacy, flat, rtol=0, atol=0)
 
     for scheduler, case_group, actual_threads in (
@@ -533,6 +589,75 @@ def test_cpu_sgl_int8_dense_schedulers_preserve_scaled_mm_result(tmp_path):
     )
     for legacy, flat in zip(legacy_eligible_128, flat_eligible_128, strict=True):
         torch.testing.assert_close(legacy, flat, rtol=0, atol=0)
+
+    tall_legacy_outputs = {}
+    for actual_threads in (2, 7, 95):
+        tall_legacy_outputs[actual_threads] = run(
+            "legacy",
+            actual_threads,
+            actual_threads,
+            tmp_path / f"legacy-flat128x128-tall-{actual_threads}.pt",
+            "flat128x128_tall",
+        )
+        tall_flat_outputs = run(
+            "flat_128x128",
+            actual_threads,
+            actual_threads,
+            tmp_path / f"flat128x128-tall-{actual_threads}.pt",
+            "flat128x128_tall",
+        )
+        for legacy, flat in zip(
+            tall_legacy_outputs[actual_threads], tall_flat_outputs, strict=True
+        ):
+            torch.testing.assert_close(legacy, flat, rtol=0, atol=0)
+
+    tall_constrained_outputs = run(
+        "flat_128x128",
+        requested_threads=128,
+        thread_limit=2,
+        output_path=tmp_path / "flat128x128-tall-128-2.pt",
+        case_group="flat128x128_tall",
+    )
+    for legacy, flat in zip(
+        tall_legacy_outputs[2], tall_constrained_outputs, strict=True
+    ):
+        torch.testing.assert_close(legacy, flat, rtol=0, atol=0)
+
+    auto_legacy_outputs = run(
+        "legacy",
+        32,
+        32,
+        tmp_path / "legacy-flat-auto-32.pt",
+        "flat_auto",
+    )
+    auto_outputs = run(
+        "flat_auto",
+        32,
+        32,
+        tmp_path / "flat-auto-32.pt",
+        "flat_auto",
+    )
+    for legacy, auto in zip(auto_legacy_outputs, auto_outputs, strict=True):
+        torch.testing.assert_close(legacy, auto, rtol=0, atol=0)
+
+    auto_constrained_legacy_outputs = run(
+        "legacy",
+        requested_threads=2,
+        thread_limit=2,
+        output_path=tmp_path / "legacy-flat-auto-2.pt",
+        case_group="flat_auto_wide",
+    )
+    auto_constrained_outputs = run(
+        "flat_auto",
+        requested_threads=128,
+        thread_limit=2,
+        output_path=tmp_path / "flat-auto-128-2.pt",
+        case_group="flat_auto_wide",
+    )
+    for legacy, auto in zip(
+        auto_constrained_legacy_outputs, auto_constrained_outputs, strict=True
+    ):
+        torch.testing.assert_close(legacy, auto, rtol=0, atol=0)
 
 
 @pytest.mark.skipif(

@@ -909,8 +909,10 @@ environment_variables: dict[str, Callable[[], Any]] = {
         else None
     ),
     # (Experimental CPU backend only) scheduling for dense SGL INT8 projections
-    # and native shared experts. Flat modes target large-M GEMMs.
-    # Unset, empty, or legacy uses existing scheduling. Restart after changes.
+    # and native shared experts. Flat modes adapt locality for large-M GEMMs.
+    # flat_auto keeps the existing schedule below 128 rows; otherwise it
+    # keeps grouped shapes on the 32x32 base and selects 128x64 only for
+    # aligned ungrouped grids with enough actual-team work. Restart after changes.
     "VLLM_CPU_SGL_SCHEDULER": lambda: os.getenv("VLLM_CPU_SGL_SCHEDULER", ""),
     # (CPU backend only) whether vLLM is running in a CI environment.
     "VLLM_CPU_CI_ENV": lambda: bool(int(os.getenv("VLLM_CPU_CI_ENV", "0"))),
