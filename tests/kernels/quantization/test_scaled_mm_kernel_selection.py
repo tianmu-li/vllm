@@ -333,7 +333,7 @@ def test_cpu_sgl_int8_linear_accepts_3d_input():
     reason="int8_scaled_mm_with_quant is not built",
 )
 def test_cpu_sgl_int8_dense_schedulers_preserve_scaled_mm_result(tmp_path):
-    """Dense SGL INT8 scheduler modes preserve exact GEMM results."""
+    """Quantization and dense SGL INT8 schedules preserve exact GEMM results."""
     script = textwrap.dedent(
         """
         import os
@@ -351,50 +351,59 @@ def test_cpu_sgl_int8_dense_schedulers_preserve_scaled_mm_result(tmp_path):
         case_group = sys.argv[2]
         cases = {
             "base": (
-                (127, 320, False, False),
-                (128, 320, True, True),
-                (512, 1024, False, False),
-                (1, 32, False, False),
-                (33, 96, False, True),
-                (1, 32, True, False),
-                (128, 320, False, False),
-                (1, 6144, False, True),
-                (128, 32, False, True),
+                (127, 320, 64, False, False),
+                (128, 320, 64, True, True),
+                (512, 1024, 64, False, False),
+                (1, 32, 64, False, False),
+                (33, 96, 64, False, True),
+                (1, 32, 64, True, False),
+                (128, 320, 64, False, False),
+                (1, 6144, 64, False, True),
+                (128, 32, 64, False, True),
             ),
             "flat32": (
-                (127, 320, False, False),
-                (128, 320, True, True),
-                (512, 1024, False, False),
+                (127, 320, 64, False, False),
+                (128, 320, 64, True, True),
+                (512, 1024, 64, False, False),
             ),
-            "flat32_uniform": ((512, 1024, False, False),),
+            "flat32_uniform": ((512, 1024, 64, False, False),),
             "flat128x64": (
-                (385, 3072, False, True),
-                (385, 3008, False, False),
+                (385, 3072, 64, False, True),
+                (385, 3008, 64, False, False),
             ),
             "flat128x128": (
-                (385, 6144, False, True),
-                (385, 5952, False, False),
+                (385, 6144, 64, False, True),
+                (385, 5952, 64, False, False),
             ),
-            "flat128x128_eligible": ((385, 6144, False, True),),
+            "flat128x128_eligible": ((385, 6144, 64, False, True),),
             "flat128x128_tall": (
-                (3105, 1056, False, False),
-                (3071, 1056, False, False),
+                (3105, 1056, 64, False, False),
+                (3071, 1056, 64, False, False),
             ),
             "flat_auto": (
-                (127, 320, False, False),  # legacy below the flat-mode threshold
-                (512, 3072, False, False),  # short ownership splits M columns
-                (768, 6144, False, False),  # aligned, ungrouped wide workload
-                (768, 6176, False, False),  # N tail keeps the 32x32 base
-                (769, 6144, False, False),  # M tail keeps the 32x32 base
-                (768, 2048, False, False),  # grouped shape keeps existing groups
+                (31, 96, 2048, False, True),
+                (33, 32, 4096, True, False),
+                (127, 320, 2048, False, False),
+                (129, 352, 4096, True, True),
+                (128, 4096, 2048, False, False),
+                (1024, 512, 2048, True, True),
+                (1024, 512, 512, True, True),
+                (512, 3072, 2048, False, False),
+                (769, 6144, 4096, False, False),
+                (2049, 96, 2048, False, False),
             ),
-            "flat_auto_wide": ((768, 6144, False, False),),
+            "flat_auto_constrained": (
+                (1, 32, 2048, True, True),
+                (33, 32, 4096, False, False),
+                (127, 320, 2048, False, False),
+                (129, 352, 4096, False, True),
+            ),
         }[case_group]
         outputs = []
-        for m, n, has_bias, is_vnni in cases:
+        for m, n, k, has_bias, is_vnni in cases:
             torch.manual_seed(m + n)
-            x = torch.randn(m, 64).bfloat16()
-            weight = torch.randint(-30, 31, (n, 64), dtype=torch.int8)
+            x = torch.randn(m, k).bfloat16()
+            weight = torch.randint(-30, 31, (n, k), dtype=torch.int8)
             reference_weight = weight.float()
             if is_vnni:
                 weight = torch.ops._C.convert_weight_packed(weight)
@@ -641,24 +650,39 @@ def test_cpu_sgl_int8_dense_schedulers_preserve_scaled_mm_result(tmp_path):
     for legacy, auto in zip(auto_legacy_outputs, auto_outputs, strict=True):
         torch.testing.assert_close(legacy, auto, rtol=0, atol=0)
 
-    auto_constrained_legacy_outputs = run(
-        "legacy",
-        requested_threads=2,
-        thread_limit=2,
-        output_path=tmp_path / "legacy-flat-auto-2.pt",
-        case_group="flat_auto_wide",
-    )
+    # Ceiling partitions of requested worker ranks would skip 31 members of
+    # this actual team, leaving their quantization row ranges unwritten.
     auto_constrained_outputs = run(
         "flat_auto",
         requested_threads=128,
-        thread_limit=2,
-        output_path=tmp_path / "flat-auto-128-2.pt",
-        case_group="flat_auto_wide",
+        thread_limit=95,
+        output_path=tmp_path / "flat-auto-128-95.pt",
+        case_group="flat_auto",
     )
-    for legacy, auto in zip(
-        auto_constrained_legacy_outputs, auto_constrained_outputs, strict=True
-    ):
+    for legacy, auto in zip(auto_legacy_outputs, auto_constrained_outputs, strict=True):
         torch.testing.assert_close(legacy, auto, rtol=0, atol=0)
+
+    # Small and thin grids must use the actual team even below the former
+    # 128-row threshold or when OpenMP serializes a larger team request.
+    for actual_threads in (2, 1):
+        auto_constrained_legacy_outputs = run(
+            "legacy",
+            requested_threads=actual_threads,
+            thread_limit=actual_threads,
+            output_path=tmp_path / f"legacy-flat-auto-{actual_threads}.pt",
+            case_group="flat_auto_constrained",
+        )
+        auto_constrained_outputs = run(
+            "flat_auto",
+            requested_threads=128,
+            thread_limit=actual_threads,
+            output_path=tmp_path / f"flat-auto-128-{actual_threads}.pt",
+            case_group="flat_auto_constrained",
+        )
+        for legacy, auto in zip(
+            auto_constrained_legacy_outputs, auto_constrained_outputs, strict=True
+        ):
+            torch.testing.assert_close(legacy, auto, rtol=0, atol=0)
 
 
 @pytest.mark.skipif(

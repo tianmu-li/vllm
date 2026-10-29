@@ -315,7 +315,7 @@ void int8_scaled_mm_kernel_impl(
       alignas(64) int32_t Ctmp[BLOCK_M * BLOCK_N];
 
       rectangles([&](int64_t mb0, int64_t mb1, int64_t nb0, int64_t nb1) {
-        loop_2d<int8_t>(mb0, mb1, nb0, nb1, BLOCK_N * K, [&](int64_t mb, int64_t nb, int64_t nb_offset) {
+        sgl_dense_loop(rectangles, mb0, mb1, nb0, nb1, BLOCK_N * K, [&](int64_t mb, int64_t nb, int64_t nb_offset) {
           int mb_start = mb * BLOCK_M;
           int mb_size = std::min(M - mb_start, BLOCK_M);
           int nb_start = nb * BLOCK_N;
@@ -342,7 +342,7 @@ void int8_scaled_mm_kernel_impl(
       if (use_brgemm) {
         at::native::cpublas::brgemm_release();
       }
-    });
+    }, {BLOCK_M * BLOCK_N * sizeof(int32_t), sizeof(scalar_t), 0, has_bias});
   });
 }
 
@@ -527,7 +527,7 @@ at::Tensor int8_scaled_mm_with_quant(
     float* __restrict__ As_data = (float*)((void*)(Aq_data + M * K));
     const scalar_t* __restrict__ A_data = mat1.data_ptr<scalar_t>();
 
-    at::parallel_for(0, M, 0, [&](int64_t begin, int64_t end) {
+    parallel_sgl_quantize(M, [&](int64_t begin, int64_t end) {
       for (int64_t m = begin; m < end; ++m) {
         quantize_row_int8<scalar_t>(Aq_data + m * K, As_data[m], A_data + m * lda, K);
       }

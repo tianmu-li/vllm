@@ -1,6 +1,9 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""Benchmark warm and cold CPU INT8 dense projections."""
+"""Benchmark warm and cold CPU INT8 dense projections.
+
+Use cold latency to qualify scheduler changes.
+"""
 
 import argparse
 import ctypes
@@ -66,6 +69,12 @@ parser.add_argument(
 parser.add_argument("--output", type=Path)
 parser.add_argument("--samples", type=int, default=3)
 parser.add_argument("--sample-ms", type=float, default=20)
+parser.add_argument(
+    "--scheduler-diagnostic-build-dir",
+    type=Path,
+    default=Path("/tmp/vllm-sgl-thread-mapping"),
+    help="build directory for the untimed flat_auto shared-planner preflight",
+)
 args = parser.parse_args()
 
 if args.threads < 1:
@@ -120,10 +129,6 @@ FLAT_SCHEDULE_GEOMETRY = {
 }
 TARGET_WEIGHT_BYTES = int(1.5 * 1024**3)
 WEIGHT_CHUNK_SIZE = 8
-FLAT_AUTO_TEAM_NOTE = (
-    "Python metadata assumes the configured thread count; the actual OpenMP "
-    "team is not measured by this benchmark."
-)
 RESOURCE_USAGE_FIELDS = (
     "ru_utime",
     "ru_stime",
@@ -422,7 +427,7 @@ def runtime_metadata():
     }
 
 
-def schedule_metadata(m, n, k):
+def schedule_metadata(m, n, k, diagnostic_executable=None):
     m_blocks = math.ceil(m / 32)
     n_blocks = math.ceil(n / 32)
     metadata = {
@@ -439,40 +444,42 @@ def schedule_metadata(m, n, k):
         "scheduler_eligible": None,
         "eligibility_reason": "not_applicable",
     }
-    selected_geometry = args.scheduler
-    auto_selection = None
     if args.scheduler == "flat_auto":
-        m_blocks = math.ceil(m / 32)
-        n_blocks = math.ceil(n / 32)
-        grouped = m >= 0.25 * (n_blocks * 32)
-        wide_task_count = math.ceil(m_blocks / 4) * math.ceil(n_blocks / 2)
-        wide_eligible = (
-            not grouped
-            and m >= 128
-            and m % 128 == 0
-            and n % 64 == 0
-            and wide_task_count >= 192
-            and (
-                wide_task_count // args.threads >= 8
-                or (
-                    wide_task_count % args.threads == 0
-                    and (wide_task_count // args.threads) % (m // 128) == 0
-                )
-            )
-        )
-        selected_geometry = (
-            "flat_32x32" if grouped or not wide_eligible else "flat_128x64"
-        )
-        auto_selection = {
-            "chosen_geometry": selected_geometry,
-            "grouped_policy": grouped,
-            "grouped_threshold": 0.25,
-            "wide_128x64_base_task_count": wide_task_count,
-            "wide_128x64_eligible": wide_eligible,
-            "assumed_team_size": args.threads,
-            "team_size_source": "configured threads",
-        }
+        from benchmark_cpu_sgl_thread_mapping import run_diagnostic
 
+        diagnostic = run_diagnostic(
+            diagnostic_executable,
+            scheduler=args.scheduler,
+            threads=args.threads,
+            m=m,
+            n=n,
+            k=k,
+            # This public operator uses BF16 output and a single INT8 K panel.
+            panels=1,
+            scratch_bytes=4096,
+            output_bytes=2,
+        )
+        metadata.update(
+            scheduler_diagnostic={
+                key: diagnostic[key]
+                for key in (
+                    "selected_schedule",
+                    "effective_schedule",
+                    "actual_team_size",
+                    "auto_plan",
+                    "worker_load",
+                    "coverage",
+                    "assignments",
+                    "diagnostic_command",
+                    "diagnostic_environment",
+                    "diagnostic_cpu_affinity",
+                )
+            },
+            scheduler_metadata_source="untimed standalone shared-planner preflight",
+        )
+        return metadata
+
+    selected_geometry = args.scheduler
     if selected_geometry not in FLAT_SCHEDULE_GEOMETRY:
         if args.scheduler == "legacy":
             metadata.update(
@@ -521,19 +528,6 @@ def schedule_metadata(m, n, k):
         flat_superblock_m_blocks=bm,
         flat_superblock_n_blocks=bn,
     )
-    if auto_selection is not None:
-        auto_selection.update(
-            effective_schedule=effective_schedule,
-            wide_128x64_selected=selected_geometry == "flat_128x64",
-            base_geometry={"bm": bm, "bn": bn},
-            base_task_count=task_count,
-            fallback_eligible=eligible,
-            fallback_reason=reason,
-        )
-        metadata.update(
-            auto_selection=auto_selection,
-            auto_selection_note=FLAT_AUTO_TEAM_NOTE,
-        )
     if eligible:
         traversal = flat_traversal_metadata(
             m_blocks,
@@ -728,6 +722,24 @@ torch.set_num_interop_threads(1)
 torch.manual_seed(42)
 torch.cpu._init_amx()
 metadata = runtime_metadata()
+diagnostic_executable = None
+if args.scheduler == "flat_auto":
+    from benchmark_cpu_sgl_thread_mapping import build_diagnostic
+
+    diagnostic_executable, diagnostic_sources = build_diagnostic(
+        args.scheduler_diagnostic_build_dir
+    )
+    metadata["scheduler_diagnostic_provenance"] = {
+        **diagnostic_sources,
+        "extension_scheduler_source_binding": "unverified",
+        "extension_actual_team_size": None,
+        "note": (
+            "The diagnostic compiles the current source separately from the loaded "
+            "extension. Its observed team and plan describe that probe; the "
+            "extension SHA256 identifies the timed binary and does not establish "
+            "a matching source revision or its internal OpenMP team."
+        ),
+    }
 results = []
 cases_by_projection = selected_cases()
 args.output_dir.mkdir(parents=True, exist_ok=True)
@@ -775,6 +787,7 @@ with torch.inference_mode():
         scales = torch.full((n,), 0.001, dtype=torch.float32)
 
         for m in m_values:
+            shape_schedule_metadata = schedule_metadata(m, n, k, diagnostic_executable)
             x = torch.randn(m, k).bfloat16()
             input_memory = memory_setup_metadata(
                 x,
@@ -857,7 +870,7 @@ with torch.inference_mode():
                 "m": m,
                 "k": k,
                 "n": n,
-                **schedule_metadata(m, n, k),
+                **shape_schedule_metadata,
                 "weight_bank_bytes": packed_bank_bytes,
                 "packed_weight_matrix_bytes": packed_matrix_bytes,
                 "rotating_weight_matrices": depth,

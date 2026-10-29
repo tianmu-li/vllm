@@ -772,7 +772,7 @@ void shared_expert_int8_kernel_impl(
   constexpr int64_t BLOCK_N = block_size_n();
 
   // stage 0: quantize input to uint8, [M, K]
-  at::parallel_for(0, M, 0, [&](int64_t begin, int64_t end) {
+  parallel_sgl_quantize(M, [&](int64_t begin, int64_t end) {
     for (int64_t m = begin; m < end; ++m) {
       quantize_row_int8<scalar_t>(Aq_tmp + m * K, As_tmp[m], input + m * K, K);
     }
@@ -800,7 +800,7 @@ void shared_expert_int8_kernel_impl(
     int32_t* __restrict__ C1 = C0 + BLOCK_M * BLOCK_N;
 
     rectangles([&](int64_t mb0, int64_t mb1, int64_t nb0, int64_t nb1) {
-      loop_2d<int8_t>(mb0, mb1, nb0, nb1, BLOCK_N * K * 2, [&](int64_t mb, int64_t nb, int64_t nb_offset) {
+      sgl_dense_loop(rectangles, mb0, mb1, nb0, nb1, BLOCK_N * K * 2, [&](int64_t mb, int64_t nb, int64_t nb_offset) {
         // nb_upper from top half and nb_lower from bottom half
         int64_t nb_upper = nb, nb_lower = nb + NB;
         int64_t n_size = std::min(N - nb * BLOCK_N, BLOCK_N);
@@ -872,10 +872,10 @@ void shared_expert_int8_kernel_impl(
     if (use_brgemm) {
       at::native::cpublas::brgemm_release();
     }
-  });
+  }, {2 * BLOCK_M * BLOCK_N * sizeof(int32_t), sizeof(scalar_t)});
 
-  // stage 1.5: quantize ic1 to uint8, [M * topk, N]
-  at::parallel_for(0, M, 0, [&](int64_t begin, int64_t end) {
+  // stage 1.5: quantize ic1 to uint8, [M, N]
+  parallel_sgl_quantize(M, [&](int64_t begin, int64_t end) {
     for (int64_t m = begin; m < end; ++m) {
       quantize_row_int8<scalar_t>(Aq_tmp + m * N, As_tmp[m], ic1 + m * N, N);
     }
@@ -897,7 +897,7 @@ void shared_expert_int8_kernel_impl(
     int32_t* __restrict__ C32 = reinterpret_cast<int32_t*>(C + BLOCK_M * BLOCK_N);
 
     rectangles([&](int64_t mb0, int64_t mb1, int64_t nb0, int64_t nb1) {
-      loop_2d<int8_t>(mb0, mb1, nb0, nb1, BLOCK_N * IC, [&](int64_t mb, int64_t nb, int64_t nb_offset) {
+      sgl_dense_loop(rectangles, mb0, mb1, nb0, nb1, BLOCK_N * IC, [&](int64_t mb, int64_t nb, int64_t nb_offset) {
         int64_t m_size = std::min(M - mb * BLOCK_M, BLOCK_M);
         int64_t n_size = std::min(OC - nb * BLOCK_N, BLOCK_N);
 
@@ -955,7 +955,8 @@ void shared_expert_int8_kernel_impl(
     if (use_brgemm) {
       at::native::cpublas::brgemm_release();
     }
-  });
+  }, {2 * BLOCK_M * BLOCK_N * sizeof(float), sizeof(scalar_t),
+      apply_scaling_factor ? int64_t(sizeof(scalar_t)) : 0});
 }
 
 #define INSTANTIATE_SHARED_EXPERT_INT8_TEMPLATE(TYPE) \

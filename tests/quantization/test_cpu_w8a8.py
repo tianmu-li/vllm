@@ -98,6 +98,7 @@ def test_cpu_w8a8_sgl_modes_preserve_large_prefill_generation(model, dtype, tmp_
         "flat_32x32",
         "flat_128x64",
         "flat_128x128",
+        "flat_auto",
     ):
         env["VLLM_CPU_SGL_SCHEDULER"] = mode
         result_path = tmp_path / f"{mode}.json"
