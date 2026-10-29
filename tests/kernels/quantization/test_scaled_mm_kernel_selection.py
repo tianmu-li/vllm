@@ -382,6 +382,7 @@ def test_cpu_sgl_int8_dense_schedulers_preserve_scaled_mm_result(tmp_path):
             ),
             "flat_auto": (
                 (127, 320, False, False),  # legacy below the flat-mode threshold
+                (512, 3072, False, False),  # short ownership splits M columns
                 (768, 6144, False, False),  # aligned, ungrouped wide workload
                 (768, 6176, False, False),  # N tail keeps the 32x32 base
                 (769, 6144, False, False),  # M tail keeps the 32x32 base

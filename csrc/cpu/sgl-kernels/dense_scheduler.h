@@ -72,8 +72,9 @@ struct DenseFlatGrid {
 inline SGLDenseSchedule sgl_auto_schedule(int64_t mb, int64_t nb, int64_t m,
                                           int64_t n, int64_t nth) {
   const DenseFlatGrid large(mb, nb, SGLDenseSchedule::Flat128x64);
+  const int64_t owned = large.tasks() / nth;
   if (m % 128 == 0 && n % 64 == 0 && large.eligible(m) &&
-      (large.tasks() % nth == 0 || large.tasks() / nth >= 8)) {
+      (owned >= 8 || (large.tasks() % nth == 0 && owned % large.rows == 0))) {
     return SGLDenseSchedule::Flat128x64;
   }
   return SGLDenseSchedule::Flat32;

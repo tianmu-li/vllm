@@ -3,12 +3,15 @@
 """Benchmark warm and cold CPU INT8 dense projections."""
 
 import argparse
+import ctypes
 import hashlib
 import importlib
 import json
 import math
+import mmap
 import os
 import platform
+import resource
 import statistics
 import sys
 import time
@@ -91,6 +94,11 @@ os.environ["OMP_NUM_THREADS"] = str(args.threads)
 os.environ["OMP_THREAD_LIMIT"] = str(args.threads)
 os.environ["OMP_DYNAMIC"] = "FALSE"
 os.environ["VLLM_CPU_SGL_SCHEDULER"] = args.scheduler
+TORCH_ALREADY_IMPORTED = "torch" in sys.modules
+if TORCH_ALREADY_IMPORTED and "THP_MEM_ALLOC_ENABLE" not in os.environ:
+    parser.error("set THP_MEM_ALLOC_ENABLE before Python starts")
+os.environ.setdefault("THP_MEM_ALLOC_ENABLE", "1")
+STARTUP_CPU_AFFINITY = os.sched_getaffinity(0)
 
 import torch  # noqa: E402
 
@@ -116,6 +124,239 @@ FLAT_AUTO_TEAM_NOTE = (
     "Python metadata assumes the configured thread count; the actual OpenMP "
     "team is not measured by this benchmark."
 )
+RESOURCE_USAGE_FIELDS = (
+    "ru_utime",
+    "ru_stime",
+    "ru_minflt",
+    "ru_majflt",
+    "ru_nvcsw",
+    "ru_nivcsw",
+)
+
+
+def numa_node_for_cpu(cpu):
+    node_paths = Path(f"/sys/devices/system/cpu/cpu{cpu}").glob("node[0-9]*")
+    nodes = {int(path.name.removeprefix("node")) for path in node_paths}
+    if len(nodes) != 1:
+        raise RuntimeError(f"could not identify one NUMA node for CPU {cpu}: {nodes}")
+    return nodes.pop()
+
+
+def read_smaps_mappings(address, tensor_bytes):
+    mappings = []
+    mapping = None
+    rows = Path("/proc/self/smaps").read_text().splitlines()
+    for line in rows:
+        fields = line.split(maxsplit=5)
+        if "-" in fields[0]:
+            start, end = (int(value, 16) for value in fields[0].split("-"))
+            overlap = max(0, min(end, address + tensor_bytes) - max(start, address))
+            mapping = None
+            if overlap:
+                mapping = {
+                    "range": fields[0],
+                    "name": fields[5] if len(fields) > 5 else "",
+                    "tensor_overlap_bytes": overlap,
+                }
+                mappings.append(mapping)
+            continue
+        key, _, value = line.partition(":")
+        if mapping is not None and key in (
+            "Size",
+            "Rss",
+            "KernelPageSize",
+            "MMUPageSize",
+            "AnonHugePages",
+            "ShmemPmdMapped",
+            "FilePmdMapped",
+            "THPeligible",
+            "VmFlags",
+        ):
+            mapping[key] = value.strip()
+
+    if sum(m["tensor_overlap_bytes"] for m in mappings) != tensor_bytes:
+        raise RuntimeError("the tensor range is not fully covered by /proc/self/smaps")
+    for mapping in mappings:
+        size_bytes = int(mapping["Size"].split()[0]) * 1024
+        huge_bytes = 1024 * sum(
+            int(mapping[key].split()[0])
+            for key in ("AnonHugePages", "ShmemPmdMapped", "FilePmdMapped")
+        )
+        mapping["guaranteed_tensor_huge_bytes"] = max(
+            0, huge_bytes - (size_bytes - mapping["tensor_overlap_bytes"])
+        )
+        mapping["mapping_aggregates_allocations"] = True
+    return mappings
+
+
+def read_numa_mapping(mapping_start):
+    rows = Path("/proc/self/numa_maps").read_text().splitlines()
+    for row in rows:
+        tokens = row.split()
+        if int(tokens[0], 16) == mapping_start:
+            return {
+                "policy": tokens[1],
+                "node_pages": {
+                    token.split("=", 1)[0]: int(token.split("=", 1)[1])
+                    for token in tokens[2:]
+                    if token.startswith("N") and "=" in token
+                },
+            }
+    raise RuntimeError(f"mapping {mapping_start:x} is absent from /proc/self/numa_maps")
+
+
+def memory_setup_metadata(tensor, *, expected_node, require_huge_pages):
+    tensor_bytes = tensor.numel() * tensor.element_size()
+    mappings = read_smaps_mappings(tensor.data_ptr(), tensor_bytes)
+    expected_policy = f"bind:{expected_node}"
+    for mapping in mappings:
+        mapping.update(read_numa_mapping(int(mapping["range"].split("-")[0], 16)))
+        if mapping["policy"] != expected_policy or any(
+            count
+            for node, count in mapping["node_pages"].items()
+            if node != f"N{expected_node}"
+        ):
+            raise RuntimeError("tensor mappings must be bound and resident on one node")
+    coverage = sum(m["guaranteed_tensor_huge_bytes"] for m in mappings) / tensor_bytes
+    if require_huge_pages and coverage < 0.95:
+        raise RuntimeError(
+            "the packed-weight tensor has less than 95% guaranteed huge-page "
+            "backing; start the benchmark with THP_MEM_ALLOC_ENABLE=1 and "
+            "bind its CPUs and memory to one NUMA node"
+        )
+    return {
+        "tensor_bytes": tensor_bytes,
+        "huge_page_coverage_lower_bound": coverage,
+        "mappings": mappings,
+    }
+
+
+def preload_metadata():
+    preload = os.environ.get("LD_PRELOAD", "")
+    loaded_paths = {
+        Path(row.split()[-1]).resolve()
+        for row in Path("/proc/self/maps").read_text().splitlines()
+        if len(row.split()) >= 6 and row.split()[-1].startswith("/")
+    }
+    required = ["libtcmalloc"]
+    if platform.machine().lower() in ("x86_64", "amd64"):
+        required.append("libiomp")
+    configured_paths = [Path(path) for path in preload.split(":") if path]
+    missing_configuration = [
+        library
+        for library in required
+        if not any(
+            library in path.name and path.is_absolute() and path.is_file()
+            for path in configured_paths
+        )
+    ]
+    missing = [
+        library
+        for library in required
+        if not any(
+            library in path.name and path.resolve() in loaded_paths
+            for path in configured_paths
+        )
+    ]
+    if missing or missing_configuration:
+        raise RuntimeError(
+            "CPU kernel benchmarks require absolute tcmalloc and Intel "
+            "OpenMP libraries in LD_PRELOAD before Python starts; "
+            "unloaded="
+            + ", ".join(missing)
+            + "; missing absolute paths="
+            + ", ".join(missing_configuration)
+        )
+    preload_files = []
+    for path in preload.split(":"):
+        if path and Path(path).is_file():
+            library = Path(path).resolve()
+            digest = hashlib.sha256(library.read_bytes()).hexdigest()
+            preload_files.append({"path": str(library), "sha256": digest})
+    return {
+        "environment": preload,
+        "preloaded_file_sha256": preload_files,
+        "loaded_libraries": sorted(
+            str(path)
+            for path in loaded_paths
+            if any(name in path.name for name in required)
+        ),
+    }
+
+
+def numa_setup_metadata(threads):
+    proclist = (
+        os.environ.get("KMP_AFFINITY", "").partition("proclist=[")[2].partition("]")[0]
+    )
+    cpus = set()
+    if proclist:
+        for part in proclist.split(","):
+            bounds = [int(value) for value in part.split("-")]
+            cpus.update(range(bounds[0], bounds[-1] + 1))
+    elif TORCH_ALREADY_IMPORTED:
+        raise RuntimeError(
+            "use an explicit KMP_AFFINITY proclist for staged benchmarks"
+        )
+    else:
+        cpus = STARTUP_CPU_AFFINITY
+    node_by_cpu = {cpu: numa_node_for_cpu(cpu) for cpu in cpus}
+    nodes = sorted(set(node_by_cpu.values()))
+    if len(nodes) != 1:
+        raise RuntimeError(
+            "bind the benchmark process CPUs and memory to one NUMA node; "
+            f"the current CPU affinity spans nodes {nodes}"
+        )
+    if len(cpus) < threads:
+        raise RuntimeError(
+            f"thread count {threads} exceeds CPUs in process affinity ({len(cpus)})"
+        )
+    node = nodes[0]
+    return {
+        "cpu_affinity": format_cpu_set(cpus),
+        "allowed_cpus": sorted(cpus),
+        "source": "KMP_AFFINITY proclist" if proclist else "script-entry affinity",
+        "numa_node": node,
+        "numa_policy": f"expected bind:{node} from numactl --membind",
+    }
+
+
+def resource_usage():
+    usage = resource.getrusage(resource.RUSAGE_SELF)
+    return {name: getattr(usage, name) for name in RESOURCE_USAGE_FIELDS}
+
+
+def allocate_packed_bank(shape):
+    if os.environ["THP_MEM_ALLOC_ENABLE"] != "1":
+        return torch.empty(shape, dtype=torch.int8)
+    alignment = 2 * 1024**2
+    tensor_bytes = math.prod(shape)
+    rounded_bytes = math.ceil(tensor_bytes / alignment) * alignment
+    allocation = mmap.mmap(
+        -1,
+        rounded_bytes + 2 * alignment,
+        flags=mmap.MAP_PRIVATE | mmap.MAP_ANONYMOUS,
+        prot=mmap.PROT_READ | mmap.PROT_WRITE,
+    )
+    base = ctypes.addressof(ctypes.c_char.from_buffer(allocation))
+    offset = (base + mmap.PAGESIZE + alignment - 1) // alignment * alignment - base
+    protect = ctypes.CDLL(None, use_errno=True).mprotect
+    protect.argtypes = (ctypes.c_void_p, ctypes.c_size_t, ctypes.c_int)
+    protect.restype = ctypes.c_int
+    for address, size in (
+        (base, offset),
+        (
+            base + offset + rounded_bytes,
+            len(allocation) - offset - rounded_bytes,
+        ),
+    ):
+        if protect(address, size, 0):
+            error = ctypes.get_errno()
+            raise OSError(error, os.strerror(error))
+    allocation.madvise(mmap.MADV_HUGEPAGE, offset, rounded_bytes)
+    # The tensor retains the mmap owner; guards isolate its VMA from the heap.
+    return torch.frombuffer(
+        allocation, dtype=torch.int8, count=tensor_bytes, offset=offset
+    ).reshape(shape)
 
 
 def cpu_model():
@@ -148,11 +389,20 @@ def runtime_metadata():
     with extension_path.open("rb") as library:
         for block in iter(lambda: library.read(1024 * 1024), b""):
             digest.update(block)
-    cpus = os.sched_getaffinity(0)
+    cpus = STARTUP_CPU_AFFINITY
+    master_cpus = os.sched_getaffinity(0)
+    memory_placement = numa_setup_metadata(args.threads)
+    preload = preload_metadata()
     return {
         "cpu": cpu_model(),
-        "cpu_affinity": format_cpu_set(cpus),
-        "allowed_cpus": sorted(cpus),
+        "cpu_affinity": memory_placement["cpu_affinity"],
+        "allowed_cpus": memory_placement["allowed_cpus"],
+        "script_entry_thread_affinity": format_cpu_set(cpus),
+        "master_cpu_affinity_after_thread_init": format_cpu_set(master_cpus),
+        "memory_placement": memory_placement,
+        "ld_preload": preload,
+        "thp_mem_alloc_enable": os.environ["THP_MEM_ALLOC_ENABLE"],
+        "thp_enabled": os.environ["THP_MEM_ALLOC_ENABLE"] == "1",
         "requested_threads": args.threads,
         "torch_threads": torch.get_num_threads(),
         "scheduler": args.scheduler,
@@ -203,8 +453,11 @@ def schedule_metadata(m, n, k):
             and n % 64 == 0
             and wide_task_count >= 192
             and (
-                wide_task_count % args.threads == 0
-                or wide_task_count // args.threads >= 8
+                wide_task_count // args.threads >= 8
+                or (
+                    wide_task_count % args.threads == 0
+                    and (wide_task_count // args.threads) % (m // 128) == 0
+                )
             )
         )
         selected_geometry = (
@@ -489,7 +742,7 @@ with torch.inference_mode():
 
         packed_matrix_bytes = n * (k + 4)
         depth = 1 + math.ceil(TARGET_WEIGHT_BYTES / packed_matrix_bytes)
-        packed = torch.empty((depth, n, k + 4), dtype=torch.int8)
+        packed = allocate_packed_bank((depth, n, k + 4))
         raw_first = None
 
         for start in range(0, depth, WEIGHT_CHUNK_SIZE):
@@ -504,6 +757,12 @@ with torch.inference_mode():
         packed_matrix_bytes = packed[0].numel() * packed.element_size()
         packed_bank_bytes = packed.numel() * packed.element_size()
         intervening_bytes = (depth - 1) * packed_matrix_bytes
+        thp_enabled = os.environ["THP_MEM_ALLOC_ENABLE"] == "1"
+        packed_memory = memory_setup_metadata(
+            packed,
+            expected_node=metadata["memory_placement"]["numa_node"],
+            require_huge_pages=thp_enabled,
+        )
         weight_pointers = [packed[i].data_ptr() for i in range(depth)]
         assert packed_bank_bytes == depth * packed_matrix_bytes
         assert len(set(weight_pointers)) == depth
@@ -517,6 +776,11 @@ with torch.inference_mode():
 
         for m in m_values:
             x = torch.randn(m, k).bfloat16()
+            input_memory = memory_setup_metadata(
+                x,
+                expected_node=metadata["memory_placement"]["numa_node"],
+                require_huge_pages=False,
+            )
 
             def run(weight, x=x, scales=scales):
                 return torch.ops._C.int8_scaled_mm_with_quant(
@@ -524,6 +788,11 @@ with torch.inference_mode():
                 )
 
             actual = run(packed[0])
+            output_memory = memory_setup_metadata(
+                actual,
+                expected_node=metadata["memory_placement"]["numa_node"],
+                require_huge_pages=False,
+            )
             reference_rows = min(m, 4)
             reference = (
                 x[:reference_rows].float() @ (raw_first.float() * scales[:, None]).t()
@@ -567,12 +836,20 @@ with torch.inference_mode():
             )
             assert cold_repetitions % depth == 0
             cold_samples_ms = []
+            cold_resource_deltas = []
             for _ in range(args.samples):
+                resource_before = resource_usage()
                 start_time = time.perf_counter_ns()
                 for _ in range(cold_repetitions):
                     run_cold()
-                cold_samples_ms.append(
-                    (time.perf_counter_ns() - start_time) / 1e6 / cold_repetitions
+                elapsed_ms = (time.perf_counter_ns() - start_time) / 1e6
+                cold_samples_ms.append(elapsed_ms / cold_repetitions)
+                resource_after = resource_usage()
+                cold_resource_deltas.append(
+                    {
+                        field: resource_after[field] - resource_before[field]
+                        for field in RESOURCE_USAGE_FIELDS
+                    }
                 )
 
             row = {
@@ -593,7 +870,14 @@ with torch.inference_mode():
                 "warm_repetitions_per_sample": warm_repetitions,
                 "cold_median_ms": statistics.median(cold_samples_ms),
                 "cold_samples_ms": cold_samples_ms,
+                "cold_sample_process_resource_deltas": cold_resource_deltas,
                 "correctness_relative_l2": relative_l2,
+                "memory": {
+                    "packed_weights": packed_memory,
+                    "activation": input_memory,
+                    "output": output_memory,
+                    "huge_page_target_enabled": thp_enabled,
+                },
             }
             print(row, flush=True)
             results.append(row)
