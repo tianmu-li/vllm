@@ -381,6 +381,7 @@ def test_cpu_sgl_int8_dense_schedulers_preserve_scaled_mm_result(tmp_path):
                 (3071, 1056, 64, False, False),
             ),
             "flat_auto": (
+                (0, 32, 2048, False, False),
                 (31, 96, 2048, False, True),
                 (33, 32, 4096, True, False),
                 (127, 320, 2048, False, False),
@@ -397,6 +398,11 @@ def test_cpu_sgl_int8_dense_schedulers_preserve_scaled_mm_result(tmp_path):
                 (33, 32, 4096, False, False),
                 (127, 320, 2048, False, False),
                 (129, 352, 4096, False, True),
+            ),
+            "flat_auto_wide": (
+                (256, 9216, 2048, False, True),
+                (257, 9216, 2048, True, False),
+                (768, 2048, 512, True, True),
             ),
         }[case_group]
         outputs = []
@@ -648,6 +654,16 @@ def test_cpu_sgl_int8_dense_schedulers_preserve_scaled_mm_result(tmp_path):
         "flat_auto",
     )
     for legacy, auto in zip(auto_legacy_outputs, auto_outputs, strict=True):
+        torch.testing.assert_close(legacy, auto, rtol=0, atol=0)
+
+    # Cover odd-row pipeline stages and short-K output stores at P95.
+    wide_legacy_outputs = run(
+        "legacy", 95, 95, tmp_path / "legacy-wide.pt", "flat_auto_wide"
+    )
+    wide_auto_outputs = run(
+        "flat_auto", 95, 95, tmp_path / "flat-auto-wide.pt", "flat_auto_wide"
+    )
+    for legacy, auto in zip(wide_legacy_outputs, wide_auto_outputs, strict=True):
         torch.testing.assert_close(legacy, auto, rtol=0, atol=0)
 
     # Ceiling partitions of requested worker ranks would skip 31 members of

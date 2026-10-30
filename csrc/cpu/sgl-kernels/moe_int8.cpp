@@ -750,8 +750,9 @@ void fused_experts_int8_kernel_impl(
 INSTANTIATE_MOE_INT8_TEMPLATE(at::BFloat16);
 INSTANTIATE_MOE_INT8_TEMPLATE(at::Half);
 
-template <typename scalar_t>
-void shared_expert_int8_kernel_impl(
+namespace {
+template <typename scalar_t, typename execution_t>
+void shared_expert_int8_stages(
     scalar_t* __restrict__ output,
     scalar_t* __restrict__ ic1,
     float* __restrict__ C_tmp,
@@ -766,13 +767,14 @@ void shared_expert_int8_kernel_impl(
     float routed_scaling_factor,
     int64_t M,
     int64_t N,
-    int64_t K) {
+    int64_t K,
+    const execution_t& execute) {
   // handle 2 tiles per block
   constexpr int64_t BLOCK_M = block_size_m();
   constexpr int64_t BLOCK_N = block_size_n();
 
   // stage 0: quantize input to uint8, [M, K]
-  parallel_sgl_quantize(M, [&](int64_t begin, int64_t end) {
+  execute.quantize(M, [&](int64_t begin, int64_t end) __attribute__((always_inline)) {
     for (int64_t m = begin; m < end; ++m) {
       quantize_row_int8<scalar_t>(Aq_tmp + m * K, As_tmp[m], input + m * K, K);
     }
@@ -781,8 +783,6 @@ void shared_expert_int8_kernel_impl(
   // stage 1: intermediate_cache1 = silu(hidden_states @ w1)
   const int64_t MB = div_up(M, BLOCK_M);
   const int64_t NB = div_up(N, BLOCK_N);
-
-  TORCH_CHECK(N % BLOCK_N == 0, "Fixme when N is not multiples of ", BLOCK_N);
 
   // K and N are packed for int8
   const int64_t packed_K = get_row_size<int8_t>(K);
@@ -793,7 +793,7 @@ void shared_expert_int8_kernel_impl(
   const bool apply_scaling_factor = fused_experts_out != nullptr;
 
   // here we only parallel on half of 2N to fuse silu_and_mul with gemm
-  parallel_sgl_dense(MB, NB, M, N, K, 2, [&](const auto& rectangles) {
+  execute(MB, NB, M, N, K, 2, [&](const auto& rectangles) {
     // get local pointers
     int tid = get_thread_num();
     int32_t* __restrict__ C0 = reinterpret_cast<int32_t*>(C_tmp) + tid * 2 * BLOCK_M * BLOCK_N;
@@ -873,9 +873,10 @@ void shared_expert_int8_kernel_impl(
       at::native::cpublas::brgemm_release();
     }
   }, {2 * BLOCK_M * BLOCK_N * sizeof(int32_t), sizeof(scalar_t)});
+  execute.barrier();
 
   // stage 1.5: quantize ic1 to uint8, [M, N]
-  parallel_sgl_quantize(M, [&](int64_t begin, int64_t end) {
+  execute.quantize(M, [&](int64_t begin, int64_t end) __attribute__((always_inline)) {
     for (int64_t m = begin; m < end; ++m) {
       quantize_row_int8<scalar_t>(Aq_tmp + m * N, As_tmp[m], ic1 + m * N, N);
     }
@@ -890,7 +891,7 @@ void shared_expert_int8_kernel_impl(
   const int64_t stride_oc = packed_N;
 
   // parallel on [MB2, NB2]
-  parallel_sgl_dense(MB2, NB2, M, OC, IC, 1, [&](const auto& rectangles) {
+  execute(MB2, NB2, M, OC, IC, 1, [&](const auto& rectangles) {
     // get local pointers
     int tid = get_thread_num();
     float* __restrict__ C = C_tmp + tid * 2 * BLOCK_M * BLOCK_N;
@@ -957,6 +958,40 @@ void shared_expert_int8_kernel_impl(
     }
   }, {2 * BLOCK_M * BLOCK_N * sizeof(float), sizeof(scalar_t),
       apply_scaling_factor ? int64_t(sizeof(scalar_t)) : 0});
+}
+}  // namespace
+
+template <typename scalar_t>
+void shared_expert_int8_kernel_impl(
+    scalar_t* __restrict__ output,
+    scalar_t* __restrict__ ic1,
+    float* __restrict__ C_tmp,
+    uint8_t* __restrict__ Aq_tmp,
+    float* __restrict__ As_tmp,
+    const scalar_t* __restrict__ input,
+    const int8_t* __restrict__ packed_w1,
+    const int8_t* __restrict__ packed_w2,
+    const float* __restrict__ w1s,
+    const float* __restrict__ w2s,
+    const scalar_t* __restrict__ fused_experts_out,
+    float routed_scaling_factor,
+    int64_t M,
+    int64_t N,
+    int64_t K) {
+  TORCH_CHECK(N % block_size_n() == 0,
+             "Fixme when N is not multiples of ", block_size_n());
+  auto run = [&](const auto& execute) {
+    shared_expert_int8_stages(output, ic1, C_tmp, Aq_tmp, As_tmp, input,
+                             packed_w1, packed_w2, w1s, w2s, fused_experts_out,
+                             routed_scaling_factor, M, N, K, execute);
+  };
+  if (sgl_dense_schedule() == SGLDenseSchedule::Legacy) {
+    run(DenseLegacyExecution{});
+  } else if (sgl_auto_pipeline(M)) {
+    parallel_sgl_auto_team(run);
+  } else {
+    run(DenseParallelExecution{});
+  }
 }
 
 #define INSTANTIATE_SHARED_EXPERT_INT8_TEMPLATE(TYPE) \

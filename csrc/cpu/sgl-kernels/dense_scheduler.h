@@ -477,7 +477,7 @@ inline bool sgl_auto_is_uniform(const DenseAutoPlan& plan,
   if (plan.workers != team || problem.m % 32 != 0 || problem.n % 32 != 0) {
     return false;
   }
-  const bool m_fast = plan.ownership == DenseOwnership::MFast;
+  const bool m_fast = (plan.ownership == DenseOwnership::MFast);
   if (m_fast
           ? plan.nb % team != 0
           : plan.mb % plan.group_m != 0 || plan.nb % plan.group_n != 0 ||
@@ -492,6 +492,43 @@ inline bool sgl_auto_is_uniform(const DenseAutoPlan& plan,
          get_cache_blocks<int8_t>(32 * problem.k * problem.panels) >= width;
 }
 
+inline DenseScheduleProblem sgl_auto_problem(int64_t mb, int64_t nb, int64_t m,
+                                             int64_t n, int64_t k,
+                                             int64_t panels,
+                                             DenseScheduleFootprint footprint) {
+  if (!footprint.cache_bytes) {
+    footprint.cache_bytes = cpu_utils::get_available_l2_size();
+  }
+  if (!footprint.l1_bytes) {
+    static const int64_t l1_bytes = [] {
+      const auto caps = at::cpu::get_cpu_capabilities();
+      const auto found = caps.find("l1d_cache_size");
+      return found == caps.end() ? int64_t{0} : found->second.toInt();
+    }();
+    footprint.l1_bytes = l1_bytes;
+  }
+  return {mb, nb, m, n, k, panels, footprint};
+}
+
+template <typename func_t>
+inline void sgl_auto_worker(const DenseScheduleProblem& problem, int64_t team,
+                            int64_t worker, const func_t& f) {
+  const auto plan = DenseAutoPlan::make(problem, team);
+  if (sgl_auto_is_uniform(plan, problem, team)) {
+    const bool m_fast = (plan.ownership == DenseOwnership::MFast);
+    const int64_t height = m_fast ? problem.mb : plan.group_m;
+    const int64_t width = m_fast ? problem.nb / team : plan.group_n;
+    const int64_t columns = problem.nb / width;
+    const int64_t m0 = (worker / columns) * height;
+    const int64_t n0 = (worker % columns) * width;
+    const DenseAutoUniformWorker rectangles{{plan, problem, worker},
+                                            {m0, m0 + height, n0, n0 + width}};
+    sgl_auto_uniform_worker(rectangles, f);
+  } else {
+    f(DenseAutoWorker{plan, problem, worker});
+  }
+}
+
 template <typename func_t>
 __attribute__((noinline)) void parallel_sgl_dense(
     int64_t mb, int64_t nb, int64_t m, int64_t n, int64_t k, int64_t panels,
@@ -502,41 +539,16 @@ __attribute__((noinline)) void parallel_sgl_dense(
     return;
   }
   if (selected == SGLDenseSchedule::FlatAuto) {
-    if (!footprint.cache_bytes) {
-      footprint.cache_bytes = cpu_utils::get_available_l2_size();
-    }
-    if (!footprint.l1_bytes) {
-      static const int64_t l1_bytes = [] {
-        const auto caps = at::cpu::get_cpu_capabilities();
-        const auto found = caps.find("l1d_cache_size");
-        return found == caps.end() ? int64_t{0} : found->second.toInt();
-      }();
-      footprint.l1_bytes = l1_bytes;
-    }
-    const DenseScheduleProblem problem{mb, nb, m, n, k, panels, footprint};
+    const auto problem = sgl_auto_problem(mb, nb, m, n, k, panels, footprint);
 #if defined(_OPENMP)
   #pragma omp parallel num_threads(at::get_num_threads())
     {
       const int64_t team = omp_get_num_threads();
       const int64_t worker = omp_get_thread_num();
-      const auto plan = DenseAutoPlan::make(problem, team);
-      if (sgl_auto_is_uniform(plan, problem, team)) {
-        const bool m_fast = plan.ownership == DenseOwnership::MFast;
-        const int64_t height = m_fast ? mb : plan.group_m;
-        const int64_t width = m_fast ? nb / team : plan.group_n;
-        const int64_t columns = nb / width;
-        const int64_t m0 = (worker / columns) * height;
-        const int64_t n0 = (worker % columns) * width;
-        const DenseAutoUniformWorker rectangles{
-            {plan, problem, worker}, {m0, m0 + height, n0, n0 + width}};
-        sgl_auto_uniform_worker(rectangles, f);
-      } else {
-        f(DenseAutoWorker{plan, problem, worker});
-      }
+      sgl_auto_worker(problem, team, worker, f);
     }
 #else
-    const auto plan = DenseAutoPlan::make(problem, 1);
-    f(DenseAutoWorker{plan, problem, 0});
+    sgl_auto_worker(problem, 1, 0, f);
 #endif
     return;
   }
@@ -608,6 +620,98 @@ __attribute__((noinline)) void parallel_sgl_dense(
   }
 #else
   f([&](const auto& rectangle) { rectangle(0, mb, 0, nb); });
+#endif
+}
+
+struct DenseParallelExecution {
+  template <typename func_t>
+  void quantize(int64_t rows, const func_t& f) const {
+    parallel_sgl_quantize(rows, f);
+  }
+
+  template <typename func_t>
+  void operator()(int64_t mb, int64_t nb, int64_t m, int64_t n, int64_t k,
+                  int64_t panels, const func_t& f,
+                  DenseScheduleFootprint footprint) const {
+    parallel_sgl_dense(mb, nb, m, n, k, panels, f, footprint);
+  }
+
+  void barrier() const {}
+};
+
+struct DenseLegacyExecution {
+  template <typename func_t>
+  void quantize(int64_t rows, const func_t& f) const {
+    at::parallel_for(0, rows, 0, f);
+  }
+
+  template <typename func_t>
+  void operator()(int64_t mb, int64_t nb, int64_t, int64_t, int64_t, int64_t,
+                  const func_t& f, DenseScheduleFootprint) const {
+    if (mb == 0 || nb == 0) {
+      return;
+    }
+    parallel_2d(mb, nb, [&](int64_t m0, int64_t m1, int64_t n0, int64_t n1) {
+      f([&](const auto& rectangle) { rectangle(m0, m1, n0, n1); });
+    });
+  }
+
+  void barrier() const {}
+};
+
+struct DenseAutoExecution {
+  int64_t team, worker;
+
+  template <typename func_t>
+  void quantize(int64_t rows, const func_t& f) const {
+    const int64_t quotient = rows / team;
+    const int64_t remainder = rows % team;
+    const int64_t begin = worker * quotient + std::min(worker, remainder);
+    const int64_t end = begin + quotient + (worker < remainder);
+    if (begin < end) {
+      at::internal::ThreadIdGuard thread_guard(worker);
+      c10::ParallelGuard parallel_guard(true);
+      f(begin, end);
+    }
+    barrier();
+  }
+
+  template <typename func_t>
+  void operator()(int64_t mb, int64_t nb, int64_t m, int64_t n, int64_t k,
+                  int64_t panels, const func_t& f,
+                  DenseScheduleFootprint footprint) const {
+    if (mb != 0 && nb != 0) {
+      const auto problem = sgl_auto_problem(mb, nb, m, n, k, panels, footprint);
+      sgl_auto_worker(problem, team, worker, f);
+    }
+  }
+
+  void barrier() const {
+#if defined(_OPENMP)
+  #pragma omp barrier
+#endif
+  }
+};
+
+inline bool sgl_auto_pipeline(int64_t rows) {
+#if defined(_OPENMP)
+  at::internal::lazy_init_num_threads();
+  return sgl_dense_schedule() == SGLDenseSchedule::FlatAuto && rows > 1 &&
+         !at::in_parallel_region() && at::get_num_threads() > 1;
+#else
+  return false;
+#endif
+}
+
+template <typename func_t>
+inline void parallel_sgl_auto_team(const func_t& f) {
+#if defined(_OPENMP)
+  #pragma omp parallel num_threads(at::get_num_threads())
+  {
+    f(DenseAutoExecution{omp_get_num_threads(), omp_get_thread_num()});
+  }
+#else
+  f(DenseAutoExecution{1, 0});
 #endif
 }
 

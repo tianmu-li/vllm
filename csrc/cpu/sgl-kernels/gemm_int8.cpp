@@ -288,7 +288,7 @@ void tinygemm_kernel(
   }
 }
 
-template <typename scalar_t>
+template <typename scalar_t, typename execution_t = DenseParallelExecution>
 void int8_scaled_mm_kernel_impl(
     scalar_t* __restrict__ out,
     const uint8_t* __restrict__ mat1,
@@ -298,7 +298,8 @@ void int8_scaled_mm_kernel_impl(
     const float* __restrict__ bias,
     int64_t M,
     int64_t N,
-    int64_t K) {
+    int64_t K,
+    const execution_t& execute = {}) {
   constexpr int64_t BLOCK_M = block_size_m();
   constexpr int64_t BLOCK_N = block_size_n();
   const int64_t MB = div_up(M, BLOCK_M);
@@ -310,7 +311,7 @@ void int8_scaled_mm_kernel_impl(
   const int64_t packed_row_size = get_row_size<int8_t>(K);
 
   AT_DISPATCH_BOOL(bias != nullptr, has_bias, [&] {
-    parallel_sgl_dense(MB, NB, M, N, K, 1, [&](const auto& rectangles) {
+    execute(MB, NB, M, N, K, 1, [&](const auto& rectangles) {
       // for brgemm, use int32_t for accumulate
       alignas(64) int32_t Ctmp[BLOCK_M * BLOCK_N];
 
@@ -527,13 +528,13 @@ at::Tensor int8_scaled_mm_with_quant(
     float* __restrict__ As_data = (float*)((void*)(Aq_data + M * K));
     const scalar_t* __restrict__ A_data = mat1.data_ptr<scalar_t>();
 
-    parallel_sgl_quantize(M, [&](int64_t begin, int64_t end) {
-      for (int64_t m = begin; m < end; ++m) {
-        quantize_row_int8<scalar_t>(Aq_data + m * K, As_data[m], A_data + m * lda, K);
-      }
-    });
-
-    int8_scaled_mm_kernel_impl<scalar_t>(
+    auto run = [&](const auto& execute) {
+      execute.quantize(M, [&](int64_t begin, int64_t end) __attribute__((always_inline)) {
+        for (int64_t m = begin; m < end; ++m) {
+          quantize_row_int8<scalar_t>(Aq_data + m * K, As_data[m], A_data + m * lda, K);
+        }
+      });
+      int8_scaled_mm_kernel_impl<scalar_t>(
         out.data_ptr<scalar_t>(),
         Aq_data,
         packed_w.data_ptr<int8_t>(),
@@ -542,7 +543,16 @@ at::Tensor int8_scaled_mm_with_quant(
         bias_data,
         M,
         N,
-        K);
+        K,
+        execute);
+    };
+    if (sgl_dense_schedule() == SGLDenseSchedule::Legacy) {
+      run(DenseLegacyExecution{});
+    } else if (sgl_auto_pipeline(M)) {
+      parallel_sgl_auto_team(run);
+    } else {
+      run(DenseParallelExecution{});
+    }
   });
   return out;
 }

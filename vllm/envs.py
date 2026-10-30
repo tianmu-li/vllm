@@ -909,10 +909,10 @@ environment_variables: dict[str, Callable[[], Any]] = {
         else None
     ),
     # (Experimental CPU backend only) scheduling for dense SGL INT8 projections
-    # and native shared experts. flat_auto balances 32x32 output blocks across
-    # the actual OpenMP team for every nonempty GEMM. M-fast or block-major
-    # ownership uses L2 capacity; stationary strips use a conservative half-L2
-    # active window. Performance/model qualification is pending. Restart after changes.
+    # and native shared experts. flat_auto uses the actual OpenMP team, with
+    # balanced 32x32 blocks and L2-based ownership.
+    # Stationary strips use a conservative half-L2 active window. Fused stages
+    # reuse one team. Performance qualification is pending. Restart after changes.
     "VLLM_CPU_SGL_SCHEDULER": lambda: os.getenv("VLLM_CPU_SGL_SCHEDULER", ""),
     # (CPU backend only) whether vLLM is running in a CI environment.
     "VLLM_CPU_CI_ENV": lambda: bool(int(os.getenv("VLLM_CPU_CI_ENV", "0"))),

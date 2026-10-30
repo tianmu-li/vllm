@@ -165,6 +165,8 @@ VLLM_USE_PRECOMPILED=1 VLLM_PRECOMPILED_WHEEL_VARIANT=cpu VLLM_TARGET_DEVICE=cpu
 
     Uniform ownership uses a direct rectangle and the existing tile loop when each actual worker owns one blocked group, or a full M range with equal contiguous N widths. This requires full M/N tiles, a weight-stationary traversal spanning the region's full N width, and a width within the existing loop's cache limit. The fast path preserves each worker's region, tile order, and arithmetic.
 
+    Non-nested, multithreaded fused operations with more than one input row reuse one OpenMP team across quantization and GEMM. Native shared experts use barriers between input quantization, gate/up, intermediate quantization, and down; activation quantization still balances rows across the actual team.
+
     The `flat_auto` cache budget assumes one OpenMP worker per physical core. It remains experimental, with performance and model qualification pending: qualify cold-kernel latency and generation output on the intended model, shapes, core binding, and NUMA placement before deployment.
 - `CPU_VISIBLE_MEMORY_NODES`: specify visible NUMA memory nodes for vLLM CPU workers, similar to ```CUDA_VISIBLE_DEVICES```. The variable only takes effect when VLLM_CPU_OMP_THREADS_BIND is set to `auto`. The variable provides more control for the auto thread-binding feature, such as masking nodes and changing nodes binding sequence.
 - `VLLM_ZENTORCH_WEIGHT_PREPACK` (AMD Zen only): when `ZenCpuPlatform` is active, eagerly prepack linear weights into ZenDNN's blocked layout at model load time, eliminating per-inference layout conversion overhead. Default is `1` (enabled). See [AMD Zen optimizations](#amd-zen-optimizations).
