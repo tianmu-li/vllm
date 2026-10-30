@@ -1,6 +1,263 @@
 # Full-K CPU INT8 single-shape experiment
 
-## Current result: minimize the b23 implementation (2026-10-30)
+## Current result: bounded 200-TOPS investigation (2026-10-30)
+
+**200 cold full-operator TOPS was not reached.** The retained partial improvement
+measures **2.534940 ms / 162.65 cold TOPS**, compared with **2.564961 ms / 160.75
+TOPS** for the contemporaneous committed control. The paired geometric cold
+latency change is **−1.099%**, with a process-bootstrap 95% interval of
+**[−1.279%, −0.905%]**. It passes the preselected partial-improvement gate:
+aggregate candidate median at least 1% lower than baseline, and paired upper
+95% bound below zero. None of the five candidate process medians meets the
+200-TOPS threshold of **2.06158430208 ms**.
+
+The source baseline is commit `2782ac44fa79edc1b824eba1d7429fddd50af97b`.
+Acceptance still measures the complete fused operator, including allocation,
+unchanged row quantization, compensation, scaling, BF16 conversion, streaming
+stores and fence. The protocol uses physical CPUs 96–191 on NUMA node 1,
+96 actual workers, explicit Intel OpenMP/tcmalloc preload, performance governor
+and EPP verified before and after, 33 packed-weight banks with verified 100%
+huge-page backing, and more than 1.5 GiB of intervening packed weights.
+Tests, builds and model checks use node 0. No outliers or samples were excluded.
+
+### Retained implementation
+
+Each worker has two aligned 4 KiB INT32 result buffers. While computing the
+next 32×32 tile's first eight K64 steps, it converts and streams four rows of
+the previous result after each step. Compensation and channel scale/bias
+vectors are loaded once for that previous tile. The current tile accumulates
+all 4096 K elements before its four INT32 stores. The final pending tile is
+drained before tile release and the existing output fence.
+
+The change retains the public N32 weight format, 4160-byte activation rows,
+fourfold K64 unrolling, ordinary operand tile loads, 256×2048 exclusive worker
+ownership and existing window traversal. Quantization, arithmetic order,
+Linux tile permission, backend-state reset, exact shape/96-actual-worker guard,
+opt-in interface, defaults and fallback behavior are unchanged. No serial
+K blocking, software prefetch, quantization rewrite, heap workspace or
+production tuning controls were retained.
+
+Generated-code inspection confirms one first tile, 511 tiles with pending
+epilogues, and one final drain per worker. Per output microtile, AMX work
+remains 128 A loads, 128 B loads, 256 INT8 dots and four final INT32 stores.
+There are no intermediate accumulator stores/reloads or ZMM/YMM stack spills
+in the inspected functions. The compiler naturally inlines the new tile
+helper; the baseline had a helper call and 4 KiB frame setup per microtile.
+The selected no-bias GEMM symbol is 4713 bytes, versus 2013 bytes for the
+serial-pending comparison. Register assignment, loop splitting and four-row
+epilogue unrolling also change. Timing therefore establishes the benefit of
+the selected implementation, rather than isolating hardware overlap alone.
+
+### Final qualification
+
+Five alternating candidate/current-baseline fresh-process pairs each contain
+five cold and five warm samples, with a frozen legacy process interleaved in
+every pair. Warm and downstream-consumption diagnostics do not determine
+standalone cold acceptance.
+
+| Pair | Candidate cold ms | Baseline cold ms | Legacy cold ms |
+| --- | ---: | ---: | ---: |
+| 1 | 2.534940 | 2.562784 | 3.199805 |
+| 2 | 2.529366 | 2.565054 | 3.279526 |
+| 3 | 2.532892 | 2.564961 | 3.212580 |
+| 4 | 2.541543 | 2.567402 | 3.242023 |
+| 5 | 2.535779 | 2.555097 | 3.239673 |
+
+Candidate process-median SD is **0.004460 ms**; process medians span
+2.529366–2.541543 ms. Individual cold samples span 2.525000–2.562013 ms.
+Aggregate warm medians are **2.270194 ms** for candidate and **2.297118 ms**
+for baseline, a **1.172% decrease** in their ratio. An earlier independent
+five-pair cohort also passed the partial gate: 2.536884 ms, paired
+−0.977% [−1.310%, −0.679%]. Its statistics are retained separately.
+
+### Bounded experiments and selection
+
+**43 of 48 allowed timed optimization variants** were screened, each using five
+cold samples and full-output frozen-legacy verification before timing.
+The archive's `screening_summary.json` contains every variant's raw cold/warm
+samples and binary hash; all negative results remain available. These screening
+medians are conditional comparisons, not independent additive effects or
+familywise confidence estimates. Within 1%, selection prefers fewer
+mechanisms, then less scratch, then no prefetch.
+
+| Family / representative | Variants | Cold ms | Warm ms | Decision |
+| --- | ---: | ---: | ---: | --- |
+| Original serial-K macroblock matrix | 23 | Best 2.612598 | 2.425328 | All slower than committed baseline |
+| K2048 follow-up | 3 | Best 2.735630 | 2.520185 | Rejected |
+| Compact C stride, best K1024 shape | 2 | 2.609670 | 2.448302 | Rejected |
+| Cached epilogue, best K1024 shape | 2 | 2.589318 | 2.441799 | Rejected |
+| Interleaved epilogue, best K1024 shape | 2 | 2.543644 | 2.351199 | Within 1%; more scratch than full-K |
+| Sparse T1/T0 prefetch on K-overlap | 3 | Best 2.532989 | 2.353817 | Within 1%; more mechanisms/scratch |
+| Full-K cached epilogue | 1 | 2.573393 | 2.304968 | Repeated cold comparison regressed |
+| Full-K interleaved epilogue | 1 | 2.533964 | 2.269488 | Selected for final rebuild |
+| Full-K helper forced inline | 1 | 2.562271 | 2.309524 | No material screening benefit |
+| Two buffers, serial pending epilogue | 1 | 2.583161 | 2.310181 | Rejected |
+| Explicit rounding / two-way quantization unroll | 2 | Best 2.572696 | 2.294951 | Rejected |
+| Overlap plus those quantization changes | 2 | Best 2.529888 | 2.260226 | Within 1%; omit quantization change |
+
+Serial-K experiments span M macroblocks 128/256, N macroblocks
+128/256/512/1024 and K blocks 256/512/1024, excluding a footprint above the
+1792 KiB screening budget; three K2048 shapes were added. They keep the
+existing ownership and packing, load/store partial INT32 sums privately,
+and compensate/scale only after full K. C stride is N-macroblock plus 16
+INT32 elements except in the compact-stride ablation. Base workspace ranges
+from 6.75 MiB to 97.5 MiB. The best K-overlap needs 13.5 MiB plus alignment
+reserve, versus 8 KiB of result buffers per worker in the selected full-K
+implementation. Sparse prefetch tests issue eight evenly spaced cache lines
+for valid future N32/K64 panels, with T1 lookahead 128/256 or T0 lookahead 256.
+
+The full-K cached-epilogue variant also has an archived five-pair comparison:
+paired cold change **+0.252% [+0.039%, +0.497%]**. It was not retained.
+The serial-pending ablation holds buffering and channel-vector caching but
+changes generated loop layout/unrolling along with epilogue placement.
+No causal claim rests on subtracting these screening medians.
+
+### Roofline and phase analysis
+
+The socket-0 side experiment's 216–242 TOPS bandwidth estimate is arithmetically
+consistent with its assumed 954 MB of cold cache-response traffic and
+500–560 GB/s service rate. That traffic includes quantization-associated reads,
+but the estimate does not model quantization execution/dependencies, allocation,
+compensation, BF16 output, barriers or AMX setup/release. Its shared-operand probe
+uses about 67.4 MB of warm operands in 71.3 MB of mapped backing,
+runtime K-tail checks, `std::thread`, another
+socket and different observed clocks. Sequential LLC/DRAM bandwidth and
+dependent-load latency measurements characterize those access patterns;
+they do not identify an LLC-slice bottleneck or predict cold operator timing.
+At 200 TOPS, that assumed traffic alone takes 1.908 ms at 500 GB/s or
+1.704 ms at 560 GB/s, leaving 153–358 µs for other work.
+
+Source-matched reduced diagnostics provide a closer comparison:
+
+| Timed work | Cold ms | Warm ms |
+| --- | ---: | ---: |
+| Integer AMX loop, quantization prepared outside timing | 1.865904 | 1.527101 |
+| Integer loop plus real output epilogue/allocation/stores/fence | 2.038841 | 1.710131 |
+
+These are diagnostic builds, never acceptance builds. The second row is not
+an epilogue-only measurement. Subtracting the rows is an unpaired marginal
+difference that includes allocation, output stores and changed generated code.
+The reduced integer loop still stores INT32 results and reads a scalar from each tile;
+the real-epilogue variant uses the production worker and timed output
+allocation/free. Their cache preparation differs from the complete operator.
+
+Separately instrumented baseline critical-path intervals reconstruct a median
+**2.559147 ms** cold call, with **0.520342 ms** outside the critical GEMM path
+and **2.040887 ms** on that GEMM path. Last quantization completion is about
+0.505558 ms; worker finish spread is about 0.174436 ms. Per-call reconstruction
+sums correctly. Independent worker-phase maxima or medians must not be added:
+they can belong to different workers/calls and overcount the critical path.
+Instrumentation is excluded from qualification.
+
+Holding that non-GEMM cost fixed would leave only **1.541242 ms** for GEMM at
+200 TOPS, requiring roughly 24.5% less GEMM time. This is an illustrative
+budget, not an attainable-performance prediction. Quantization variants in
+this bounded iteration failed to improve cold operator latency materially.
+
+For the best serial-K overlap, separate whole-operator counters showed
+cache-response traffic **1009.75 versus 937.63 MB/call**, and L2-miss stall
+cycles **201.49 versus 187.64 million/call**. Core-group total cycles were
+essentially unchanged; the candidate's effective clock was about 0.84% higher.
+Its small timing gain does not establish reduced cache delivery work.
+Under fixed ownership, the logical B payload participation is about 805 MB
+per call. This is not a physical LLC/DRAM traffic floor: cache residency,
+request merging and shared sources affect hardware events.
+
+The previous source-matched BRGEMM inspection remains below. Its equal AMX
+operand counts, streaming B-load hint, scratch prefetch, dispatch/allocation
+costs and larger generated bodies remain relevant; this iteration does not
+remeasure or add those earlier effects to the new overlap gain.
+
+### Selected implementation counters and output consumption
+
+Nine counter groups ran separately for candidate and committed baseline,
+with measurement-window FIFO controls, five cold samples per process and
+100% event scheduling coverage. Counts below are aggregate counts divided by
+timed calls; MB means decimal MB. Line-event traffic is not distinct data.
+Fractions use each group's own measured cycles and may overlap.
+
+| Metric / group | Candidate per call | Baseline per call |
+| --- | ---: | ---: |
+| Execution cycles / core | 727.675 million | 735.718 million |
+| AMX-busy cycles / core | 201.363 million (27.67%) | 201.360 million (27.37%) |
+| Load-bound cycles / core | 505.068 million (69.41%) | 518.820 million (70.52%) |
+| Active clock from cycles/ref-cycles × 2.4 GHz / core | 2.9537 GHz | 2.9529 GHz |
+| L2-miss stall cycles / stalls | 194.233 million (26.68%) | 186.577 million (25.46%) |
+| L3-miss stall cycles / stalls | 9.339 million (1.28%) | 7.599 million (1.04%) |
+| L1-miss stall cycles / l1 | 424.439 million (58.33%) | 425.059 million (57.81%) |
+| L1 replacement line events / l1 | 213.202 million | 213.516 million |
+| L2 fills / cache | 1011.174 MB | 1005.015 MB |
+| Socket-cache response reads / cache | 949.262 MB | 942.984 MB |
+| Local-DRAM response reads / cache | 53.414 MB | 53.489 MB |
+| L2 demand hit events / l2 | 145.822 million | 137.735 million |
+| L2 demand miss events / l2 | 1.133 million | 1.083 million |
+| L2 RFO hit events / l2 | 3.277 million | 2.372 million |
+| L2 RFO miss events / l2 | 168,953 | 168,517 |
+| DTLB load-walk cycles / dtlb_load | 94,225 (0.013%) | 116,370 (0.016%) |
+| DTLB store-walk cycles / dtlb_store | 94,514 (0.013%) | 108,350 (0.015%) |
+| Frontend zero-delivery cycles / frontend | 1.361 million (0.187%) | 1.420 million (0.192%) |
+| Socket IMC reads / memory | 64.256 MB | 63.758 MB |
+| Socket IMC writes / memory | 105.142 MB | 104.812 MB |
+
+Absolute load-bound cycles fall **2.651%**, with core-group active-clock difference
+only about 0.026%. The narrower statement that this measured load-bound
+counter decreased is supported. Cache-response bytes do not fall, and
+L2/L3-miss stall cycles increase. L1 stall fraction increases even though
+absolute L1 stall cycles decrease slightly. These events do not establish
+reduced operand traffic, a general reduction in every load-stall counter,
+or LLC-slice contention. AMX-busy cycles are essentially unchanged.
+Page-walk and frontend counters remain small. IMC traffic includes socket
+background activity and uses perf's scaled units.
+
+An independent diagnostic immediately sums all 50,331,648 BF16 output
+elements into FP32 after each operator call. It retains both streaming stores
+and their fence and runs without perf. Candidate versus baseline medians are
+**3.185526 versus 3.219791 ms cold**, and **2.964547 versus 2.988933 ms warm**.
+This single-process diagnostic shows no regression for that consumer, but
+does not characterize every downstream operator or enter acceptance timing.
+
+### Correctness and validation
+
+Every screened variant and the rebuilt selected binary match all
+50,331,648 output elements exactly against seeded frozen legacy, both with
+bias and without bias, with unequal channel scales and unchanged inputs.
+The nearest scaled-MM suite passed **26 tests**, with two existing Swig
+deprecation warnings, in 301.01 seconds. Its fresh process verifies the
+selected extension SHA/path and both preloads without pre-initializing AMX.
+Coverage includes actual-team fallback, mismatched shapes, strided BF16 input,
+quantization boundaries/zero rows, unequal scales, bias/no-bias, first direct
+execution and direct/BRGEMM alternation. No new tests or helpers were needed.
+
+The existing offline cached RedHatAI Llama-3.1-8B W8A8 generation comparison
+passed: legacy and `single_shape` produce identical greedy token IDs for
+two prompts, 32 tokens each. Both processes use the selected extension.
+With six actual workers and model shapes outside the specialization, this
+checks serving fallback only. All test/model children and measurement
+drivers completed successfully and were reaped.
+
+Applicable pre-commit hooks pass on the changed C++ source, rendered CPU
+documentation and this report; `git diff --check` also passes.
+
+### Reproduction and provenance
+
+The persistent archive is
+`/home/tianmuli/vllm_test/snc_scaling_analysis/single_shape_200_2782ac44fa_20261030`.
+Its `ARCHIVE.md` documents host dependencies, path substitution and replay.
+It contains all 43 variant sources/build metadata/binaries, frozen controls
+and reference tensors, raw qualification samples, phase and counter runs,
+bounded disassembly, side-roofline sources/results, validation and check logs.
+All 44 external link inputs are archived by SHA256. Temporary tuning and
+diagnostic controls remain outside production.
+
+| Artifact | SHA256 |
+| --- | --- |
+| Baseline GEMM source | `065df2fd698383aaa7c93e7fd8eb2b33a246ef13be8ea91878f0b912138f1a67` |
+| Selected GEMM source | `a9b0d9909462a2af203327aa80ae65a06ee7e3f1af49d78a66828d8b6970805e` |
+| Frozen committed extension | `d61b9abb2b1ca7844b0a9c22096d4038af04786180d88af75ad242382a1b5a34` |
+| Rebuilt selected extension | `a1888f1c9e406212164a03f4b8657ebcf6365f6f66f25c826c2f63188b6eba67` |
+| Frozen legacy extension | `0988f8960179ecdcbc5d17e866d524ccd532b2edb4842e5121021dbbfe778a1d` |
+
+## Previous result: minimize the b23 implementation (2026-10-30)
 
 The simplified implementation qualifies at **2.561864 ms / 160.94 cold TOPS**.
 All five fresh-process medians are below **2.57698038 ms**. Relative to the

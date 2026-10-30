@@ -387,21 +387,72 @@ struct alignas(64) Int8TileConfig {
   }
 };
 
-template <bool has_bias>
+struct SingleShapePending {
+  at::BFloat16* out = nullptr;
+  const int8_t* B = nullptr;
+  const int32_t* C = nullptr;
+  const float* As = nullptr;
+  const float* Bs = nullptr;
+  const float* bias = nullptr;
+};
+
+template <bool has_bias, bool has_pending>
 void single_shape_tile(
-    at::BFloat16* __restrict__ out,
     const uint8_t* __restrict__ A,
     const int8_t* __restrict__ B,
-    const float* __restrict__ As,
-    const float* __restrict__ Bs,
-    const float* __restrict__ bias) {
-  alignas(64) int32_t Ctmp[32 * 32];
+    int32_t* __restrict__ Ctmp,
+    const SingleShapePending& pending) {
   constexpr int64_t K = 4096, N = 12288;
+  __m512 scale0, scale1, bias0, bias1;
+  __m512i comp0, comp1;
+  if constexpr (has_pending) {
+    const auto* comp = reinterpret_cast<const int32_t*>(pending.B + 32 * K);
+    scale0 = _mm512_loadu_ps(pending.Bs);
+    scale1 = _mm512_loadu_ps(pending.Bs + 16);
+    comp0 = _mm512_loadu_si512(comp);
+    comp1 = _mm512_loadu_si512(comp + 16);
+    if constexpr (has_bias) {
+      bias0 = _mm512_loadu_ps(pending.bias);
+      bias1 = _mm512_loadu_ps(pending.bias + 16);
+    }
+  }
   _tile_zero(0);
   _tile_zero(1);
   _tile_zero(2);
   _tile_zero(3);
-  for (int64_t k0 = 0; k0 < K; k0 += 256) {
+  for (int64_t k0 = 0; k0 < 512; k0 += 256) {
+    Unroll<4>{}([&](auto u) {
+      const int64_t k = k0 + u * 64;
+      _tile_loadd(4, A + k, SINGLE_SHAPE_A_STRIDE);
+      _tile_loadd(6, B + k * 32, 128);
+      _tile_dpbusd(0, 4, 6);
+      _tile_loadd(5, A + 16 * SINGLE_SHAPE_A_STRIDE + k, SINGLE_SHAPE_A_STRIDE);
+      _tile_dpbusd(2, 5, 6);
+      _tile_loadd(7, B + k * 32 + 64, 128);
+      _tile_dpbusd(1, 4, 7);
+      _tile_dpbusd(3, 5, 7);
+      if constexpr (has_pending) {
+        Unroll<4>{}([&](auto row) {
+          const int64_t m = (k / 64) * 4 + row;
+          const __m512 row_scale = _mm512_set1_ps(pending.As[m]);
+          __m512 v0 = _mm512_cvtepi32_ps(_mm512_sub_epi32(
+              _mm512_loadu_si512(pending.C + m * 32), comp0));
+          __m512 v1 = _mm512_cvtepi32_ps(_mm512_sub_epi32(
+              _mm512_loadu_si512(pending.C + m * 32 + 16), comp1));
+          if constexpr (has_bias) {
+            v0 = _mm512_fmadd_ps(_mm512_mul_ps(v0, row_scale), scale0, bias0);
+            v1 = _mm512_fmadd_ps(_mm512_mul_ps(v1, row_scale), scale1, bias1);
+          } else {
+            v0 = _mm512_mul_ps(_mm512_mul_ps(v0, row_scale), scale0);
+            v1 = _mm512_mul_ps(_mm512_mul_ps(v1, row_scale), scale1);
+          }
+          _mm512_stream_si512(reinterpret_cast<__m512i*>(pending.out + m * N),
+              (__m512i)_mm512_cvtne2ps_pbh(v1, v0));
+        });
+      }
+    });
+  }
+  for (int64_t k0 = 512; k0 < K; k0 += 256) {
     Unroll<4>{}([&](auto u) {
       const int64_t k = k0 + u * 64;
       _tile_loadd(4, A + k, SINGLE_SHAPE_A_STRIDE);
@@ -414,16 +465,10 @@ void single_shape_tile(
       _tile_dpbusd(3, 5, 7);
     });
   }
-
   _tile_stored(0, Ctmp, 128);
   _tile_stored(1, Ctmp + 16, 128);
   _tile_stored(2, Ctmp + 16 * 32, 128);
   _tile_stored(3, Ctmp + 16 * 32 + 16, 128);
-  const auto* comp = reinterpret_cast<const int32_t*>(B + 32 * K);
-  for (int64_t m = 0; m < 32; ++m) {
-    scale_C<at::BFloat16, has_bias, 32, true>::apply(
-        out + m * N, Ctmp + m * 32, comp, bias, As[m], Bs);
-  }
 }
 
 template <bool has_bias>
@@ -436,6 +481,9 @@ void single_shape_gemm(
     const float* __restrict__ bias,
     int64_t worker) {
   constexpr int64_t K = 4096, N = 12288;
+  alignas(64) int32_t Cbuffers[2][32 * 32];
+  int buffer = 0;
+  SingleShapePending pending;
   const int64_t m0 = (worker % 16) * 256;
   const int64_t n0 = (worker / 16) * 2048;
   at::native::cpublas::brgemm_release();
@@ -447,13 +495,24 @@ void single_shape_gemm(
     for (int64_t mc = m0; mc < m0 + 256; mc += 128) {
       for (int64_t n = nc; n < nc + 64; n += 32) {
         for (int64_t m = mc; m < mc + 128; m += 32) {
-          single_shape_tile<has_bias>(
-              out + m * N + n, A + m * SINGLE_SHAPE_A_STRIDE,
-              B + n * (K + 4), As + m, Bs + n,
-              has_bias ? bias + n : nullptr);
+          if (pending.out) {
+            single_shape_tile<has_bias, true>(
+                A + m * SINGLE_SHAPE_A_STRIDE, B + n * (K + 4), Cbuffers[buffer], pending);
+          } else {
+            single_shape_tile<has_bias, false>(
+                A + m * SINGLE_SHAPE_A_STRIDE, B + n * (K + 4), Cbuffers[buffer], pending);
+          }
+          pending = {out + m * N + n, B + n * (K + 4), Cbuffers[buffer],
+                     As + m, Bs + n, has_bias ? bias + n : nullptr};
+          buffer ^= 1;
         }
       }
     }
+  }
+  const auto* comp = reinterpret_cast<const int32_t*>(pending.B + 32 * K);
+  for (int64_t m = 0; m < 32; ++m) {
+    scale_C<at::BFloat16, has_bias, 32, true>::apply(
+        pending.out + m * N, pending.C + m * 32, comp, pending.bias, pending.As[m], pending.Bs);
   }
   _tile_release();
   _mm_sfence();
