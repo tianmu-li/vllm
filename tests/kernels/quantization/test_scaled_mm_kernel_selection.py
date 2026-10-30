@@ -404,20 +404,40 @@ def test_cpu_sgl_int8_dense_schedulers_preserve_scaled_mm_result(tmp_path):
                 (257, 9216, 2048, True, False),
                 (768, 2048, 512, True, True),
             ),
+            "single_shape": (
+                (4096, 12288, 4096, False, True),
+                (4096, 12288, 4096, True, True),
+            ),
+            "single_shape_mismatch": ((4096, 12288, 64, False, True),),
         }[case_group]
         outputs = []
         for m, n, k, has_bias, is_vnni in cases:
             torch.manual_seed(m + n)
             x = torch.randn(m, k).bfloat16()
             weight = torch.randint(-30, 31, (n, k), dtype=torch.int8)
-            reference_weight = weight.float()
+            target_shape = (m, n, k) == (4096, 12288, 4096)
+            if not target_shape:
+                reference_weight = weight.float()
             if is_vnni:
                 weight = torch.ops._C.convert_weight_packed(weight)
             weight_scale = torch.rand(n, dtype=torch.float32) * 0.01
             bias = torch.rand(n, dtype=torch.float32) if has_bias else None
+            if case_group.startswith("single_shape"):
+                inputs = (x, weight, weight_scale) + (
+                    (bias,) if bias is not None else ()
+                )
+                saved_inputs = tuple(tensor.clone() for tensor in inputs)
             result = torch.ops._C.int8_scaled_mm_with_quant(
                 x, weight, weight_scale, bias, x.dtype, is_vnni
             )
+            if case_group.startswith("single_shape"):
+                for tensor, saved in zip(inputs, saved_inputs, strict=True):
+                    torch.testing.assert_close(tensor, saved, rtol=0, atol=0)
+            if target_shape:
+                # Compare every target element against legacy below, avoiding
+                # a second full-size floating-point GEMM in each subprocess.
+                outputs.append(result)
+                continue
             input_scale = x.float().abs().amax(dim=-1).clamp_min(1e-7) / 127
             qx = (x.float() / input_scale[:, None]).round().to(torch.int32)
             reference = qx.float() @ reference_weight.T
@@ -699,6 +719,32 @@ def test_cpu_sgl_int8_dense_schedulers_preserve_scaled_mm_result(tmp_path):
             auto_constrained_legacy_outputs, auto_constrained_outputs, strict=True
         ):
             torch.testing.assert_close(legacy, auto, rtol=0, atol=0)
+
+    # The exact target specializes only with 96 actual workers. A constrained
+    # team must fall back without leaving quantization rows or output tiles out.
+    for case_group, requested_threads, actual_threads in (
+        ("single_shape", 96, 96),
+        ("single_shape", 96, 2),
+        ("single_shape_mismatch", 96, 96),
+    ):
+        legacy_results = run(
+            "legacy",
+            actual_threads,
+            actual_threads,
+            tmp_path / f"legacy-{case_group}-{actual_threads}.pt",
+            case_group,
+        )
+        single_shape_results = run(
+            "single_shape",
+            requested_threads,
+            actual_threads,
+            tmp_path / f"single-shape-{case_group}-{actual_threads}.pt",
+            case_group,
+        )
+        for legacy, single_shape in zip(
+            legacy_results, single_shape_results, strict=True
+        ):
+            torch.testing.assert_close(legacy, single_shape, rtol=0, atol=0)
 
 
 @pytest.mark.skipif(

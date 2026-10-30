@@ -20,7 +20,8 @@ enum class SGLDenseSchedule {
   Flat32,
   Flat128x64,
   Flat128x128,
-  FlatAuto
+  FlatAuto,
+  SingleShape
 };
 
 inline SGLDenseSchedule sgl_dense_schedule() {
@@ -45,9 +46,13 @@ inline SGLDenseSchedule sgl_dense_schedule() {
     if (std::strcmp(value, "flat_auto") == 0) {
       return SGLDenseSchedule::FlatAuto;
     }
-    TORCH_CHECK(false, "Invalid VLLM_CPU_SGL_SCHEDULER: ", value,
-                ". Expected legacy, logical96_dense, flat_32x32, flat_128x64, "
-                "flat_128x128, or flat_auto; restart after changing it.");
+    if (std::strcmp(value, "single_shape") == 0) {
+      return SGLDenseSchedule::SingleShape;
+    }
+    TORCH_CHECK(
+        false, "Invalid VLLM_CPU_SGL_SCHEDULER: ", value,
+        ". Expected legacy, logical96_dense, flat_32x32, flat_128x64, "
+        "flat_128x128, flat_auto, or single_shape; restart after changing it.");
   }();
   return schedule;
 }
@@ -56,8 +61,9 @@ template <typename func_t>
 inline void parallel_sgl_quantize(int64_t rows, const func_t& f) {
 #if defined(_OPENMP)
   at::internal::lazy_init_num_threads();
-  if (sgl_dense_schedule() == SGLDenseSchedule::FlatAuto && rows > 1 &&
-      !at::in_parallel_region() && at::get_num_threads() > 1) {
+  if ((sgl_dense_schedule() == SGLDenseSchedule::FlatAuto ||
+       sgl_dense_schedule() == SGLDenseSchedule::SingleShape) &&
+      rows > 1 && !at::in_parallel_region() && at::get_num_threads() > 1) {
   #pragma omp parallel num_threads(at::get_num_threads())
     {
       const int64_t team = omp_get_num_threads();
@@ -538,7 +544,8 @@ __attribute__((noinline)) void parallel_sgl_dense(
   if (mb == 0 || nb == 0) {
     return;
   }
-  if (selected == SGLDenseSchedule::FlatAuto) {
+  if (selected == SGLDenseSchedule::FlatAuto ||
+      selected == SGLDenseSchedule::SingleShape) {
     const auto problem = sgl_auto_problem(mb, nb, m, n, k, panels, footprint);
 #if defined(_OPENMP)
   #pragma omp parallel num_threads(at::get_num_threads())
@@ -696,8 +703,9 @@ struct DenseAutoExecution {
 inline bool sgl_auto_pipeline(int64_t rows) {
 #if defined(_OPENMP)
   at::internal::lazy_init_num_threads();
-  return sgl_dense_schedule() == SGLDenseSchedule::FlatAuto && rows > 1 &&
-         !at::in_parallel_region() && at::get_num_threads() > 1;
+  return (sgl_dense_schedule() == SGLDenseSchedule::FlatAuto ||
+          sgl_dense_schedule() == SGLDenseSchedule::SingleShape) &&
+         rows > 1 && !at::in_parallel_region() && at::get_num_threads() > 1;
 #else
   return false;
 #endif

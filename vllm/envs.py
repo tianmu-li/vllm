@@ -913,6 +913,8 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # balanced 32x32 blocks and L2-based ownership.
     # Stationary strips use a conservative half-L2 active window. Fused stages
     # reuse one team. Performance qualification is pending. Restart after changes.
+    # single_shape specializes BF16 M=4096/N=12288/K=4096 with 96 actual workers,
+    # otherwise using flat_auto.
     "VLLM_CPU_SGL_SCHEDULER": lambda: os.getenv("VLLM_CPU_SGL_SCHEDULER", ""),
     # (CPU backend only) whether vLLM is running in a CI environment.
     "VLLM_CPU_CI_ENV": lambda: bool(int(os.getenv("VLLM_CPU_CI_ENV", "0"))),

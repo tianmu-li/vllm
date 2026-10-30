@@ -9,7 +9,7 @@
 
 namespace {
 
-template <typename scalar_t, bool has_bias, int BLOCK_N>
+template <typename scalar_t, bool has_bias, int BLOCK_N, bool stream_output = false>
 struct scale_C {
   static inline void apply(
       scalar_t* __restrict__ C,
@@ -23,8 +23,8 @@ struct scale_C {
 };
 
 #if defined(CPU_CAPABILITY_AVX512)
-template <bool has_bias, int BLOCK_N>
-struct scale_C<at::BFloat16, has_bias, BLOCK_N> {
+template <bool has_bias, int BLOCK_N, bool stream_output>
+struct scale_C<at::BFloat16, has_bias, BLOCK_N, stream_output> {
   static inline void apply(
       at::BFloat16* __restrict__ C,
       const int32_t* __restrict__ Ctmp,
@@ -55,8 +55,12 @@ struct scale_C<at::BFloat16, has_bias, BLOCK_N> {
     auto storec = [&](auto col) {
       // for COLS = 2, 4 use 512bit store
       if constexpr (col % 2 == 0) {
-        _mm512_storeu_si512(
-            reinterpret_cast<__m512i*>((C + col * 16)), (__m512i)(_mm512_cvtne2ps_pbh(vc[col + 1], vc[col + 0])));
+        const __m512i result = (__m512i)(_mm512_cvtne2ps_pbh(vc[col + 1], vc[col + 0]));
+        if constexpr (stream_output) {
+          _mm512_stream_si512(reinterpret_cast<__m512i*>(C + col * 16), result);
+        } else {
+          _mm512_storeu_si512(reinterpret_cast<__m512i*>(C + col * 16), result);
+        }
       }
     };
     Unroll<COLS>{}(storec);
@@ -210,7 +214,7 @@ struct tinygemm_kernel_nn<at::BFloat16, has_bias, BLOCK_M, BLOCK_N> {
       ldb,                                                         \
       ldc);
 
-template <typename scalar_t, bool has_bias>
+template <typename scalar_t, bool has_bias, bool stream_output = false>
 void tinygemm_kernel(
     const uint8_t* __restrict__ A,
     const int8_t* __restrict__ B,
@@ -235,7 +239,7 @@ void tinygemm_kernel(
 
     // apply compensation and scale
     for (int64_t m = 0; m < M; ++m) {
-      scale_C<scalar_t, has_bias, BLOCK_N>::apply(C + m * ldc, Ctmp + m * BLOCK_N, Bcomp, bias, As[m], Bs);
+      scale_C<scalar_t, has_bias, BLOCK_N, stream_output>::apply(C + m * ldc, Ctmp + m * BLOCK_N, Bcomp, bias, As[m], Bs);
     }
     return;
   }
@@ -345,6 +349,47 @@ void int8_scaled_mm_kernel_impl(
       }
     }, {BLOCK_M * BLOCK_N * sizeof(int32_t), sizeof(scalar_t), 0, has_bias});
   });
+}
+
+template <typename scalar_t, bool has_bias>
+void single_shape_gemm(
+    scalar_t* __restrict__ out,
+    const uint8_t* __restrict__ A,
+    const int8_t* __restrict__ B,
+    const float* __restrict__ As,
+    const float* __restrict__ Bs,
+    const float* __restrict__ bias,
+    int64_t worker) {
+  constexpr int64_t PARTITIONS_M = 16;
+  constexpr int64_t BLOCK_M = 128;
+  constexpr int64_t BLOCK_N = block_size_n();
+  constexpr int64_t WINDOW_N = 64;
+  constexpr int64_t K = 4096;
+  constexpr int64_t N = 12288;
+  constexpr int64_t ROWS = 4096 / PARTITIONS_M;
+  constexpr int64_t COLUMNS = N / (96 / PARTITIONS_M);
+  constexpr int64_t WINDOWS = COLUMNS / WINDOW_N;
+  const int64_t m0 = (worker % PARTITIONS_M) * ROWS;
+  const int64_t n0 = (worker / PARTITIONS_M) * COLUMNS;
+  const int64_t first_window = (worker % 2) * (WINDOWS / 2);
+  const int64_t packed_row_size = get_row_size<int8_t>(K);
+  alignas(64) int32_t Ctmp[BLOCK_M * BLOCK_N];
+  for (int64_t window = 0; window < WINDOWS; ++window) {
+    const int64_t nc = n0 + ((window + first_window) % WINDOWS) * WINDOW_N;
+    for (int64_t m = m0; m < m0 + ROWS; m += BLOCK_M) {
+      for (int64_t n = nc; n < nc + WINDOW_N; n += BLOCK_N) {
+        // This shape places every BF16 output tile on a 64-byte boundary.
+        tinygemm_kernel<scalar_t, has_bias, true>(
+            A + m * K, B + n * packed_row_size, out + m * N + n, Ctmp,
+            As + m, Bs + n, has_bias ? bias + n : nullptr,
+            BLOCK_M, BLOCK_N, K, K, BLOCK_N, N, true);
+      }
+    }
+  }
+  at::native::cpublas::brgemm_release();
+#if defined(CPU_CAPABILITY_AVX512)
+  _mm_sfence();
+#endif
 }
 
 }  // anonymous namespace
@@ -549,7 +594,24 @@ at::Tensor int8_scaled_mm_with_quant(
     if (sgl_dense_schedule() == SGLDenseSchedule::Legacy) {
       run(DenseLegacyExecution{});
     } else if (sgl_auto_pipeline(M)) {
-      parallel_sgl_auto_team(run);
+      parallel_sgl_auto_team([&](const DenseAutoExecution& execute) {
+        if (sgl_dense_schedule() != SGLDenseSchedule::SingleShape ||
+            st != at::kBFloat16 || M != 4096 || N != 12288 || K != 4096 ||
+            execute.team != 96) {
+          run(execute);
+          return;
+        }
+        execute.quantize(M, [&](int64_t begin, int64_t end) {
+          for (int64_t m = begin; m < end; ++m) {
+            quantize_row_int8<scalar_t>(Aq_data + m * K, As_data[m], A_data + m * lda, K);
+          }
+        });
+        AT_DISPATCH_BOOL(has_bias, with_bias, [&] {
+          single_shape_gemm<scalar_t, with_bias>(
+              out.data_ptr<scalar_t>(), Aq_data, packed_w.data_ptr<int8_t>(),
+              As_data, scales2.data_ptr<float>(), bias_data, execute.worker);
+        });
+      });
     } else {
       run(DenseParallelExecution{});
     }

@@ -32,6 +32,7 @@ parser.add_argument(
         "flat_128x64",
         "flat_128x128",
         "flat_auto",
+        "single_shape",
     ),
     default="legacy",
 )
@@ -444,6 +445,18 @@ def schedule_metadata(m, n, k, diagnostic_executable=None):
         "scheduler_eligible": None,
         "eligibility_reason": "not_applicable",
     }
+    if args.scheduler == "single_shape":
+        eligible = (m, n, k, args.threads) == (4096, 12288, 4096, 96)
+        metadata.update(
+            effective_schedule=None if eligible else "flat_auto",
+            scheduler_eligible=eligible,
+            expected_schedule="single_shape" if eligible else "flat_auto",
+            eligibility_reason="requires BF16 4096x12288x4096 and actual team 96",
+            scheduler_metadata_source=(
+                "shape and requested team; actual execution team is unobserved"
+            ),
+        )
+        return metadata
     if args.scheduler == "flat_auto":
         from benchmark_cpu_sgl_thread_mapping import run_diagnostic
 
