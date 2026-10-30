@@ -1,12 +1,329 @@
 # Full-K CPU INT8 single-shape experiment
 
-## Result
+## Current result: minimize the b23 implementation (2026-10-30)
+
+The simplified implementation qualifies at **2.561864 ms / 160.94 cold TOPS**.
+All five fresh-process medians are below **2.57698038 ms**. Relative to the
+contemporaneous frozen `b23d40942152c10bdcfb4931408ed667f14763bf` control,
+the paired geometric latency change is **+0.274%**, with a process-bootstrap
+95% interval of **[+0.129%, +0.416%]**. This meets the preselected 1%
+noninferiority limit. The purpose of this iteration is fewer special-case
+changes while retaining 160 TOPS; it does not establish a new speed record.
+
+Removed: 2 MiB activation-pointer alignment and its **2 MiB minus one byte**
+allocation reserve, custom quantization ownership, N32-only window grouping,
+alternate-worker reversal, worker-hoisted accumulator scratch, and explicit
+`noinline`. The implementation reuses `execute.quantize` with contiguous
+balanced row ownership and its dependency barrier, traverses forward 128×64
+windows, and allocates aligned 4 KiB accumulator scratch in the tile helper.
+The compiler still outlines the selected helper. The inherited half-partition
+start offset remains.
+
+Retained: exact shape and 96-actual-worker guard, full-K 32×32 direct AMX,
+4160-byte activation rows, fourfold K64 unrolling, interleaved ordinary A/B
+loads, existing output arithmetic and streaming stores/fence, Linux tile
+permission and backend-state handling. The public packing, opt-in interface,
+defaults and fallback behavior are unchanged. Padded rows add 256 KiB; no
+software prefetch or production tuning controls are introduced.
+
+For each complete 256×64 window, useful operand bytes including compensation
+are approximately **1280.25 KiB**; the padded A address span plus B is
+**1296.25 KiB**. An inner 128×64 window has **768.25 KiB** of useful operands
+and a **776.25 KiB** span. Padding holes are not touched by quantization or
+AMX loads. Neither address span nor useful bytes establish cache residency;
+scratch, scales, output and other live data are additional.
+
+### Selection and qualification
+
+Screening used five cold samples per candidate, followed by five alternating
+candidate/b23 fresh-process pairs with five cold samples per process.
+The final cleaned-source qualification additionally interleaves frozen legacy
+controls. Every candidate process median must pass
+the absolute target, and the upper 95% paired process-bootstrap regression
+must be at most 1%. Within that limit, prefer BRGEMM, then fewer special-case
+changes, then less scratch. Warm timing and immediate output consumption are
+reported separately. Effects below are conditional, not additive; there is no
+claim of a global minimum or familywise statistical confidence.
+
+All 96 measurement CPUs used the performance governor and performance EPP,
+verified before and after. Placement, preloads, allocation, quantization,
+packing, compensation, scaling and output timing follow the original protocol
+below. Packed banks have verified huge-page backing on node 1 and more than
+1.5 GiB of intervening packed weights. No samples or outliers were excluded.
+
+| Mode | Cold ms | Cold TOPS | Warm ms | Process-median SD ms |
+| --- | ---: | ---: | ---: | ---: |
+| Simplified candidate | 2.561864 | 160.94 | 2.308637 | 0.003074 |
+| Frozen b23 | 2.555837 | 161.32 | 2.294037 | 0.002761 |
+| Frozen legacy | 3.218129 | 128.12 | 2.445057 | 0.023759 |
+
+| Pair | Candidate ms | b23 ms | Legacy ms |
+| --- | ---: | ---: | ---: |
+| 1 | 2.565623 | 2.555837 | 3.207435 |
+| 2 | 2.558558 | 2.557202 | 3.240898 |
+| 3 | 2.560817 | 2.558679 | 3.218129 |
+| 4 | 2.565543 | 2.554186 | 3.256527 |
+| 5 | 2.561864 | 2.551544 | 3.199371 |
+
+Candidate individual cold samples span 2.555715–2.596643 ms; acceptance applies
+to each process median. Paired geometric warm regression is **+0.363%**;
+the ratio of aggregate warm medians is +0.636%, a different statistic.
+
+### Ablations and interactions
+
+The following labels identify immutable source snapshots in the archive.
+`no_quant` changes row ownership; quantization is always performed.
+`no_align_same_size` isolates pointer placement with allocation size retained;
+`no_align` removes both placement and allocation reserve. N64 grouping still
+uses N32 microkernels. `brgemm128` changes backend, M aggregation, scratch size
+and call cadence together; `brgemm32` preserves M32. `old_baseline` restores
+the d80 GEMM source within the otherwise b23 build, rather than rebuilding the
+entire d80 repository. The `simplify_layout_quant` combination removes alignment/reserve and uses
+contiguous ownership. Its `_scratch` variant also restores default inlining
+and helper-local scratch; `_scratch_helper` additionally reuses
+`execute.quantize`. `simplify_window` adds N64 grouping, `simplify_forward`
+also removes reversal, and `simplify_grouped` changes its operand load order.
+`ref_stream_b` changes only the B tile-load hint in the rebuilt reference.
+All intervals compare each variant with its own
+contemporaneous b23 pair. A byte-identical rebuilt reference differs by
++0.246%, cautioning against interpreting tiny effects as uniquely causal.
+
+| Variant | Cold ms | Warm ms | Cold change % | Paired 95% CI % | Passing processes |
+| --- | ---: | ---: | ---: | --- | ---: |
+| brgemm128_no_quant | 2.688480 | 2.339309 | +5.095 | [+4.842, +5.437] | 0/5 |
+| brgemm128 | 2.677230 | 2.340275 | +4.807 | [+4.556, +5.030] | 0/5 |
+| no_align_same_size | 2.554358 | 2.300349 | -0.032 | [-0.240, +0.148] | 5/5 |
+| ref | 2.559438 | 2.299045 | +0.246 | [+0.033, +0.440] | 5/5 |
+| no_align | 2.553168 | 2.295524 | +0.116 | [+0.058, +0.183] | 5/5 |
+| window64 | 2.543800 | 2.300545 | -0.296 | [-0.475, -0.067] | 5/5 |
+| local_scratch | 2.550437 | 2.302095 | -0.012 | [-0.239, +0.220] | 5/5 |
+| default_inline | 2.566621 | 2.306917 | +0.341 | [-0.035, +0.594] | 5/5 |
+| brgemm128_no_pad_no_align | 2.714568 | 2.443006 | +6.240 | [+5.854, +6.840] | 0/5 |
+| no_pad | 2.684446 | 2.449127 | +4.751 | [+4.463, +5.134] | 0/5 |
+| grouped_loads | 2.563292 | 2.294479 | +0.334 | [+0.030, +0.631] | 5/5 |
+| unroll1 | 2.591720 | 2.312645 | +1.223 | [+1.166, +1.283] | 0/5 |
+| window64_no_reverse | 2.566736 | 2.299751 | +0.466 | [+0.369, +0.590] | 5/5 |
+| no_pad_no_align | 2.674789 | 2.439826 | +4.770 | [+4.591, +4.949] | 0/5 |
+| no_quant | 2.551662 | 2.294061 | -0.034 | [-0.231, +0.162] | 5/5 |
+| brgemm32 | 2.651416 | 2.357402 | +3.601 | [+3.344, +3.828] | 0/5 |
+| default_inline_local_scratch | 2.552969 | 2.303789 | -0.085 | [-0.196, +0.050] | 5/5 |
+| old_baseline | 2.793904 | 2.503050 | +9.161 | [+9.021, +9.374] | 0/5 |
+| no_reverse | 2.574824 | 2.299543 | +0.457 | [+0.202, +0.656] | 3/5 |
+| brgemm128_window64 | 2.691499 | 2.348095 | +5.607 | [+5.354, +5.867] | 0/5 |
+| simplify_window | 2.548943 | 2.312054 | -0.380 | [-0.648, -0.066] | 5/5 |
+| simplify_layout_quant | 2.553499 | 2.323142 | -0.160 | [-0.291, -0.055] | 5/5 |
+| simplify_grouped | 2.590754 | 2.325801 | +1.481 | [+1.266, +1.724] | 0/5 |
+| simplify_layout_quant_scratch_helper | 2.555333 | 2.306514 | -0.002 | [-0.099, +0.098] | 5/5 |
+| ref_stream_b | 2.619114 | 2.347263 | +2.582 | [+2.249, +2.816] | 0/5 |
+| simplify_layout_quant_scratch | 2.557557 | 2.315841 | +0.450 | [-0.057, +1.096] | 4/5 |
+| simplify_forward | 2.567273 | 2.304024 | +0.631 | [+0.454, +0.850] | 5/5 |
+| forward_no_pad | 2.692477 | 2.443894 | +5.597 | [+5.404, +5.791] | 0/5 |
+| forward_brgemm128 | 2.768658 | 2.353647 | +8.357 | [+8.079, +8.611] | 0/5 |
+| forward_brgemm32 | 2.697851 | 2.370673 | +5.697 | [+5.395, +6.099] | 0/5 |
+| forward_unroll1 | 2.618106 | 2.322862 | +2.519 | [+2.408, +2.630] | 0/5 |
+| clean_forward | 2.561864 | 2.308637 | +0.274 | [+0.129, +0.416] | 5/5 |
+
+| Interaction | Excess latency % | 95% CI % |
+| --- | ---: | --- |
+| padding × alignment removal | -0.098 | [-0.493, +0.239] |
+| helper scratch × default inlining | -0.413 | [-0.804, +0.037] |
+| N64 window × forward traversal | +0.306 | [-0.017, +0.641] |
+| BRGEMM128 × contiguous quantization | +0.310 | [-0.094, +0.737] |
+| BRGEMM128 × unpadded unaligned A | -3.247 | [-3.734, -2.645] |
+| BRGEMM128 × N64 window | +1.063 | [+0.663, +1.468] |
+
+Interaction estimates are joint log regressions minus the individual log
+regressions, each normalized to its contemporaneous control; intervals use
+20,000 independent process-pair bootstrap draws. The backend interactions
+show why individual benefits cannot simply be added. In particular, removing
+padding and alignment in BRGEMM costs less than its direct-kernel joint effect, while
+BRGEMM plus N64 grouping is worse than an additive prediction.
+
+`simplify_forward` removes all selected policies together. Its combined-candidate
+paired result passes at +0.631% [0.454%, 0.850%]. Removing dead alignment
+constants and zero-offset expressions produces `clean_forward`; the selected
+direct functions are byte-identical, and the exact cleaned source is qualified
+again above. Final neighbors retain every other forward-policy choice:
+removing padding, replacing direct AMX with BRGEMM M32 or M128, or reducing
+unrolling to one fails all five absolute process medians. Grouped loads also
+fail in the simplified combination; retain interleaving.
+
+### Generated BRGEMM code and the measured gap
+
+Source-matched captures use the actual public operator and loaded Torch
+library, M32/M128, N32, K4096, A stride4160 and public B stride128. All 96
+workers emit identical kernels for each descriptor. Full outputs match the
+frozen reference. The capture, tile configurations, wrapper disassembly,
+commands and hashes are in `jit-brgemm/`.
+
+Per M32 output, both direct and JIT kernels execute **128 A tile loads, 128 B
+tile loads, 256 INT8 dot products, and four INT32 accumulator stores**. M128
+executes four sequential M32 blocks and reloads B four times, as do four direct
+calls. Extra operand work therefore does not explain the gap by itself.
+
+BRGEMM fully unrolls 64 K64 steps; the direct kernel loops over four-step
+bodies. The M32 JIT is 4,867 bytes and M128 is 19,249 bytes. BRGEMM uses
+ordinary A loads and `TILELOADDT1` B loads; direct uses ordinary loads for both.
+BRGEMM issues 64 `prefetchw` instructions per M32 into INT32 accumulator
+scratch, not future operands or final BF16 output, and zeros more tile
+registers. Nevertheless its static executed instruction count is lower:
+684 instructions for M32, or 657.75 per M32 in M128, versus 800 in the direct
+K-loop body alone. Instruction-count arguments cannot explain a BRGEMM loss
+without considering instruction cost and memory behavior. The M128 JIT fits
+nominally inside the 64 KiB L1 instruction cache; size alone does not prove
+an instruction-cache bottleneck.
+
+The Torch u8×s8 wrapper allocates and frees a **56-byte std::function capture
+on every invocation**, including cache hits, and performs descriptor lookup,
+TLS/helper checks and indirect dispatch. This is real unquantified overhead.
+M128 reduces calls fourfold but still loses; these measurements do not
+quantify how much the remaining wrapper overhead explains. The tile helper compares the configuration and conditionally
+loads it when the cached helper changes; generated code does **not** establish
+a tile-configuration reload on every steady-state call. The BF16 epilogue is
+inlined in both backends.
+
+A controlled direct-kernel experiment changes only the B load hint: exactly
+16 instruction bytes across bias/no-bias functions, with all addresses,
+branches, registers and scheduler instructions otherwise identical. Streaming
+B regresses cold latency by **2.582% [2.249%, 2.816%]** and fails all five
+process medians. Separate counters show load-bound cycles increasing from
+**519.959 to 539.359 million per call**, and L2-miss stall cycles from
+**189.077 to 218.278 million**. AMX-busy cycles stay approximately 201.35
+million; effective clocks are 2.958 and 2.939 GHz. This supports cache delivery
+as one contributor to the B-hint regression, without identifying an exact
+cache eviction mechanism. This isolated effect must not be added numerically
+to the BRGEMM gap. Other backend differences remain coupled.
+
+### Separate counter comparisons
+
+Matched forward-policy BRGEMM diagnostics compare each backend with the exact
+selected direct binary. Each group uses separate fresh processes; counts are
+aggregate events divided by all timed calls. Millions of cycles below are
+summed across workers. Fractions overlap and are not additive. Effective GHz
+is execution cycles/reference cycles × 2.4. The performance governor does not
+fix the measured clock.
+
+| Metric | BRGEMM M32 | Its direct control | BRGEMM M128 | Its direct control |
+| --- | ---: | ---: | ---: | ---: |
+| Core-group ms/call | 2.729722 | 2.567002 | 2.778399 | 2.557455 |
+| Execution cycles/call, million | 699.477 | 734.793 | 710.125 | 731.723 |
+| Effective GHz | 2.646 | 2.953 | 2.639 | 2.952 |
+| AMX-busy cycles/call, million | 201.423 | 201.362 | 201.387 | 201.360 |
+| Load-bound cycles/call, million | 477.003 | 518.400 | 499.330 | 516.616 |
+| L2-miss stall cycles/call, million | 193.209 | 187.825 | 213.887 | 188.340 |
+| L3-miss stall cycles/call, million | 20.508 | 7.548 | 24.905 | 7.577 |
+| L2 fills/call, million lines | 15.777 | 15.680 | 15.749 | 15.628 |
+| I-cache data stall cycles/call, million | 1.258 | 0.737 | 1.854 | 0.756 |
+| Frontend zero-delivery cycles/call, million | 2.065 | 1.338 | 2.015 | 1.349 |
+
+Both backend runs have lower effective clocks and higher cache-miss stalls,
+despite fewer aggregate execution cycles and essentially equal AMX work.
+The isolated B-hint regression provides one plausible contributor. These
+runs do not identify the clock cause or apportion backend latency. Frontend
+counters do not support instruction-cache stalls as the leading explanation.
+Whole-operator retired instructions include wrappers, allocator paths and
+software waiting, so they are not the static kernel instruction counts above.
+
+The matched unpadded direct variant runs at 2.963 versus 2.952 GHz but raises
+load-bound cycles from 518.205 to 556.929 million per call. Separate L1-miss
+stalls rise from 423.954 to 471.400 million; L2 demand misses are approximately
+1.08 million in both layouts. DTLB load/store walk cycles remain small
+(0.127/0.101 million versus 0.115/0.092 million). CPU96 has a 48 KiB,
+64-set, 12-way L1 data cache: fixed-offset rows with stride4096 repeat a set,
+while stride4160 advances one set per row. The measured L1 behavior is
+consistent with that conflict hypothesis, without proving it uniquely.
+
+Reducing K-loop unrolling from four to one leaves AMX-busy cycles unchanged
+at 201.36 million and effective clocks close (2.947 versus 2.953 GHz), while
+load-bound cycles rise from 517.457 to 532.592 million. Separate L2/L3-miss
+stalls rise from 187.772/7.581 to 214.705/19.722 million. Machine-code audits
+find no K-accumulator spills, but branch/address setup and bias-helper register
+assignment also change. Treat this as a K-unroll code-generation effect,
+rather than a pure change in AMX throughput.
+
+The selected candidate versus frozen b23 is repeated in separate core/stall
+processes. Absolute load-bound and cache-miss stall cycles fall in both
+observations, by small amounts; this does not establish a latency improvement.
+
+| Metric, million cycles/call | Selected | b23 | Selected repeat | b23 repeat |
+| --- | ---: | ---: | ---: | ---: |
+| Load-bound | 516.865 | 520.052 | 518.948 | 519.509 |
+| L2-miss stalls | 186.634 | 188.626 | 186.465 | 190.170 |
+| L3-miss stalls | 7.541 | 8.262 | 7.534 | 8.384 |
+
+The first core group measures 70.36% load-bound cycles and 27.41% AMX-busy
+cycles; these overlapping fractions are not a speedup budget. L2 fills are
+15.625 million lines/call in the core group (approximately 953.7 MiB of event
+traffic, not unique operand bytes). Separate L2 demand hits/misses are
+137.696/1.093 million requests, RFO hits/misses 2.383/0.170 million, and
+DTLB load/store walk cycles 0.121/0.092 million. Socket-wide DRAM counters
+measure 60.158 MiB read and 100.673 MiB written per call versus
+61.397/100.634 MiB for b23; these include background traffic. All detailed
+cache-response, fill, frontend, event coverage and DRAM measurements are in
+`diagnostics_comparison.json` and the raw per-group records. No specific LLC
+slice-contention mechanism is established. Operand delivery remains a
+reasonable target for further experiments, not a predicted speedup.
+
+### Immediate output consumption
+
+A separate diagnostic includes an immediate full-output FP32 sum after every
+operator call. Each mode uses one fresh process with five cold and five warm
+samples; this is not the five-pair acceptance protocol. Cold medians are
+**3.215470 ms selected versus 3.175342 ms b23 (+1.264%)**; warm medians are
+**3.000526 versus 2.957296 ms (+1.462%)**. All samples and generated drivers are
+preserved in `chain_clean_forward/`. This diagnostic exposes a downstream
+tradeoff and includes the sum's own work; it does not isolate the cost of
+streaming stores. It neither overrides cold standalone selection nor
+qualifies a complete model pipeline. Controller threads remained off node1
+until these processes completed.
+
+### Verification and reproducibility
+
+The exact selected source passes **26 tests** in
+`tests/kernels/quantization/test_scaled_mm_kernel_selection.py`, including
+first-ever AMX execution, actual-team fallback, mismatched shapes, strided
+BF16 input, quantization boundaries, unequal scales, bias/no-bias,
+direct/BRGEMM alternation and input immutability. Every measured variant also
+compares all 50,331,648 output elements against frozen legacy with bias and
+without bias before timing. The cached Llama comparison produces identical
+32-token greedy outputs for both prompts. Its shapes exercise fallback;
+it does not qualify direct-kernel model performance. No new tests were needed. Applicable pre-commit hooks pass on the C++ source,
+rendered documentation and this report; `git diff --check` also passes.
+
+Selected GEMM source SHA256:
+`065df2fd698383aaa7c93e7fd8eb2b33a246ef13be8ea91878f0b912138f1a67`.
+Selected extension SHA256:
+`d61b9abb2b1ca7844b0a9c22096d4038af04786180d88af75ad242382a1b5a34`.
+Frozen b23 extension:
+`843a6df1f09688d2b3c4458dc6a76818ab9e97a71b1d1af310a03f71e27c5e50`.
+Loaded `libtorch_cpu.so`:
+`cc3d0101c16504ba021abe6794c98122f744ec8cf077bd0178f630f320b24aeb`.
+
+The new archive is
+`/home/tianmuli/vllm_test/snc_scaling_analysis/single_shape_ablation_b23d409421_20261030`.
+It preserves all screens, paired samples, qualification, counter windows,
+output-consuming diagnostics, failures, frozen controls/reference outputs,
+source snapshots, extension binaries, normalized compiler/linker commands,
+346 source hashes and 44 linked-input hashes, JIT captures, machine-code
+audits, test/model logs and replay drivers. Unchanged external build objects
+were reused with hashes; this is not claimed as a clean rebuild of Torch or
+all dependencies. The early stage-not-ready attempt was rejected before
+verification or timing, and is retained. `ARCHIVE.md` documents replay paths
+and dependency requirements. The original 2026-10-29 archive remains intact.
+
+## Historical b23 qualification and tuning
+
+Everything below records the original implementation committed as b23.
+In these historical tables, “candidate” is b23 and “current” is d80, rather
+than the simplified candidate and b23 controls used above.
+
+### Result
 
 **160 cold INT8 TOPS qualified.** The selected change measures **2.554976 ms / 161.38 TOPS**, with **8.40% lower cold latency** than the source-matched committed specialization. All five fresh-process candidate medians are below **2.57698038 ms**, using five cold samples per process and alternating candidate/current order with interleaved legacy controls. Earlier u4 and N32-only candidates failed this strict requirement; their results remain below and in the archive.
 
 Acceptance times the fused operator without bias, including allocation, row quantization, compensation, scaling, BF16 conversion, streaming stores, and the output fence. Bias and no-bias correctness are both verified. Standalone acceptance excludes downstream output reads. Model generation below exercises fallback.
 
-## Selected implementation
+### Selected implementation
 
 The opt-in interface remains `VLLM_CPU_SGL_SCHEDULER=single_shape`. Linux AMX INT8 support and process-wide tile-state permission are checked before direct execution. The exact BF16 M4096/N12288/K4096 shape requires 96 actual workers; other cases preserve `flat_auto` fallback.
 
@@ -14,7 +331,7 @@ The full-K 32×32 u8×s8 kernel uses four INT32 accumulators, two A tiles and tw
 
 Quantized A uses a private 4160-byte row stride, adding 256 KiB over contiguous rows. Its start is aligned to 2 MiB within a private allocation that reserves 2 MiB minus one byte of additional scratch space; this does not guarantee huge-page backing. Quantization ownership matches the 16×6 GEMM grid: six workers divide each 256-row partition exactly once and synchronize. Each worker exclusively owns 256×2048 output elements and traverses two inner 128×32 windows for each N32 step, reversing alternate workers with the half-partition offset. The complete 256×32 step has a padded operand union of **1168.125 KiB**: 1040 KiB of quantized A and 128.125 KiB of packed B plus compensation. One inner 128×32 window accounts for **648.125 KiB**. These totals exclude scratch, scales, output and other live data; they do not establish cache residency. Aligned 4 KiB accumulator scratch is allocated once per worker and passed to the tile helper, which is marked `noinline`. The four accumulators remain in AMX tiles throughout K. If eligibility holds but the actual team is smaller, fallback uses contiguous quantized rows within the same private allocation.
 
-## Controls and protocol
+### Controls and protocol
 
 Base commit: `d80bd2eeb5cb3ae7be0d83d661e723ad51491189`. Original reference: 147.48 TOPS at 2.79567 ms. Hardware: Intel Xeon 6972P, 96 physical cores per socket, 2 MiB L2 per core, 480 MiB LLC per socket. Acceptance uses physical CPUs 96–191 and NUMA node 1. Builds, correctness and model checks use the other socket.
 
@@ -30,7 +347,7 @@ Five candidate/current pairs alternate their process order, with a fresh legacy 
 
 `window32_aligned_clean/build_metadata.json` records staged source hashes, compiler/linker commands and linked-input hashes. `integrated_source_hashes.json` also records the CMake AMX INT8 flag, tests and rendered documentation. Controls are under `/home/tianmuli/vllm_test/snc_scaling_analysis/regression_fix_20261029/{single_shape_l2_final,final}`.
 
-## Qualification
+### Qualification
 
 Medians aggregate the five process medians; variability is their sample standard deviation. Controller threads are isolated on CPUs 0–15, outside the measurement set (`controller_affinity.log`). Benchmark binding, preloads, allocations, rotation and acceptance remained unchanged. No samples were excluded.
 
@@ -50,7 +367,7 @@ Medians aggregate the five process medians; variability is their sample standard
 
 Candidate cold sample range: 2.537869–2.565112 ms. Warm latency improves by 7.88% against the committed specialization. Complete records: `qualification_window32_aligned_clean.json`.
 
-## Historical qualification
+### Historical qualification
 
 | Candidate | Cold ms | Cold TOPS | Warm ms | Passing processes |
 | --- | --- | --- | --- | --- |
@@ -61,7 +378,7 @@ Candidate cold sample range: 2.537869–2.565112 ms. Warm latency improves by 7.
 
 The initial u4 aggregate above 160 TOPS did not reproduce. Its isolated-controller repeat remained 7.12% faster cold than its committed control but failed all five process medians. N32 without alignment passed four of five, with a failing first median of 2.603648 ms. These complete failures are retained, including every sample; controller isolation alone is not established as the cause of any timing change.
 
-## Performance-governor rerun (2026-10-30)
+### Performance-governor rerun (2026-10-30)
 
 All measurement CPUs 96–191 had `performance` governor with `intel_pstate` and `energy_performance_preference=performance`, verified before and after the run. The previous governor was not captured. Frozen binary hashes, core/NUMA placement, preloads, bank rotation and the complete five-pair protocol were retained. No source or arithmetic changes were made.
 
@@ -82,7 +399,7 @@ Clock counters used three additional fresh processes excluded from acceptance. A
 
 Records: `qualification_performance_governor_20261030.json`, `performance_governor_20261030_environment{,_after}.json`, and `profiles-performance-governor-20261030/summary.json`.
 
-## Bounded experiments
+### Bounded experiments
 
 The locality experiments were motivated by [the paper's space-filling traversal and panel budget](https://arxiv.org/pdf/2601.16294); BF16 results were not treated as a predicted INT8 speedup. Inspecting source-matched oneDNN JIT code first showed full-unrolled K loops, ordinary A loads (stride4096), streaming B loads (stride128), operand reuse within M32 tiles, repeated B streams across M128, and accumulator `prefetchw`; it did not have software operand prefetch. The capture and disassembly are preserved in `jit-current/`.
 
@@ -107,7 +424,7 @@ AMX screened 38 parameter configurations: 12 geometry/load/layout combinations (
 
 Selection uses cold latency. Within 1%, prefer existing BRGEMM, then no prefetch, then less scratch. `final_selection.json` records the historical interleaved selection and rejected codegen checks; `selection.json` preserves the earlier fixed-layout selection. The final integrated selection is recorded separately in `integrated_selection.json`.
 
-## Focused source-generation follow-up
+### Focused source-generation follow-up
 
 After the original bounded scheduling and AMX sweeps, the production source was checked for stack and instruction-generation costs. Hoisting accumulator scratch with explicit noinline, then unrolling four K64 steps, improved the repeated result. Static inspection found no accumulator spills and 16 complete K256 iterations; compensation and epilogue semantics were unchanged. Historical `final` qualification measured 159.65 TOPS and failed the strict threshold. The subsequent u4 candidate also failed strict qualification; narrowing the window and aligning private A supplied the qualifying combination.
 
@@ -129,7 +446,7 @@ After the original bounded scheduling and AMX sweeps, the production source was 
 
 Periodic minor-fault windows are consistent with tcmalloc scavenging freed tensor storage with `madvise(MADV_DONTNEED)`. Sample logs lack fault addresses, so this does not prove tensor ownership or causation of the full timing difference. Timed output-page touches retained allocation and all arithmetic, but did not improve the selected kernel. No allocator suppression, output reuse, benchmark-window change or fault-sample exclusion was used. `allocation_notes.md` records the evidence and its limits.
 
-## Narrow-window and allocation follow-up
+### Narrow-window and allocation follow-up
 
 These focused experiments preserve full K, exclusive output ownership, public weight packing and the timed fused operator. They do not replace the original bounded sweeps.
 
@@ -147,7 +464,7 @@ These focused experiments preserve full K, exclusive output ownership, public we
 
 N32 traversal reduces the complete 256-row step's padded operand union to 1168.125 KiB and covers every output tile exactly once. Its tile helpers are instruction-byte identical to selected u4. Spreading workers across more starting columns hurt cold latency while warm latency remained closer; this supports testing temporal panel sharing but does not isolate LLC slice contention. Direct tile-major quantization preserves row arithmetic but adds scattered-store address calculations and was slower. Alignment adds up to 2 MiB of private scratch, with allocation and quantization still timed. The combined candidate passed subsequent full qualification. Removing its single-iteration column loop preserved tile instruction bytes but changed helper alignment and worker register allocation, so the cleaned source received its own fresh-process qualification.
 
-## Verification and diagnostics
+### Verification and diagnostics
 
 The selected scaled-MM selection/scheduler suite passed: `26 passed, 2 warnings in 291.16s`. Command: `numactl --all --physcpubind=0-95 --membind=0 <torch-venv>/bin/python -m pytest tests/kernels/quantization/test_scaled_mm_kernel_selection.py -v`, with the selected staged extension and Intel OpenMP/tcmalloc preload. Coverage includes constrained actual teams, mismatched K, strided BF16 input including padding, zero/tiny rows, BF16 quantization ties and adjacent boundary values, unequal scales, bias/no-bias, first direct execution, direct→BRGEMM→direct transitions, and unchanged inputs. Tests extend the nearest existing subprocess suite.
 
@@ -220,7 +537,7 @@ The separate diagnostic immediately consumes every output element with `torch.su
 
 Cold chain latency improves by 8.14% and warm chain latency by 6.30% against current in this diagnostic. Each mode has one fresh process with five samples, less replication than qualification. Chain and standalone timings cannot be subtracted to isolate a store-fence cost: the consumer changes cache residency and subsequent reuse.
 
-## Reproduction artifacts
+### Reproduction artifacts
 
 Persistent archive: `/home/tianmuli/vllm_test/snc_scaling_analysis/single_shape_160_20261029`. Its `ARCHIVE.md` explains original-path substitution. It includes all screening samples, source snapshots, binaries, build commands/hashes, JIT capture, qualification, profile manifests, frozen outputs, test logs and model token outputs. Original root: `/tmp/sgl-160-20261029`.
 

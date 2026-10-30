@@ -388,14 +388,14 @@ struct alignas(64) Int8TileConfig {
 };
 
 template <bool has_bias>
-__attribute__((noinline)) void single_shape_tile(
+void single_shape_tile(
     at::BFloat16* __restrict__ out,
     const uint8_t* __restrict__ A,
     const int8_t* __restrict__ B,
     const float* __restrict__ As,
     const float* __restrict__ Bs,
-    const float* __restrict__ bias,
-    int32_t* __restrict__ Ctmp) {
+    const float* __restrict__ bias) {
+  alignas(64) int32_t Ctmp[32 * 32];
   constexpr int64_t K = 4096, N = 12288;
   _tile_zero(0);
   _tile_zero(1);
@@ -439,19 +439,19 @@ void single_shape_gemm(
   const int64_t m0 = (worker % 16) * 256;
   const int64_t n0 = (worker / 16) * 2048;
   at::native::cpublas::brgemm_release();
-  alignas(64) int32_t Ctmp[32 * 32];
   const Int8TileConfig config;
   _tile_loadconfig(&config);
-  for (int64_t w = 0; w < 64; ++w) {
-    const int64_t first_window = (worker % 2) * 32;
-    const int64_t index = worker % 2 ? 63 - w : w;
-    const int64_t nc = n0 + ((index + first_window) % 64) * 32;
+  for (int64_t w = 0; w < 32; ++w) {
+    const int64_t first_window = (worker % 2) * 16;
+    const int64_t nc = n0 + ((w + first_window) % 32) * 64;
     for (int64_t mc = m0; mc < m0 + 256; mc += 128) {
-      for (int64_t m = mc; m < mc + 128; m += 32) {
-        single_shape_tile<has_bias>(
-            out + m * N + nc, A + m * SINGLE_SHAPE_A_STRIDE,
-            B + nc * (K + 4), As + m, Bs + nc,
-            has_bias ? bias + nc : nullptr, Ctmp);
+      for (int64_t n = nc; n < nc + 64; n += 32) {
+        for (int64_t m = mc; m < mc + 128; m += 32) {
+          single_shape_tile<has_bias>(
+              out + m * N + n, A + m * SINGLE_SHAPE_A_STRIDE,
+              B + n * (K + 4), As + m, Bs + n,
+              has_bias ? bias + n : nullptr);
+        }
       }
     }
   }
@@ -632,9 +632,7 @@ at::Tensor int8_scaled_mm_with_quant(
       single_shape_amx_enabled();
 #endif
   const int64_t aq_stride = single_shape ? SINGLE_SHAPE_A_STRIDE : K;
-  constexpr int64_t alignment = 2 * 1024 * 1024;
-  const int64_t buffer_size = M * aq_stride + M * sizeof(float) +
-      (single_shape ? alignment - 1 : 0);
+  const int64_t buffer_size = M * aq_stride + M * sizeof(float);
   auto buffer = at::empty({buffer_size}, mat1.options().dtype(at::kByte));
   auto out = at::empty({M, N}, mat1.options().dtype(out_dtype));
 
@@ -647,10 +645,6 @@ at::Tensor int8_scaled_mm_with_quant(
 
   AT_DISPATCH_REDUCED_FLOATING_TYPES(out_dtype, "int8_scaled_mm_with_quant_kernel_impl", [&] {
     uint8_t* __restrict__ Aq_data = buffer.data_ptr<uint8_t>();
-    if (single_shape) {
-      Aq_data = reinterpret_cast<uint8_t*>(
-          (reinterpret_cast<uintptr_t>(Aq_data) + alignment - 1) & ~(alignment - 1));
-    }
     float* __restrict__ As_data = (float*)((void*)(Aq_data + M * aq_stride));
     const scalar_t* __restrict__ A_data = mat1.data_ptr<scalar_t>();
 
@@ -678,12 +672,11 @@ at::Tensor int8_scaled_mm_with_quant(
       parallel_sgl_auto_team([&](const DenseAutoExecution& execute) {
 #if defined(__AMX_INT8__) && defined(__linux__)
         if (single_shape && execute.team == 96) {
-          const int64_t rank = execute.worker / 16;
-          const int64_t m0 = (execute.worker % 16) * 256;
-          for (int64_t m = m0 + 256 * rank / 6; m < m0 + 256 * (rank + 1) / 6; ++m) {
-            quantize_row_int8<scalar_t>(Aq_data + m * aq_stride, As_data[m], A_data + m * lda, K);
-          }
-          execute.barrier();
+          execute.quantize(M, [&](int64_t begin, int64_t end) __attribute__((always_inline)) {
+            for (int64_t m = begin; m < end; ++m) {
+              quantize_row_int8<scalar_t>(Aq_data + m * aq_stride, As_data[m], A_data + m * lda, K);
+            }
+          });
           AT_DISPATCH_BOOL(has_bias, with_bias, [&] {
             single_shape_gemm<with_bias>(
                 out.data_ptr<at::BFloat16>(), Aq_data, packed_w.data_ptr<int8_t>(),
