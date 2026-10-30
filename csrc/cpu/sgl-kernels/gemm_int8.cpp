@@ -7,7 +7,15 @@
 #include "gemm.h"
 #include "vec.h"
 
+#if defined(__AMX_INT8__) && defined(__linux__)
+#include <cpuid.h>
+#include <sys/syscall.h>
+#include <unistd.h>
+#endif
+
 namespace {
+
+constexpr int64_t SINGLE_SHAPE_A_STRIDE = 4160;
 
 template <typename scalar_t, bool has_bias, int BLOCK_N, bool stream_output = false>
 struct scale_C {
@@ -351,46 +359,106 @@ void int8_scaled_mm_kernel_impl(
   });
 }
 
-template <typename scalar_t, bool has_bias>
+#if defined(__AMX_INT8__) && defined(__linux__)
+bool single_shape_amx_enabled() {
+  // Linux grants dynamic tile-state permission to the whole process.
+  static const bool enabled = [] {
+    unsigned int eax, ebx, ecx, edx;
+    constexpr unsigned int capabilities = bit_AMX_TILE | bit_AMX_INT8;
+    constexpr int request_xcomp_permission = 0x1023;
+    constexpr int tile_data_component = 18;
+    return __get_cpuid_count(7, 0, &eax, &ebx, &ecx, &edx) &&
+        (edx & capabilities) == capabilities &&
+        syscall(SYS_arch_prctl, request_xcomp_permission, tile_data_component) == 0;
+  }();
+  return enabled;
+}
+
+struct alignas(64) Int8TileConfig {
+  uint8_t palette = 1, start_row = 0, reserved[14] = {};
+  uint16_t columns[16] = {};
+  uint8_t rows[16] = {};
+
+  Int8TileConfig() {
+    for (int i = 0; i < 8; ++i) {
+      columns[i] = 64;
+      rows[i] = 16;
+    }
+  }
+};
+
+template <bool has_bias>
+__attribute__((noinline)) void single_shape_tile(
+    at::BFloat16* __restrict__ out,
+    const uint8_t* __restrict__ A,
+    const int8_t* __restrict__ B,
+    const float* __restrict__ As,
+    const float* __restrict__ Bs,
+    const float* __restrict__ bias,
+    int32_t* __restrict__ Ctmp) {
+  constexpr int64_t K = 4096, N = 12288;
+  _tile_zero(0);
+  _tile_zero(1);
+  _tile_zero(2);
+  _tile_zero(3);
+  for (int64_t k0 = 0; k0 < K; k0 += 256) {
+    Unroll<4>{}([&](auto u) {
+      const int64_t k = k0 + u * 64;
+      _tile_loadd(4, A + k, SINGLE_SHAPE_A_STRIDE);
+      _tile_loadd(6, B + k * 32, 128);
+      _tile_dpbusd(0, 4, 6);
+      _tile_loadd(5, A + 16 * SINGLE_SHAPE_A_STRIDE + k, SINGLE_SHAPE_A_STRIDE);
+      _tile_dpbusd(2, 5, 6);
+      _tile_loadd(7, B + k * 32 + 64, 128);
+      _tile_dpbusd(1, 4, 7);
+      _tile_dpbusd(3, 5, 7);
+    });
+  }
+
+  _tile_stored(0, Ctmp, 128);
+  _tile_stored(1, Ctmp + 16, 128);
+  _tile_stored(2, Ctmp + 16 * 32, 128);
+  _tile_stored(3, Ctmp + 16 * 32 + 16, 128);
+  const auto* comp = reinterpret_cast<const int32_t*>(B + 32 * K);
+  for (int64_t m = 0; m < 32; ++m) {
+    scale_C<at::BFloat16, has_bias, 32, true>::apply(
+        out + m * N, Ctmp + m * 32, comp, bias, As[m], Bs);
+  }
+}
+
+template <bool has_bias>
 void single_shape_gemm(
-    scalar_t* __restrict__ out,
+    at::BFloat16* __restrict__ out,
     const uint8_t* __restrict__ A,
     const int8_t* __restrict__ B,
     const float* __restrict__ As,
     const float* __restrict__ Bs,
     const float* __restrict__ bias,
     int64_t worker) {
-  constexpr int64_t PARTITIONS_M = 16;
-  constexpr int64_t BLOCK_M = 128;
-  constexpr int64_t BLOCK_N = block_size_n();
-  constexpr int64_t WINDOW_N = 64;
-  constexpr int64_t K = 4096;
-  constexpr int64_t N = 12288;
-  constexpr int64_t ROWS = 4096 / PARTITIONS_M;
-  constexpr int64_t COLUMNS = N / (96 / PARTITIONS_M);
-  constexpr int64_t WINDOWS = COLUMNS / WINDOW_N;
-  const int64_t m0 = (worker % PARTITIONS_M) * ROWS;
-  const int64_t n0 = (worker / PARTITIONS_M) * COLUMNS;
-  const int64_t first_window = (worker % 2) * (WINDOWS / 2);
-  const int64_t packed_row_size = get_row_size<int8_t>(K);
-  alignas(64) int32_t Ctmp[BLOCK_M * BLOCK_N];
-  for (int64_t window = 0; window < WINDOWS; ++window) {
-    const int64_t nc = n0 + ((window + first_window) % WINDOWS) * WINDOW_N;
-    for (int64_t m = m0; m < m0 + ROWS; m += BLOCK_M) {
-      for (int64_t n = nc; n < nc + WINDOW_N; n += BLOCK_N) {
-        // This shape places every BF16 output tile on a 64-byte boundary.
-        tinygemm_kernel<scalar_t, has_bias, true>(
-            A + m * K, B + n * packed_row_size, out + m * N + n, Ctmp,
-            As + m, Bs + n, has_bias ? bias + n : nullptr,
-            BLOCK_M, BLOCK_N, K, K, BLOCK_N, N, true);
+  constexpr int64_t K = 4096, N = 12288;
+  const int64_t m0 = (worker % 16) * 256;
+  const int64_t n0 = (worker / 16) * 2048;
+  at::native::cpublas::brgemm_release();
+  alignas(64) int32_t Ctmp[32 * 32];
+  const Int8TileConfig config;
+  _tile_loadconfig(&config);
+  for (int64_t w = 0; w < 64; ++w) {
+    const int64_t first_window = (worker % 2) * 32;
+    const int64_t index = worker % 2 ? 63 - w : w;
+    const int64_t nc = n0 + ((index + first_window) % 64) * 32;
+    for (int64_t mc = m0; mc < m0 + 256; mc += 128) {
+      for (int64_t m = mc; m < mc + 128; m += 32) {
+        single_shape_tile<has_bias>(
+            out + m * N + nc, A + m * SINGLE_SHAPE_A_STRIDE,
+            B + nc * (K + 4), As + m, Bs + nc,
+            has_bias ? bias + nc : nullptr, Ctmp);
       }
     }
   }
-  at::native::cpublas::brgemm_release();
-#if defined(CPU_CAPABILITY_AVX512)
+  _tile_release();
   _mm_sfence();
-#endif
 }
+#endif
 
 }  // anonymous namespace
 
@@ -557,7 +625,16 @@ at::Tensor int8_scaled_mm_with_quant(
   TORCH_CHECK(mat2.scalar_type() == at::kChar, "int8_scaled_mm_with_quant: expect mat2 to be int8.");
   TORCH_CHECK(scales2.scalar_type() == at::kFloat, "int8_scaled_mm_with_quant: expect scales to be float32.");
 
-  const int64_t buffer_size = M * K + M * sizeof(float);
+  bool single_shape = false;
+#if defined(__AMX_INT8__) && defined(__linux__)
+  single_shape = sgl_dense_schedule() == SGLDenseSchedule::SingleShape &&
+      st == at::kBFloat16 && M == 4096 && N == 12288 && K == 4096 &&
+      single_shape_amx_enabled();
+#endif
+  const int64_t aq_stride = single_shape ? SINGLE_SHAPE_A_STRIDE : K;
+  constexpr int64_t alignment = 2 * 1024 * 1024;
+  const int64_t buffer_size = M * aq_stride + M * sizeof(float) +
+      (single_shape ? alignment - 1 : 0);
   auto buffer = at::empty({buffer_size}, mat1.options().dtype(at::kByte));
   auto out = at::empty({M, N}, mat1.options().dtype(out_dtype));
 
@@ -570,7 +647,11 @@ at::Tensor int8_scaled_mm_with_quant(
 
   AT_DISPATCH_REDUCED_FLOATING_TYPES(out_dtype, "int8_scaled_mm_with_quant_kernel_impl", [&] {
     uint8_t* __restrict__ Aq_data = buffer.data_ptr<uint8_t>();
-    float* __restrict__ As_data = (float*)((void*)(Aq_data + M * K));
+    if (single_shape) {
+      Aq_data = reinterpret_cast<uint8_t*>(
+          (reinterpret_cast<uintptr_t>(Aq_data) + alignment - 1) & ~(alignment - 1));
+    }
+    float* __restrict__ As_data = (float*)((void*)(Aq_data + M * aq_stride));
     const scalar_t* __restrict__ A_data = mat1.data_ptr<scalar_t>();
 
     auto run = [&](const auto& execute) {
@@ -595,22 +676,23 @@ at::Tensor int8_scaled_mm_with_quant(
       run(DenseLegacyExecution{});
     } else if (sgl_auto_pipeline(M)) {
       parallel_sgl_auto_team([&](const DenseAutoExecution& execute) {
-        if (sgl_dense_schedule() != SGLDenseSchedule::SingleShape ||
-            st != at::kBFloat16 || M != 4096 || N != 12288 || K != 4096 ||
-            execute.team != 96) {
-          run(execute);
+#if defined(__AMX_INT8__) && defined(__linux__)
+        if (single_shape && execute.team == 96) {
+          const int64_t rank = execute.worker / 16;
+          const int64_t m0 = (execute.worker % 16) * 256;
+          for (int64_t m = m0 + 256 * rank / 6; m < m0 + 256 * (rank + 1) / 6; ++m) {
+            quantize_row_int8<scalar_t>(Aq_data + m * aq_stride, As_data[m], A_data + m * lda, K);
+          }
+          execute.barrier();
+          AT_DISPATCH_BOOL(has_bias, with_bias, [&] {
+            single_shape_gemm<with_bias>(
+                out.data_ptr<at::BFloat16>(), Aq_data, packed_w.data_ptr<int8_t>(),
+                As_data, scales2.data_ptr<float>(), bias_data, execute.worker);
+          });
           return;
         }
-        execute.quantize(M, [&](int64_t begin, int64_t end) {
-          for (int64_t m = begin; m < end; ++m) {
-            quantize_row_int8<scalar_t>(Aq_data + m * K, As_data[m], A_data + m * lda, K);
-          }
-        });
-        AT_DISPATCH_BOOL(has_bias, with_bias, [&] {
-          single_shape_gemm<scalar_t, with_bias>(
-              out.data_ptr<scalar_t>(), Aq_data, packed_w.data_ptr<int8_t>(),
-              As_data, scales2.data_ptr<float>(), bias_data, execute.worker);
-        });
+#endif
+        run(execute);
       });
     } else {
       run(DenseParallelExecution{});

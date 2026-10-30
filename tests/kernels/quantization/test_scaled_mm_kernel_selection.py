@@ -406,6 +406,7 @@ def test_cpu_sgl_int8_dense_schedulers_preserve_scaled_mm_result(tmp_path):
             ),
             "single_shape": (
                 (4096, 12288, 4096, False, True),
+                (33, 96, 64, False, True),
                 (4096, 12288, 4096, True, True),
             ),
             "single_shape_mismatch": ((4096, 12288, 64, False, True),),
@@ -414,8 +415,28 @@ def test_cpu_sgl_int8_dense_schedulers_preserve_scaled_mm_result(tmp_path):
         for m, n, k, has_bias, is_vnni in cases:
             torch.manual_seed(m + n)
             x = torch.randn(m, k).bfloat16()
+            storage = None
             weight = torch.randint(-30, 31, (n, k), dtype=torch.int8)
             target_shape = (m, n, k) == (4096, 12288, 4096)
+            if target_shape:
+                if not has_bias:
+                    storage = torch.full((m, k + 32), 123, dtype=x.dtype)
+                    storage[:, :k].copy_(x)
+                    x = storage[:, :k]
+                x[0].zero_()
+                x[1].fill_(1e-8)
+                x[1, 1::2] = -1e-8
+                # With amax=127, these BF16 values bracket exact rounding ties.
+                boundary = torch.tensor(
+                    [
+                        -127, 127, -1.5078125, -1.5, -1.4921875,
+                        -0.50390625, -0.5, -0.498046875, 0,
+                        0.498046875, 0.5, 0.50390625,
+                        1.4921875, 1.5, 1.5078125, 126,
+                    ],
+                    dtype=x.dtype,
+                )
+                x[[2, 31, 32, m - 1]] = boundary.repeat(k // 16)
             if not target_shape:
                 reference_weight = weight.float()
             if is_vnni:
@@ -423,9 +444,11 @@ def test_cpu_sgl_int8_dense_schedulers_preserve_scaled_mm_result(tmp_path):
             weight_scale = torch.rand(n, dtype=torch.float32) * 0.01
             bias = torch.rand(n, dtype=torch.float32) if has_bias else None
             if case_group.startswith("single_shape"):
-                inputs = (x, weight, weight_scale) + (
-                    (bias,) if bias is not None else ()
-                )
+                inputs = (
+                    storage if storage is not None else x,
+                    weight,
+                    weight_scale,
+                ) + ((bias,) if bias is not None else ())
                 saved_inputs = tuple(tensor.clone() for tensor in inputs)
             result = torch.ops._C.int8_scaled_mm_with_quant(
                 x, weight, weight_scale, bias, x.dtype, is_vnni
@@ -720,8 +743,9 @@ def test_cpu_sgl_int8_dense_schedulers_preserve_scaled_mm_result(tmp_path):
         ):
             torch.testing.assert_close(legacy, auto, rtol=0, atol=0)
 
-    # The exact target specializes only with 96 actual workers. A constrained
-    # team must fall back without leaving quantization rows or output tiles out.
+    # The single_shape cases start with the target without an explicit AMX
+    # initialization, then alternate through BRGEMM and back to the target.
+    # Only 96 actual workers specialize; constrained teams must preserve output.
     for case_group, requested_threads, actual_threads in (
         ("single_shape", 96, 96),
         ("single_shape", 96, 2),

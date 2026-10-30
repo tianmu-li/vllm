@@ -152,6 +152,7 @@ if (CMAKE_SYSTEM_PROCESSOR MATCHES "x86_64|amd64" OR ENABLE_X86_ISA)
     list(APPEND CXX_COMPILE_FLAGS_AVX512_AMX 
         ${CXX_COMPILE_FLAGS_AVX512}
         "-mamx-bf16"
+        "-mamx-int8"
         "-mamx-tile"
         "-mavx512bf16"
         "-mavx512vnni")
