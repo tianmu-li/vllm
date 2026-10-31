@@ -17,7 +17,7 @@ namespace {
 
 constexpr int64_t SINGLE_SHAPE_A_STRIDE = 4160;
 constexpr int64_t SINGLE_SHAPE_M_MACRO = 256;
-constexpr int64_t SINGLE_SHAPE_N_MACRO = 64;
+constexpr int64_t SINGLE_SHAPE_N_MACRO = 32;
 constexpr int64_t SINGLE_SHAPE_K_BLOCK = 1024;
 
 template <typename scalar_t, bool has_bias, int BLOCK_N, bool stream_output = false>
@@ -418,10 +418,10 @@ void single_shape_tile(
   for (int64_t k0 = k_begin; k0 < k_begin + SINGLE_SHAPE_K_BLOCK; k0 += 256) {
     Unroll<4>{}([&](auto u) {
       const int64_t k = k0 + u * 64;
-      _tile_loadd(4, A + k, SINGLE_SHAPE_A_STRIDE);
+      _tile_stream_loadd(4, A + k, SINGLE_SHAPE_A_STRIDE);
       _tile_loadd(6, B + k * 32, 128);
       _tile_dpbusd(0, 4, 6);
-      _tile_loadd(5, A + 16 * SINGLE_SHAPE_A_STRIDE + k, SINGLE_SHAPE_A_STRIDE);
+      _tile_stream_loadd(5, A + 16 * SINGLE_SHAPE_A_STRIDE + k, SINGLE_SHAPE_A_STRIDE);
       _tile_dpbusd(2, 5, 6);
       _tile_loadd(7, B + k * 32 + 64, 128);
       _tile_dpbusd(1, 4, 7);

@@ -1,5 +1,88 @@
 # CPU INT8 single-shape experiments
 
+## Qualified 200 TOPS: activation load hints and N32 windows (2026-10-31)
+
+**The stateless `c_256_32_1024` implementation passes the 200-TOPS gate.** All five fresh-process cold medians are at most 2.06158430208 ms. Their median is **2.053165 ms / 200.82 INT8 TOPS**, using `2*M*N*K`, versus 2.202130 ms for frozen production `d98b499fcf`. The geometric paired latency change is -6.690%, with process-pair bootstrap 95% interval [-7.303%, -5.980%]. No samples or processes were excluded. The slowest process is 2.059102 ms; this result qualifies this host, shape and binding rather than other workloads or machines.
+
+| Pair | Selected cold ms | Production cold ms | Legacy cold ms |
+| --- | ---: | ---: | ---: |
+| 1 | 2.057038 | 2.225864 | 3.201001 |
+| 2 | 2.053165 | 2.202130 | 3.250810 |
+| 3 | 2.052633 | 2.192868 | 3.196406 |
+| 4 | 2.052276 | 2.213648 | 3.208141 |
+| 5 | 2.059102 | 2.176640 | 3.196017 |
+
+Warm median latency is 1.837358 versus 1.948441 ms. Five separate alternating output-consuming pairs give 2.924602 versus 2.997481 ms cold and 2.762006 versus 2.745290 ms warm. The cold chain's geometric change is -2.928%, but its 95% interval [-5.914%, +0.106%] crosses zero. **A reliable end-to-end improvement is not established.** These chain measurements retain the immediate full-output `torch.sum(dtype=float32)` and are excluded from standalone acceptance.
+
+### Implementation and search selection
+
+Production changes three lines from `d98b499fcf`: activation tile loads use `tileloaddt1`, and the N macroblock is 32 columns. The M macroblock remains 256 and reduction remains four ascending K1024 blocks. Weights and partial INT32 accumulators use ordinary tile loads. The C row stride becomes 48 INT32 values, reducing each worker's private slab from 80 to 48 KiB and the fresh per-call C arena from 7.5 to **4.5 MiB**. The logical extra partial-C traffic remains **1,152 MiB per call**. The 48.8 MiB activation arena, shared maximum pass, paired conversion/publication schedule, output streaming/fence, public N32 weight packing, actual-team guard and fallback remain unchanged. There is no retained state.
+
+The continuation used a bounded 12-configuration mechanism campaign followed by a bounded six-configuration campaign; these follow the completed 24-configuration search recorded below. Every configuration received exact frozen seeded legacy and edge-fixture checks before five-cold/five-warm fresh-process screens. The first continuation bracketed against frozen production. It selected activation-T1 loads, whose overall qualification median was 2.043328 ms / 201.79 TOPS, but **only three of five process medians passed**, so that result did not qualify 200 TOPS. All five medians [2.066426, 2.043328, 2.041989, 2.033133, 2.203563] remain recorded. A subsequent fixed-count timing diagnostic did not replace or repair that failed qualification.
+
+The six-configuration campaign bracketed against the frozen unintegrated A-T1 stateless implementation to measure incremental gain. Four variants directly published register-packed quantized rows to three replicas; two tested smaller N32 accumulator slabs. The fastest normalized screen was non-temporal direct publication with shared maxima (ratio 0.986211), but its cold screen missed the target at 2.070597 ms. M256/N32 (ratio 0.989350) was within 1% and won the declared tie rule through smaller scratch and cached publication. Its 2.054623-ms screen triggered immediate qualification against actual frozen production. No further optimization configurations were built after the strict target pass.
+
+| Continuation configuration | Screen cold ms | Screen warm ms | Change vs adjacent brackets |
+| --- | ---: | ---: | ---: |
+| `k1024_a_t1` | 2.059432 | 1.817852 | -6.511% |
+| `k1024_a_t1_hoisted` | 2.061714 | 1.804692 | -7.322% |
+| `k1024_rolling` | 2.155236 | 1.923448 | -4.322% |
+| `k2048_rolling` | 2.255633 | 2.023954 | +0.849% |
+| `k_asymmetric` | 2.330683 | 2.013648 | +4.382% |
+| `k1024_rolling_a_t1` | 2.135306 | 1.950096 | -5.431% |
+| `k2048_a_t1` | 2.218580 | 2.011080 | +1.501% |
+| `k2048` | 2.239522 | 2.010191 | +1.853% |
+| `k1024_b_t1` | 2.280407 | 1.931404 | +3.786% |
+| `k2048_b_t1` | 2.300485 | 2.008071 | +3.996% |
+| `k1024_hoisted` | 2.215699 | 1.951569 | -0.309% |
+| `k2048_hoisted` | 2.225622 | 1.964794 | -0.405% |
+| `c_128_32_1024` | 2.244241 | 2.219943 | +5.519% |
+| `c_256_32_1024` | 2.054623 | 1.835652 | -1.065% |
+| `d_r3_cached_shared` | 2.104087 | 1.891401 | +1.249% |
+| `d_r3_cached_fused` | 2.140504 | 1.932964 | +1.158% |
+| `d_r3_nt_shared` | 2.070597 | 1.797529 | -1.379% |
+| `d_r3_nt_fused` | 2.202262 | 1.978164 | +7.595% |
+
+Measurements retain CPUs96–191/node1, Intel OpenMP/tcmalloc preloads, performance governor, 33 disjoint packed-weight banks, full verified huge-page backing and **1,612,185,600 intervening packed bytes**. Allocation, preparation, GEMM, epilogue and fence remain timed. Builds, tests, cleanup and other measurements stop during performance captures. The original calibration and sample-window method is unchanged. Source-matched fixtures establish the actual 96-worker optimized path separately from requested/Torch thread counts in timing records.
+
+### Evidence and reproduction
+
+The integrated source SHA256 is `640f80466257867323306d3a4d95c00f632148e3fcf0a912cde47a9fe51c5a9b`, identical to the qualified snapshot. The qualified library SHA256 is `b412ecf0085cebe5cdbe258440bfabda5f182ab41a296a9998fa819f418c77cf`. Frozen production source/library hashes and all 44 source-matched link inputs remain pinned. No library code was copied from oneDNN; the bounded upstream review supplies independent evidence for separate activation/weight load hints and cache heuristics.
+
+Archives are `/home/tianmuli/vllm_test/snc_scaling_analysis/continued_200_d98b499fcf_20261030` (12 configurations, failed A-T1 qualification and diagnostics) and `/home/tianmuli/vllm_test/snc_scaling_analysis/direct_publication_200_72e7a7b3ec_20261031` (six configurations, selected N32 qualification and consuming chain). Their sources, configuration generators, manifests, commands, raw measurements, selection and lossless cleanup/restoration journals remain separately addressable. The latter archive's `README.md` gives build, screen, qualification and selection commands; `chain_only.py c_256_32_1024` collects separate consuming-chain pairs after accepted qualification.
+
+All six configurations match frozen seed-123 legacy outputs with and without bias. Target-shape edge fixtures also cover unequal scales, quantization boundaries, NaN/Inf, strided inputs and bytewise input immutability, with per-build activation/C allocation evidence proving the actual 96-worker optimized path. The selected existing scaled-MM suite passes **26 tests**, including team/shape fallback, repeated eligible calls, first direct AMX execution and direct/BRGEMM alternation. The cached RedHatAI/Meta-Llama-3.1-8B-Instruct-quantized.w8a8 comparison passes with identical greedy outputs for two long prompts and 32 generated tokens. Its six-worker run is **fallback-only**; it does not qualify model execution of the specialization. Final accuracy records are in `verification/final_checks_terminal.json` and `verification/c_256_32_1024_correctness_model/terminal.json`.
+
+Selected disassembly confirms complete ascending K coverage, expected INT32 reload/store traffic, full-K epilogue lifetime, pending-C consumption before overwrite and final drain before tile release/fence. Quantization loop bytes match the A-T1 base. There are no unexpected vector/AMX accumulator spills; scalar control stack traffic remains. The integrated C++ hash matches the qualified source. Existing public-entry coverage and archived fixtures cover the risks; no new repository tests or helpers were added.
+
+### Native diagnostics and conditional EMON
+
+All three source-matched diagnostic stages pass exact-output and scratch-layout checks. Eighteen sequential captures (three sources, six groups including clock-only) retain offcore `config1`, untimed counter initialization followed by restored 33-bank conditioning, five marked calls, actual 96-worker evidence and exact positive running/enabled equality. Raw counts are not multiplex-adjusted. Startup covers the same N256/64 full-K accumulations per worker, and remaining GEMM N1792/448 accumulations.
+
+The selected N32 macroblock retains eight completed tiles at the startup boundary, versus 16 for the committed N64 macroblock and one for private256. Thus startup has published 56, 48 and 63 tiles respectively. Completed accumulation spans match, while output publication differs; whole-worker measurements include the final drain/fence. Pending output and scratch extents are explicit in `diagnostics/comparison.json` and per-source manifests.
+
+| Absolute aggregate Mcycles per marked call | Production startup / remaining | Private256 startup / remaining | Selected startup / remaining |
+| --- | ---: | ---: | ---: |
+| AMX busy | 25.362 / 176.174 | 25.176 / 176.169 | 25.225 / 176.201 |
+| Load bound | 87.559 / 339.382 | 66.718 / 326.650 | 75.201 / 249.743 |
+| Execution cycles | 103.408 / 434.344 | 80.438 / 417.122 | 91.124 / 342.233 |
+
+Clock-only median worker preparation/startup/remaining/drain durations are 139.338/369.562/1545.819/5.577 us for production and 140.314/372.080/1430.803/2.440 us for selected. Whole-worker medians are 2059.296 versus 1976.778 us. Independent event-group medians are not an additive time balance. Core-group cycles/reference-cycles ratios differ (approximately 1.208 versus 1.042 during startup), so these counts do not attribute the wall-time gain solely to cache behavior or prove L2 residency. Offcore line equivalents count requests, not unique operand bytes or LLC-array bandwidth.
+
+The selected screen improves by 1.065% against its A-T1 brackets and qualification improves by 6.690% against production. However, startup load-bound excess versus private256 is +8.483M cycles and remaining excess is -76.908M cycles. The fraction of positive excess persisting beyond startup is **0%**, below the 25% gate. The conditional driverless EMON repeat is therefore skipped; no new saturation claim is made. All native workload and collector processes completed and were reaped.
+
+### Cleanup and delivery
+
+The preceding 12-configuration continuation reclaimed **3,855,892,480 allocated bytes**; this six-configuration archive reclaimed **2,483,970,048 bytes** across 36 compressed inode actions and 48 original aliases. Combined continuation reclamation is **6,339,862,528 bytes / 5.90 GiB**. Final available space is **8,606,265,344 bytes**, above the 8 GiB reserve. Gross artifact savings differ from net available-space growth because sources, raw evidence and selected binaries remain retained.
+
+Every compressed payload was decompressed and SHA256-checked before originals or verified redundant aliases were removed. Completed-attempt, active-reference, dependency, inode, permission and whole-mirror proofs plus restoration commands are retained in the new journals. Unique sources, original commands/manifests, all frozen controls, legacy tensors, builder inputs/directories and runtime/model environments remain preserved. The later archive explicitly releases only three binary pins from its rejected provisional direct-publication selection; original dependency pinsets are unchanged. Final checks pass 13,026 original inode hashes, the preceding 805-file pinset, and the current 1,499-file/194-directory/seven-symlink pinset. Known non-dumpable service `/proc` visibility limits remain recorded. Owned comparison tensors are absent; shared-memory cleanup is separate from disk accounting.
+
+The selected production library stays directly loadable. Obsolete diagnostic and rejected build products are losslessly compressed, with all generated assembly, raw native captures, event headers and resource-release records preserved. All owned controllers, subprocesses, model workers, collectors and cleanup processes completed and were reaped. Applicable repository pre-commit hooks and `git diff --check` pass; the final integrated C++ SHA256 still equals the qualified source. No additional optimization configurations were built after acceptance.
+
+Historical results below remain unchanged. This work used AI assistance and has not opened a PR.
+
+---
+
 ## Expanded search: selected stateless K-blocked kernel (2026-10-30)
 
 **Integrate `b_256_64_1024` as a partial cold improvement; 200 TOPS was not reached.** The five-pair qualification gives **2.208672 ms / 186.68 cold TOPS**, versus 2.245464 ms for frozen `af3cabd16a`. The median latency reduction is 1.639%; the geometric paired change is -1.299%, with process-pair bootstrap 95% interval [-2.102%, -0.434%]. This passes the predeclared partial integration gate. All five finalist process medians exceed 2.06158430208 ms, so none passes the 200-TOPS gate. Another 0.147088 ms / 6.660% latency reduction is needed from this result.
