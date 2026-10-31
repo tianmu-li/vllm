@@ -471,6 +471,51 @@ void single_shape_tile(
   _tile_stored(3, Ctmp + 16 * 32 + 16, 128);
 }
 
+inline float single_shape_row_amax(const at::BFloat16* __restrict__ A) {
+  constexpr int64_t K = 4096;
+  constexpr float eps = 1e-7;
+  const __m512 signBit = _mm512_set1_ps(-0.0f);
+
+  // K is 32x, no remainder
+  float amax = 0.f;
+  __m512 vamax0 = _mm512_set1_ps(0.f);
+  __m512 vamax1 = _mm512_set1_ps(0.f);
+  for (int64_t k = 0; k < K; k += 32) {
+    __m512i va = _mm512_loadu_si512((void*)(A + k));
+    __m512 va0 = CVT_BF16_TO_FP32(_mm512_extracti32x8_epi32(va, 0));
+    __m512 va1 = CVT_BF16_TO_FP32(_mm512_extracti32x8_epi32(va, 1));
+    vamax0 = _mm512_max_ps(vamax0, _mm512_andnot_ps(signBit, va0));
+    vamax1 = _mm512_max_ps(vamax1, _mm512_andnot_ps(signBit, va1));
+  }
+  amax = _mm512_reduce_max_ps(_mm512_max_ps(vamax0, vamax1));
+  amax = std::max(amax, eps);
+  return amax;
+}
+
+inline void single_shape_quant_from_amax(
+    uint8_t* __restrict__ Aq, float& As,
+    const at::BFloat16* __restrict__ A, float amax) {
+  constexpr int64_t K = 4096;
+  const __m512i off = _mm512_set1_epi32(128);
+  const float scale = amax / 127;
+  const float inv_scale = 127 / amax;
+  const __m512 vd = _mm512_set1_ps(inv_scale);
+
+  for (int64_t k = 0; k < K; k += 32) {
+    __m512i va = _mm512_loadu_si512((void*)(A + k));
+    __m512 va0 = CVT_BF16_TO_FP32(_mm512_extracti32x8_epi32(va, 0));
+    __m512 va1 = CVT_BF16_TO_FP32(_mm512_extracti32x8_epi32(va, 1));
+    va0 = _mm512_mul_ps(va0, vd);
+    va1 = _mm512_mul_ps(va1, vd);
+    va0 = _mm512_roundscale_ps(va0, (_MM_FROUND_TO_NEAREST_INT | _MM_FROUND_NO_EXC));
+    va1 = _mm512_roundscale_ps(va1, (_MM_FROUND_TO_NEAREST_INT | _MM_FROUND_NO_EXC));
+    __m128i i0 = _mm512_cvtepi32_epi8(_mm512_add_epi32(_mm512_cvtps_epi32(va0), off));
+    __m128i i1 = _mm512_cvtepi32_epi8(_mm512_add_epi32(_mm512_cvtps_epi32(va1), off));
+    _mm256_storeu_si256(reinterpret_cast<__m256i*>(Aq + k), _mm256_set_m128i(i1, i0));
+  }
+  As = scale;
+}
+
 template <bool has_bias>
 void single_shape_gemm(
     at::BFloat16* __restrict__ out,
@@ -497,13 +542,13 @@ void single_shape_gemm(
         for (int64_t m = mc; m < mc + 128; m += 32) {
           if (pending.out) {
             single_shape_tile<has_bias, true>(
-                A + m * SINGLE_SHAPE_A_STRIDE, B + n * (K + 4), Cbuffers[buffer], pending);
+                A + (m - m0) * SINGLE_SHAPE_A_STRIDE, B + n * (K + 4), Cbuffers[buffer], pending);
           } else {
             single_shape_tile<has_bias, false>(
-                A + m * SINGLE_SHAPE_A_STRIDE, B + n * (K + 4), Cbuffers[buffer], pending);
+                A + (m - m0) * SINGLE_SHAPE_A_STRIDE, B + n * (K + 4), Cbuffers[buffer], pending);
           }
           pending = {out + m * N + n, B + n * (K + 4), Cbuffers[buffer],
-                     As + m, Bs + n, has_bias ? bias + n : nullptr};
+                     As + m - m0, Bs + n, has_bias ? bias + n : nullptr};
           buffer ^= 1;
         }
       }
@@ -694,6 +739,7 @@ at::Tensor int8_scaled_mm_with_quant(
   const int64_t buffer_size = M * aq_stride + M * sizeof(float);
   auto buffer = at::empty({buffer_size}, mat1.options().dtype(at::kByte));
   auto out = at::empty({M, N}, mat1.options().dtype(out_dtype));
+  at::Tensor paired_arena;
 
   const bool has_bias = bias.has_value();
   const float* bias_data = nullptr;
@@ -731,15 +777,38 @@ at::Tensor int8_scaled_mm_with_quant(
       parallel_sgl_auto_team([&](const DenseAutoExecution& execute) {
 #if defined(__AMX_INT8__) && defined(__linux__)
         if (single_shape && execute.team == 96) {
+          constexpr int64_t pair_rows = 256;
+          constexpr int64_t pair_segment_bytes =
+              pair_rows * (SINGLE_SHAPE_A_STRIDE + sizeof(float));
+          if (execute.worker == 0) {
+            paired_arena = at::empty({48 * pair_segment_bytes},
+                mat1.options().dtype(at::kByte));
+          }
           execute.quantize(M, [&](int64_t begin, int64_t end) __attribute__((always_inline)) {
             for (int64_t m = begin; m < end; ++m) {
-              quantize_row_int8<scalar_t>(Aq_data + m * aq_stride, As_data[m], A_data + m * lda, K);
+              As_data[m] = single_shape_row_amax(
+                  reinterpret_cast<const at::BFloat16*>(A_data + m * lda));
             }
           });
+          const int64_t mgroup = execute.worker % 16;
+          const int64_t ngroup = execute.worker / 16;
+          const int64_t replica = ngroup % 3;
+          const int64_t rank = ngroup / 3;
+          uint8_t* pair_Aq = paired_arena.data_ptr<uint8_t>() +
+              (replica * 16 + mgroup) * pair_segment_bytes;
+          float* pair_As = reinterpret_cast<float*>(
+              pair_Aq + pair_rows * SINGLE_SHAPE_A_STRIDE);
+          for (int64_t row = rank * 128; row < (rank + 1) * 128; ++row) {
+            const int64_t m = mgroup * 256 + row;
+            single_shape_quant_from_amax(
+                pair_Aq + row * SINGLE_SHAPE_A_STRIDE, pair_As[row],
+                reinterpret_cast<const at::BFloat16*>(A_data + m * lda), As_data[m]);
+          }
+          execute.barrier();
           AT_DISPATCH_BOOL(has_bias, with_bias, [&] {
             single_shape_gemm<with_bias>(
-                out.data_ptr<at::BFloat16>(), Aq_data, packed_w.data_ptr<int8_t>(),
-                As_data, scales2.data_ptr<float>(), bias_data, execute.worker);
+                out.data_ptr<at::BFloat16>(), pair_Aq, packed_w.data_ptr<int8_t>(),
+                pair_As, scales2.data_ptr<float>(), bias_data, execute.worker);
           });
           return;
         }

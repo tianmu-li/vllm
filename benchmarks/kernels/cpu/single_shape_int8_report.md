@@ -1,6 +1,365 @@
 # Full-K CPU INT8 single-shape experiment
 
-## Current result: bounded 200-TOPS investigation (2026-10-30)
+## Production selection: paired quantization replicas (2026-10-30)
+
+**Selected: 2.245140 ms / 183.65 cold TOPS, with 9.841% lower latency than the frozen current control. The 200-TOPS target remains unmet.** All five candidate process medians exceed 2.06158430208 ms; another 0.183556 ms (8.18%) latency reduction is required. The paired process-bootstrap 95% interval for latency change is [-10.364%, -9.239%]. The preselected partial-improvement gate passes.
+
+Qualification uses five alternating candidate/current fresh-process pairs, five cold and five warm samples per process, and a legacy process interleaved in each pair. All runs retain CPUs96–191/node1, actual-96-worker path evidence, explicit Intel OpenMP/tcmalloc preloads, performance governor/EPP, 33 disjoint packed weight banks, full verified packed huge-page backing, and 1,612,185,600 intervening packed bytes. Builds, tests and other measurement workloads are stopped during timing.
+
+| Pair | Paired cold ms | Current cold ms | Legacy cold ms |
+| --- | ---: | ---: | ---: |
+| 1 | 2.265895 | 2.486095 | 3.199072 |
+| 2 | 2.251740 | 2.487379 | 3.195180 |
+| 3 | 2.227629 | 2.495968 | 3.209089 |
+| 4 | 2.233339 | 2.483894 | 3.206980 |
+| 5 | 2.245140 | 2.495275 | 3.222466 |
+
+Candidate process medians range from 2.227629 to 2.265895 ms, with standard deviation 0.015161 ms. Median warm latency improves from 2.193797 to 1.945290 ms. Cold performance determines selection.
+
+The separate operator-plus-immediate-`torch.sum(result, dtype=torch.float32)` diagnostic also improves across five alternating process pairs: cold median 3.081022 ms paired versus 3.137695 ms current, geometric latency change -2.286%, paired-bootstrap 95% interval [-3.079%, -1.486%]. Warm chain medians are 2.893823 versus 2.919474 ms. This chain is diagnostic and is never mixed with standalone acceptance timing; other consumers can behave differently.
+
+Required pre-commit hooks pass on all four changed files, including test tethering, Ruff, clang-format, rendered Markdown and SPDX checks; `git diff --check` passes. Markdown formatting was applied before the final hook run.
+
+### Implementation and rejected alternatives
+
+The selected implementation computes each exact BF16 row maximum once, then quantizes three cached replicas per 256-row M partition. Each replica is shared by two GEMM workers whose IDs differ by 48; each converts 128 disjoint rows, then an explicit team barrier publishes both halves and local output scales. The arena is 51,167,232 bytes (48.8 MiB), versus 102,334,464 bytes for the private256 prototype. Allocation is inside the timed eligible call, performed by worker zero after the actual-96-worker guard. The shared fallback activation allocation remains reserved but its quantized activation area is unwritten on this path.
+
+The `16x6` ownership, `128x64` traversal, direct `32x32` full-K kernel, packed N32 weights, compensation, separate scaling divisions, bias and output arithmetic are unchanged. Cached activation stores win over streaming conversion; output streaming stores and their fence already existed. The only GEMM addressing changes make Aq and scales local to the paired M partition. No tuning environment variables, persistent arena or public weight-format change is introduced.
+
+Quiet fresh-process screens were current 2.493595 ms, private256 2.306115 ms, paired cached 2.235173 ms and paired streaming 2.268706 ms. A single `64x16` geometry was implemented and rejected: 2.370077 ms cold, 2.126165 ms warm. It halves B tile loads but doubles A tile loads, increasing total operand tile loads by 25% for equal output. Generated code retains accumulator tiles without unexpected spills. Separate whole-operator profiles show unchanged AMX busy work (201.5 versus 201.4 million cycles), but load-bound cycles rise from 459.7 to 526.6 million and L1-miss stall cycles from 434.5 to 505.0 million. L1 replacements rise from 213.6 to 267.0 million, consistent with greater operand-load pressure; L2 fills do not rise. These groups use separate processes and differing effective frequency, so they support the delivery-cost explanation without isolating a single instruction as its cause. This experiment does not justify further broad geometry, prefetch or K-blocking sweeps.
+
+The first paired revision exposed a concurrent Tensor assignment: an OpenMP single directive inside the dispatch macro did not guard allocation in generated BF16 code. Native traces establish the race, and the repeated-call fixture fails on its third call after two exact outputs. An ordinary `if (execute.worker == 0)` plus the existing maximum-pass barrier fixes publication. Both corrected variants pass repeated actual-path calls. Failed binaries remain diagnostic artifacts, never selection controls.
+
+### Where the time remains
+
+Separate native phase groups preserve absolute aggregate core counts per operator call; the GEMM interval includes the overlapped output epilogue. Counts below are independent group medians, not an additive latency balance. All phase intervals have positive enabled time and exact running/enabled equality. First-use perf setup perturbs the first barrier graph substantially; raw calls are retained, while steady timing comes from later calls and a clock-only cross-check.
+
+| Aggregate count per call | Current | Private256 | Paired cached |
+| --- | ---: | ---: | ---: |
+| Whole-worker cycles, million | 674.57 | 615.48 | 588.73 |
+| Whole-worker load-bound cycles, million | 544.91 | 458.78 | 453.81 |
+| Conversion cycles, million | 122.30 | 115.70 | 29.18 |
+| Conversion fill-buffer-full cycles, million | 101.09 | 31.76 | 6.73 |
+| GEMM cycles, million | 542.81 | 486.67 | 537.58 |
+| GEMM load-bound cycles, million | 438.27 | 382.61 | 433.68 |
+| GEMM AMX busy cycles, million | 201.34 | 201.34 | 201.41 |
+| GEMM L2-miss stall cycles, million | 181.55 | 129.87 | 187.94 |
+
+Current conversion includes maxima discovery; the other two have a separate roughly 6–7 million-cycle maximum pass. Paired conversion instructions are about half private256's, matching three copies instead of six. The absolute whole-worker load-stall reduction is established, but most of it is preparation: paired GEMM remains close to current and slower than private256, despite the same AMX work. Representative later graphs show maxima about 38–39 µs, conversion 104–116 µs, GEMM about 2.02–2.07 ms, plus two short barriers. These instrumented intervals do not reconstruct acceptance timing.
+
+Separate socket IMC captures measure paired reads/writes of 64.69/113.44 MiB per call, versus current 76.64/115.92 MiB, with paired combined bandwidth about 76.43 GiB/s. Socket-wide counters include background work; they do not suggest DRAM saturation. Whole-operator offcore cache-hit/peer-forward request equivalents are 1048.35 MiB paired versus 869.23 MiB current, and L2 fills 1125.36 versus 937.55 MiB-equivalent. Thus lower elapsed time does not imply less aggregate cache traffic. Offcore events include RFO and prefetch and cannot be equated to the side conversation's sequential LLC-array bandwidth ceiling.
+
+GEMM operand delivery remains the main opportunity. A next bounded experiment should preserve paired preparation while changing traversal to consume each worker's locally converted 128-row half first, comparing original order and opposite pair-member orders. Advance only if absolute GEMM load-bound/L2-stall cycles fall and cold process qualification improves. Private GEMM demonstrates potential cache-state headroom but its sixfold conversion and downstream dirty-cache pressure make it a poor replacement. Further quantization-only tuning cannot be assumed to close the full gap.
+
+### Output-consumer slowdown mechanism
+
+Same-call diagnostic controls isolate operator, BF16-to-FP32 cast, reduction and release. With a preallocated, initialized FP32 destination, cold casts take 0.262 ms current, 0.545 ms private256, and 0.265 ms paired cached. Read-only native BF16 scalar reduction stays near 0.217–0.221 ms across variants, though its numerical semantics differ from FP32-output reduction. Allocating casts are 0.264/0.681/0.364 ms respectively. Allocation traces show the FP32 destination reusing the freed scratch starting address in both prototypes; that changes destination cache history but cannot alone explain private256's persistent preallocated penalty.
+
+Cast-region profiles give nearly equal L2 fills: 297.07/296.16/296.83 MiB-equivalent per cast. Modified L2 evictions are 107.37/201.25/106.55 MiB-equivalent, and fill-buffer-full counts are 41.48/148.30/41.16 million cycles for current/private/paired. Matched unrelated-source controls also reproduce the private excess: about 201.6 versus 107.5 MiB-equivalent modified evictions, with equal fills. Cycles/reference cycles indicate essentially identical frequency in these captures. This supports FP32 destination fills displacing persistent modified cache state left by private preparation. It does not prove that every victim is activation scratch; counters do not tag addresses. The unrelated-source penalty is smaller than the result-source penalty, so output locality also matters.
+
+FIFO acknowledgements cost 1.5–1.9 ms per profiled call and ACTIVE worker waiting contaminates aggregate region cycles/instructions. Gated casts retain the private penalty, but these captures support a mechanism rather than complete causal isolation. Modified-line evictions are L2-fill-triggered writebacks to L3, not DRAM writes. Offcore masks include RFO, prefetch, code and peer forwards; their line equivalents are not pure LLC-array bandwidth or unique DRAM bytes. Phase counters are likewise not a quantization DRAM-bandwidth measurement.
+
+### Verification and provenance
+
+The corrected candidates and rejected geometry pass 1,207,975,392 exact output-element comparisons against frozen legacy, including NaN positions, unequal scales, bias/no-bias, quantization boundaries, strided BF16 input, mismatched shapes, actual-team fallback, first direct AMX execution and alternating direct/BRGEMM calls. All inputs are bytewise unchanged. Eighteen observed actual-96-worker calls establish execution of the paired path. The selected candidate passes all 26 nearby scaled-MM/kernel-selection tests. The nearest scheduler test repeats eligible calls to cover the allocation/reuse failure and checks bytewise immutable inputs.
+
+Cached Llama generation matches two 32-token sequences exactly. Its shapes exercise fallback. Six threads were requested, but spawned affinity effectively restricted execution to one physical core; this is an accuracy comparison, not a six-core performance claim or specialized-model qualification.
+
+Selected GEMM source SHA256: `8b54af658715cbbc940ffc382bc43906b40b069f132e883e55b3cc28330cbf7d`. Selected native library SHA256: `fbbb24219ac74295276d96164fbfdf1b552f7b3632f92a137fc7eaa745a3ef01`. Frozen current source/library hashes: `e68499f88763e268b1fe4b0284d8709492800af5a1bb5d2ce2ce0755fe875d15` / `6dbf65f82da0d11b9e736da09715848b5babc67bc6effce37300a16799688b91`. Controls start from commit `64db699a4fb088de079d2d3eea2eb906dd5fa3d8` plus the initially uncommitted files preserved in the archive. No old archive or control was modified.
+
+Reproduction sources, exact compile/link commands, native stages, source snapshots, generated-code review, raw timings/counters and terminal/reap audits are in `/home/tianmuli/vllm_test/snc_scaling_analysis/paired_quant_64db699a4f_20261030`. The archive depends on the prior immutable `private_quant_64db699a4f_20261030` controls and 44 frozen native link inputs. `experiment.py`, `run_remaining.py`, `diagnostics/PHASE_README.md` and `consumers/profiles/REVIEW.md` describe timing and profiling. The temporary path remains a symlink for recorded-command reproduction.
+
+The historical experiment sections below describe their then-current controls and are superseded by this production selection.
+
+## Experiment: shared maxima and private quantization (2026-10-30)
+
+**The 256-row private panel wins standalone timing at 2.299434 ms / 179.31 cold TOPS, but the output-consuming chain regresses. Production remains unchanged.** Five alternating candidate/current process pairs establish a 7.464% geometric latency reduction, with a paired process-bootstrap 95% interval of [-7.739%, -7.188%]. The candidate passes the preselected partial-improvement gate. It does not meet 200 TOPS: every process exceeds 2.06158430208 ms; another 0.237850 ms (10.34%) latency reduction is required.
+
+The current control is the existing working-tree specialization, including its previously qualified row-buffer/streaming-copy change, rather than HEAD alone. Its GEMM source SHA256 is `e68499f88763e268b1fe4b0284d8709492800af5a1bb5d2ce2ce0755fe875d15` and library SHA256 is `6dbf65f82da0d11b9e736da09715848b5babc67bc6effce37300a16799688b91`. Driver label `committed` refers to this frozen current control. The candidate library SHA256 is `e1c99a8df5b3706fe5e80927b8514c33b6878a0da481c476399c5b71448dc82b`. The original uncommitted production GEMM and CPU-installation documentation changes were preserved.
+
+### Six-way screen
+
+Five cold and five warm samples per fresh process, after builds/tests/model checks completed. Earlier concurrent-work screens, including an unusually slow baseline process, remain in the archive and are not combined with this quiet screen or qualification. No samples were excluded within any run.
+
+| Configuration | Cold ms | Warm ms | Additional private arena |
+| --- | ---: | ---: | ---: |
+| Current baseline | 2.495001 | 2.198133 | 0 |
+| Shared split, 256 rows | 2.532749 | 2.264189 | 0 |
+| Shared split, 128 rows | 2.838763 | 2.507771 | 0 |
+| Private, 256 rows | 2.312863 | 1.938314 | 97.6 MiB |
+| Private, 128 rows | 2.471532 | 2.101655 | 48.8 MiB |
+| Adjacent A readers, shared Aq | 4.339378 | 1.930639 | 0 |
+
+The shared-split controls isolate the extra maximum pass/barrier from private conversion. The two 128-row variants use identical M-panel-outer traversal and pending-epilogue flush boundaries. Adjacent placement maps physical worker `p` to logical worker `(p / 6) + 16 * (p % 6)` while retaining quantization ownership. It improves warm execution and quantization, but substantially worsens cold GEMM; it is rejected under the cold criterion. The smaller private panel is also rejected in favor of the faster 256-row panel. Neither shared split is beneficial.
+
+### Selected experimental implementation
+
+Compute each row's maximum once into the existing shared scalar area, preserving both FP32 maximum recurrences, operand order, reduction and epsilon. After that dependency barrier, each GEMM worker derives `amax / 127` and `127 / amax` separately, converts its own 256-row M partition once into cached private INT8 storage, and reuses it across its 2048 assigned N columns. Conversion occurs six times per global activation row. Shared Aq remains unwritten; the existing fallback allocation remains reserved.
+
+A tensor-backed arena is allocated inside every timed operator call before OpenMP. Its 96 exclusive, 64-byte-aligned segments contain rows at stride 4160 and local output scales. The 256-row arena is 102,334,464 bytes; the 128-row arena is 51,167,232 bytes. No persistent scratch cache, untimed initialization, public selector or weight-format change is introduced. Both private variants retain compensation and full-K arithmetic, release tile state and fence output stores. The 128-row variant finishes its deferred epilogue and clears pending state before overwriting scratch or scales.
+
+Generated code preserves separate divisions, maximum operand ordering, rounding and byte packing. Conversion helpers inline into GEMM, use cached scratch stores, and introduce no vector spills in bias/no-bias GEMM specializations. Tile configuration/release counts stay at 96 per call. Both 128-row variants add a second pending-output flush per worker without changing the 49,152 tiles per operator. The prototype allocates its full arena for exact-shape calls that later fall back because of a smaller actual team, and constructs a zero-sized arena tensor for other shapes; fallback output checks do not establish fallback latency.
+
+### Qualification and downstream consumption
+
+All processes use physical CPUs 96–191, NUMA node 1, 96 requested workers, explicit Intel OpenMP/tcmalloc preloads, performance governor/EPP, ACTIVE wait policy, 33 disjoint weight banks, 100% verified packed-weight huge-page backing and 1,612,185,600 intervening packed bytes. Instrumented records establish 96 distinct actual workers. Five cold samples and five warm samples are recorded per acceptance process; a frozen legacy process is interleaved in each pair.
+
+| Pair | Candidate cold ms | Current cold ms | Legacy cold ms |
+| --- | ---: | ---: | ---: |
+| 1 | 2.299434 | 2.484869 | 3.205299 |
+| 2 | 2.296528 | 2.495276 | 3.203036 |
+| 3 | 2.303970 | 2.481417 | 3.204811 |
+| 4 | 2.311023 | 2.487342 | 3.224053 |
+| 5 | 2.297187 | 2.487428 | 3.212732 |
+
+Candidate process-median range is 2.296528–2.311023 ms, standard deviation 0.006006 ms. Median warm latency is 1.926183 versus 2.195904 ms.
+
+An immediate full BF16 output sum into FP32 measures consumption separately from standalone acceptance. Its initial pair suggested a cold regression, so five alternating fresh-process pairs were run. All five pairs regress cold: process-median medians are 3.354985 versus 3.129213 ms, with a paired geometric regression of **5.976%**, 95% interval [4.534%, 7.439%]. Warm chain medians are 2.977891 versus 2.908952 ms. This diagnostic does not establish a regression for every possible downstream consumer, but the standalone gain does not carry through this chain.
+
+### Phase and counter interpretation
+
+Separate instrumented binaries record 25 calls and 96 workers per configuration. Times below are medians across worker-call observations; repeated 128-row conversion and GEMM intervals are summed within each worker-call before taking its median. Columns cannot be added to reconstruct operator latency. Timestamp/fault-query instrumentation perturbs execution, and AMX overlaps the epilogue.
+
+| Configuration | Maximum pass µs | Conversion µs | AMX plus overlapped epilogue µs |
+| --- | ---: | ---: | ---: |
+| Current baseline | fused | 397.5 | 1909.6 |
+| Shared split, 256 rows | 20.9 | 330.6 | 1916.9 |
+| Shared split, 128 rows | 20.9 | 360.4 | 2209.4 |
+| Private, 256 rows | 21.4 | 418.1 | 1732.8 |
+| Private, 128 rows | 20.8 | 165.0 | 2117.6 |
+| Adjacent A readers, shared Aq | fused | 109.7 | 4000.0 |
+
+Private 256-row preparation is not faster: it adds the shared maximum pass and performs much more conversion per worker. Its benefit is the shorter mixed GEMM/epilogue region. Private 128-row conversion is faster, but the longer weight reuse distance increases the mixed region and cache traffic. This constrains the explanation without attributing the entire gain to one coherence queue.
+
+Separate core/cache/stall groups report absolute counts per call and 100% counter coverage. Cache-group L2 fill traffic estimates are 1.002 GB for current, 1.155 GB for private256 and 1.891 GB for private128, counting repeated fills rather than distinct data or DRAM traffic. Private256 therefore increases total L2 fills while reducing demand misses and waiting. AMX busy counts remain approximately 201.34 million cycles per call. Core-group load-bound cycles fall from 541.05 to 467.53 million; L2-miss stalls fall from 214.27 to 189.73 million in their separate group. These overlapping events cannot be added.
+
+The first baseline FB-full profile had extra runtime/spin variability. A separate quiet repeat resolves that confound:
+
+| Quiet FB-full group | Current, million cycles/call | Private256, million cycles/call |
+| --- | ---: | ---: |
+| Fill-buffer full, raw 0x0248 cmask 0 | 308.458 | 228.194 |
+| Load-bound | 542.891 | 468.493 |
+| L1-miss stalls | 447.398 | 437.741 |
+| AMX busy | 201.338 | 201.335 |
+
+Absolute FB-full cycles decrease 26.02% and load-bound cycles decrease 13.70% in this repeat. This supports reduced waiting over the complete operator; it does not isolate quantization or prove an invalidation/admission-queue mechanism. Validated socket-1 CHA local requests are measured separately: current/private256 local reads are 1.123/0.926 million per call and local writes 1.978/1.853 million. These broad events count requests rather than cache-fill bytes, invalidations or WCILF residence. All measured worker phase/fault windows report zero minor faults. Scratch VMA backing and NUMA records are retained; VMA aggregates do not prove exact arena huge-page coverage.
+
+No 480 GiB/s DRAM quantization claim is made. Resident private conversion, sixfold conversion work and the shared maximum pass are different traffic scopes from the original 48 MiB useful-traffic metric.
+
+### Verification, recommendation and reproduction
+
+All six variants match legacy across 251,664,576 compared output elements per variant, including unequal channel scales, bias/no-bias, strided BF16 input, boundary values, NaN/Inf patterns, smaller actual teams, mismatched shapes, first direct AMX execution and alternating AMX/BRGEMM. Finite outputs use zero tolerances; NaN outputs match by position with `equal_nan=True`, without checking their payload bits. Inputs remain unchanged at the bit level. Split conversion matches 278,462,464 INT8 bytes and 67,984 raw scale-bit values, including every BF16 encoding. The nearest scheduler fixture adds distinct scales around 128-row panel reuse boundaries. The selected candidate passes all 26 scaled-MM kernel-selection tests. Cached Llama generation matches both 32-token outputs; it exercises fallback. Required hooks and archive checks are recorded with the artifacts.
+
+Retain private256 as the measured standalone winner and a reviewable experimental patch. Retire the other four candidates under the cold criterion. Its 97.6 MiB arena and confirmed consuming-chain regression are material tradeoffs. The experiment leaves production unchanged; it does not justify a general performance claim or claim 200 TOPS.
+
+Persistent artifacts: [/home/tianmuli/vllm_test/snc_scaling_analysis/private_quant_64db699a4f_20261030/README.md](/home/tianmuli/vllm_test/snc_scaling_analysis/private_quant_64db699a4f_20261030/README.md). They include all six source/library snapshots, five patches, hashes, 44 frozen link inputs, frozen legacy control, raw initial and quiet screens, five standalone qualification pairs, five consuming-chain pairs, phase timestamps/faults/mappings, independent measurement review, raw perf/CHA encodings and coverage, correctness/model/hook logs and reproduction commands. `/tmp/sgl-private-quant-20261030` resolves to the archive so recorded commands remain valid.
+
+## Retained production result: quantization pipeline (2026-10-30)
+
+**The 480 GiB/s quantization target was not reached.** The retained partial improvement measures **2.513397 ms / 164.05 cold TOPS**, against **2.552284 ms** for source baseline `64db699a4fb088de079d2d3eea2eb906dd5fa3d8` in the same qualification run.
+The paired geometric latency change is **-1.553%**, with a paired process-bootstrap 95% interval of **[-2.021%, -1.158%]**. This passes the preselected partial-improvement gate: aggregate candidate median at least 1% lower and the paired upper bound below zero. None of the five processes meets the 200-TOPS limit of 2.06158430208 ms.
+
+### Retained change
+
+Only the guarded exact-shape, 96-actual-worker quantization store path changes. Each productive worker uses the unchanged row quantizer into an aligned private 4 KiB stack buffer, then copies its 4096 bytes with 64 aligned 64-byte streaming stores. One worker fence precedes the existing GEMM barrier. The row buffer adds 384 KiB across 96 workers and is reused within the call; no allocation, page preparation, or arithmetic is moved outside operator timing. The existing heap allocation, 4160-byte row stride, balanced row partitions, quantization arithmetic, public weights, compensation, AMX loop and output epilogue remain unchanged. Defaults and fallback remain unchanged.
+
+Generated code retains both FP32 maximum recurrences and their operand order, horizontal reduction, scale divisions, rounding and integer conversion. The copy loop emits full ZMM `vmovntdq` stores and `sfence`, with no quantization register spills. Normalized bias/no-bias AMX instruction streams match baseline structurally (817/807 instructions, 94 static tile instructions each). No new production helper, tuning control or compiler flag is added.
+
+### Qualification
+
+Five alternating candidate/current fresh-process pairs, five cold and five warm samples per process, with one interleaved frozen legacy control per pair. Physical CPUs 96–191, NUMA node 1, 96 workers, explicit Intel OpenMP/tcmalloc preloads, performance governor/EPP audits, 33 disjoint packed-weight banks and verified 100% packed huge-page backing are retained. Intervening packed weights exceed 1.5 GiB. No samples were excluded. Node 0 handles tests/builds/model checks; socket 1 measurements run sequentially.
+
+| Pair | Candidate cold ms | Current cold ms | Legacy cold ms |
+| --- | ---: | ---: | ---: |
+| 1 | 2.504523 | 2.547750 | 3.208818 |
+| 2 | 2.513397 | 2.544150 | 3.301655 |
+| 3 | 2.491066 | 2.552284 | 3.203769 |
+| 4 | 2.523940 | 2.562383 | 3.221851 |
+| 5 | 2.532281 | 2.556703 | 3.221504 |
+
+Candidate process-median standard deviation is 0.016160 ms; range 2.491066–2.532281 ms. Warm median is 2.235358 versus 2.299980 ms (-2.81%).
+
+### Quantization bandwidth and mechanism
+
+Useful traffic is 4096×4096×3 = 50,331,648 bytes (48 MiB): one logical BF16 input read and one byte output. At 480 GiB/s this requires **97.65625 µs**. This is useful bandwidth, not measured DRAM traffic: the unchanged two-pass quantizer logically reads input twice. Row staging adds one private scratch write and read, making the selected logical traffic 7 bytes/value rather than baseline 5; most extra scratch traffic stays in L1.
+
+Separate instrumented binaries record earliest worker quantization-work entry through latest work completion, including the copy and fence. Five alternating candidate/baseline process pairs each record 25 calls. These diagnostic clocks exclude dispatch/barrier and fault-query overhead and are not acceptance timings.
+
+| Process | Candidate µs | Candidate useful GiB/s | Baseline µs | Baseline useful GiB/s |
+| --- | ---: | ---: | ---: | ---: |
+| 1 | 451.378 | 103.85 | 507.684 | 92.33 |
+| 2 | 448.661 | 104.48 | 502.311 | 93.32 |
+| 3 | 449.383 | 104.31 | 502.845 | 93.22 |
+| 4 | 450.556 | 104.04 | 502.456 | 93.29 |
+| 5 | 447.653 | 104.71 | 507.857 | 92.30 |
+
+Median of process medians: **449.383 µs / 104.31 GiB/s**, versus 502.845 µs / 93.22 GiB/s. All 250 calls and 24,000 worker quantization windows report zero minor faults. Neither alignment/huge-page advice nor moving allocation work explains the actual fused slowdown.
+
+A separate native control retains the same rows and padded Aq storage. Owner-private resident quantization is fast; after six workers read each 256-row Aq partition, cached writes slow substantially. The reader touches every cache line and barriers before quantization. This reproduces the store-ownership constraint without AMX. Reused-output medians from the final frozen native binary:
+
+| Native control | Owner-private µs | After six shared readers µs |
+| --- | ---: | ---: |
+| legacy | 47.296 | 461.503 |
+| minimum | 44.219 | 531.556 |
+| copy | 22.614 | 423.209 |
+| max | 22.556 | 25.207 |
+| convert | 40.307 | 435.361 |
+
+Separately gated native controls show demand RFO requests rising from 1,999 to 191,837 per iteration, and L2 RFO misses from 1,971 to 130,743. These are requests, not cycles or bytes. The counter region includes the 96 MiB shared-reader loads, barriers and metadata per iteration, so its aggregate cycles are not pure quantization cycles. All events have 100% coverage. Resident controls cannot establish socket-wide DRAM bandwidth.
+
+### Quantization-only counter follow-up
+
+Per-worker `perf_event_open` groups run continuously, with group reads directly before and after each quantization loop. Each of four controls uses one fresh process per group and 100 samples. Counts exclude shared-reader setup, cache preparation, AMX, barriers and kernel/hypervisor execution. User syscall-wrapper instructions and timestamp fences remain inside the counter boundaries; work timestamps exclude the counter reads. All 96 workers and every sample have 100% enabled/running coverage.
+
+| Quantization-only event per call | Private legacy | Shared legacy | Private streaming | Shared streaming |
+| --- | ---: | ---: | ---: | ---: |
+| Execution Mcycles | 8.584 | 112.236 | 11.450 | 107.494 |
+| Store-bound Mcycles | 0.000 | 56.177 | 0.000 | 0.379 |
+| Store-buffer-full Mcycles | 0.000 | 56.221 | 0.000 | 0.383 |
+| Cycles with pending RFO, Mcycles | 0.145 | 111.220 | 0.152 | 2.603 |
+| Demand RFO requests | 461 | 191,623 | 388 | 750 |
+| L2 RFO misses | 457 | 130,514 | 388 | 737 |
+| Load-bound Mcycles | 0.230 | 46.198 | 2.219 | 95.478 |
+| L2-miss stall Mcycles | 0.002 | 0.473 | 0.004 | 0.596 |
+| L3-miss stall Mcycles | 0.000 | 0.011 | 0.001 | 0.002 |
+| Fill-buffer-full Mcycles | 0.000 | 46.892 | 2.850 | 96.259 |
+| False address dependency events | 0 | 8 | 1 | 3 |
+| Blocked store-forwarding events | 0 | 0 | 3 | 4 |
+| Memory-ordering machine clears | 0 | 1 | 427 | 411 |
+
+Streaming removes most demand RFOs and conventional store-buffer stalls, but the shared output still stalls the quantization pipeline: fill-buffer-full cycles are **96.259 Mcycles / 107.387 M execution cycles (89.6%)**, versus 2.850 / 11.480 Mcycles (24.8%) with private output. The buffer-group process medians are 446.471 versus 52.307 µs for streaming, and 435.139 versus 44.556 µs for legacy. False address dependencies and store-forwarding blocks are negligible. Memory-ordering machine clears increase with streaming, but event counts alone do not establish their cycle cost.
+
+This is strong evidence for cache-coherent write delivery and limited fill-buffer capacity as the remaining constraint in the reproduced shared-operand state. Replacing the maximum reduction cannot remove this constraint. The selected kernel is not simply saturating socket DRAM bandwidth: the same arithmetic/store loop is fast with private output, input-only maximum is fast under shared-output setup, and L2/L3 load-miss stall cycles remain small. These controls do not isolate a particular coherence response, LLC slice, or exact DRAM rate during fused quantization. Native standalone controls also do not predict the full-operator gain; only the repeated operator qualification selects production.
+
+The fill-buffer cycle event uses `L1D_PEND_MISS.FB_FULL`, event 0x48 / umask 0x02 / **cmask 0**. The whole-operator group uses cmask 1, which counts full-buffer periods; its derived summary therefore reports a count rather than a stall-cycle fraction. Raw encodings, per-worker deltas, event-catalog provenance and this unit correction are retained in the archive.
+
+### Shared-output root-cause follow-up
+
+Further controls narrow the bottleneck to **placement-dependent shared-output ownership and uncore write handling**. Fill-buffer pressure is the observed backpressure, rather than a sufficient explanation of its source. This investigation changes no production kernel code or system settings.
+
+The native control divides output among W exclusive writers and maps F readers per writer as `(writer + offset + j*step) % 96`. Every reader loads every logical cache line and finishes before the writer barrier. Default step is `96/F`; six readers spaced by 16 correspond to the current AMX A-sharing worker spacing. Explicit step 1 clusters readers on adjacent physical-core IDs, without assuming physical mesh adjacency. Constant full-line store controls remove all input loads, quantization arithmetic, scale writes and scratch writes.
+
+| 4096-row native control | No readers, µs | One remote reader, µs | Six spaced readers, µs |
+| --- | ---: | ---: | ---: |
+| Pure streaming stores | 41.343 | 46.818 | 427.212 |
+| Pure cached stores | 22.260 | 34.500 | 421.529 |
+| Selected row-staged quantizer | 53.231 | 65.771 | 449.174 |
+| Batch-staged quantizer | 70.911 | 77.163 | 460.338 |
+
+Both store types reproduce the slowdown. Staging all rows before streaming does not rescue it. Two spaced readers remain fast; three and four trigger sharp increases. Fanout also changes reader spacing, so those results do not establish a fixed hardware sharer-count threshold.
+
+Holding six readers fixed demonstrates a substantial placement effect. Five alternating fresh-process pairs with explicit NUMA-node-1 memory binding and 50 samples per process confirm:
+
+| Native control | Readers spaced by 16, µs | Adjacent readers, µs |
+| --- | ---: | ---: |
+| Pure streaming stores | 427.663 | 140.774 |
+| Selected quantizer | 447.084 | 146.254 |
+
+These are medians of process medians. Selected-quantizer process ranges are 445.703–448.610 and 143.538–146.655 µs respectively. A separate five-pair owner-first-touch run gives the same result. No samples were excluded.
+
+Writer scaling keeps 32 rows per writer, avoiding a changing per-core cache footprint. With six spaced readers, pure streaming stores take 53.282/106.449/160.634/212.972/323.072 µs at 16/32/48/64/96 writers: approximately **39 GB/s logical output** throughout. Unshared times are 11.206/12.131/19.263/22.833/32.109 µs. The slowdown depends on both sharing and concurrent writers, supporting a socket-wide throughput bottleneck. Passive OpenMP barriers produce large wakeup skew and are excluded from this inference; active-policy per-worker timestamps confirm that shared writes themselves take hundreds of microseconds.
+
+The streaming-store opcode is positively identified by Intel GNR's **WCILF** events. Every tested NT layout issues exactly **262,144 WCILF requests per call**, including selected quantization. Paired `TOR_OCCUPANCY.IA_WCILF` and `TOR_INSERTS.IA_WCILF` counts give observed mean request-table residence in CHA cycles:
+
+| Pure streaming-store layout | Write µs | Mean TOR residence, CHA cycles |
+| --- | ---: | ---: |
+| No readers | 41.194 | 514.4 |
+| Two readers, step 48 | 49.939 | 594.6 |
+| Four readers, step 24 | 605.870 | 1,878.7 |
+| Six readers, step 16 | 427.774 | 1,521.1 |
+| Six readers, step 1 | 141.246 | 895.1 |
+
+For selected quantization, step 16 measures 447.207 µs / 1,672.5 CHA cycles versus 145.534 µs / 852.6 cycles at step 1. All 120 CHAs have higher residence than the unshared control, while insert counts remain broadly distributed (3.4–3.9% coefficient of variation). Absolute pure-NT fill-buffer-full cycles rise from 7.596 to 116.014 Mcycles per call with six spaced readers; selected-quantizer cycles rise from 2.817 to 98.052 Mcycles. Every core/CHA group has 100% enabled/running coverage, and every collected native timing has zero page faults and valid writer affinity.
+
+CHA sample-block gating includes reader preparation and barriers but excludes startup and warmups; the exact WCILF insert count attributes these requests to timed NT output. Occupancy uses event 0x36, inserts 0x35, low mask 0x01 and extended mask 0x00C867FF. Occupancy is constrained to counter 0 and appears first in each group. Uncore clocks vary during gating/setup, so residence is reported in cycles rather than a precise nanosecond conversion. It measures time inside TOR, not total store latency.
+
+The earlier ItoM selector does not observe these NT requests. The particular `OSB.RFO_HITS_SNP_BCAST` event remains zero; **snoop broadcast or compressed-directory overflow is not established**. Positive WCILF and broad request controls validate counter sensitivity and socket routing. Longer TOR residence, fewer completed writes per unit time, placement dependence and writer saturation support an uncore write-handling constraint, but do not identify its exact admission, snoop-service or downstream queue.
+
+The next bounded production experiment is to map the six A-sharing GEMM workers to adjacent cores while preserving the 16×6 work assignment and exclusive outputs, then measure quantization and AMX separately and qualify the full cold operator. The native 146-µs result does not establish a full-operator gain, 200 TOPS, or 480 GiB/s DRAM bandwidth.
+
+Sources, controls, raw samples, counters, independent review and replay scripts are preserved in `/home/tianmuli/vllm_test/snc_scaling_analysis/quant_sharing_64db699a4f_20261030/README.md`.
+
+### Bounded screening and nonfinite semantics
+
+Fifteen configurations were screened in fresh processes using five cold samples and full frozen-legacy output verification before timing. Each row reports its contemporaneous committed control; screen winners are not qualified results.
+
+| Configuration | Cold ms | Control ms | Disposition |
+| --- | ---: | ---: | --- |
+| `aligned` | 2.554639 | 2.539933 | No useful cold benefit |
+| `baseline_huge` | 2.535022 | 2.539933 | No useful cold benefit |
+| `huge` | 2.551914 | 2.539933 | No useful cold benefit |
+| `demote` | 2.617210 | 2.547991 | No useful cold benefit |
+| `rotating8` | 2.523303 | 2.547991 | Unstable; warm regression; more scratch |
+| `ownership` | 2.529652 | 2.530280 | No useful cold benefit |
+| `stream` | 2.574006 | 2.530280 | No useful cold benefit |
+| `write_prefetch2` | 2.533224 | 2.537326 | No useful cold benefit |
+| `copy_direct` | 2.486786 | 2.537326 | Within 0.1% of selected screen; more complexity |
+| `write_prefetch8` | 2.534611 | 2.537326 | No useful cold benefit |
+| `minimum2` | 2.567778 | 2.535964 | No useful cold benefit |
+| `rotating4` | 2.545941 | 2.551198 | No useful cold benefit |
+| `rotating` | 2.547521 | 2.539669 | No useful cold benefit |
+| `copy_cached` | 2.519279 | 2.538257 | Below 1% gate |
+| `copy_stream` | 2.484844 | 2.538257 | Selected and qualified |
+
+`minimum2` uses an unsigned BF16 integer magnitude maximum; `aligned`/`huge` add aligned/advised scratch; `baseline_huge` retains legacy arithmetic; `ownership` matches producer rows to 16×6 consumers; `stream` streams 32-byte quantizer stores; `copy_cached`/`copy_stream` stage unchanged arithmetic with cached/streaming full-line copy; `rotating`/`rotating4`/`rotating8` use 2/4/8 Aq slots within each call; `demote` demotes consumer lines; `write_prefetch2`/`write_prefetch8` prefetch write ownership; `copy_direct` uses MOVDIR64B. These alternatives are absent from production.
+
+Unsigned sign-cleared BF16 codes correctly order finite magnitudes and infinity. NaNs exceed `0x7f80` and cannot simply join the integer maximum: legacy `MAXPS` can forget an earlier maximum after a NaN in the same lane recurrence, or propagate NaN during reduction. For example, successive lane values 10, NaN, 1 can leave 1. The experimental integer helper detects NaNs and reruns the unchanged quantizer; infinities retain the original FP conversion behavior. Exhaustive native testing covers all 65,536 BF16 codes and signed NaN payload/order patterns, comparing 278,462,464 Aq bytes and 67,984 scale patterns with zero mismatches. Its full-operator timing was slower, so the selected implementation retains the original arithmetic directly and needs no nonfinite fast-path logic.
+
+### Separate counters and downstream consumption
+
+Each counter group is collected in a separate fresh process, normalized by timed calls, with at least 99% coverage. Cycle fractions overlap; changes below use absolute cycles/call.
+
+| Event, Mcycles/call | Candidate | Current |
+| --- | ---: | ---: |
+| Execution cycles | 728.682 | 732.180 |
+| AMX busy | 201.338 | 201.362 |
+| Load bound | 542.386 | 505.265 |
+| L1 miss stalls | 446.882 | 426.127 |
+| L2 miss stalls | 212.972 | 193.974 |
+| L3 miss stalls | 10.800 | 9.304 |
+| Load DTLB walk | 0.085 | 0.100 |
+| Store DTLB walk | 0.087 | 0.107 |
+
+| Requests/call | Candidate | Current |
+| --- | ---: | ---: |
+| L2_DEMAND_HIT | 145,831,593 | 145,856,687 |
+| L2_DEMAND_MISS | 1,058,922 | 1,139,982 |
+| L2_RFO_HIT | 3,385,529 | 3,278,259 |
+| L2_RFO_MISS | 168,388 | 168,917 |
+| L2_ALL_RFO | 3,180,885 | 3,446,993 |
+
+| Line traffic/call, MiB | Candidate | Current |
+| --- | ---: | ---: |
+| L2_LINES_IN | 951.85 | 951.98 |
+| L2_DIRTY_EVICTIONS | 49.08 | 44.36 |
+| SOCKET_CACHE_READS | 876.39 | 903.74 |
+| LOCAL_DRAM_READS | 66.81 | 50.99 |
+| Socket 1 IMC read | 76.14 | 61.35 |
+| Socket 1 IMC write | 115.37 | 100.25 |
+
+Absolute load-bound cycles change +7.35%, L2-miss stall cycles +9.79%, and L3-miss stall cycles +16.08%. Line traffic is count×64 and includes repeated requests, not unique payload. Demand misses exclude merged misses; IMC units are honored and socket-wide counters include background activity. These measurements support a cache-delivery diagnosis but do not isolate LLC slices or establish a quantization-only DRAM rate.
+
+Core diagnostic cycles/reference-cycles ratio: candidate 2.974 GHz equivalent (2.4 GHz reference).
+Core diagnostic cycles/reference-cycles ratio: current 2.955 GHz equivalent (2.4 GHz reference).
+
+A separate chain immediately sums every BF16 output in FP32. It is diagnostic only and excluded from acceptance; each mode uses one fresh process and five samples.
+
+| Operator + output sum | Candidate ms | Current ms |
+| --- | ---: | ---: |
+| cold | 3.115377 | 3.160214 |
+| warm | 2.861827 | 2.917406 |
+
+### Verification and reproducibility
+
+The complete scaled-MM kernel-selection suite passes 26 tests, including exact frozen legacy output comparison, unequal scales, bias/no-bias, boundary and signed quiet/signaling NaN/Inf rows, bitwise input preservation, strided BF16 input, first direct AMX execution, alternating AMX/BRGEMM, mismatched shapes and constrained actual-team fallback. The diagnostic phase binary also passes full-operator legacy comparison and input immutability. Required pre-commit hooks and `git diff --check` pass. The existing cached Llama greedy-generation comparison matches token IDs/text under legacy and single_shape; this model exercises fallback, not the exact specialization.
+
+Selected `gemm_int8.cpp` SHA256: `e68499f88763e268b1fe4b0284d8709492800af5a1bb5d2ce2ce0755fe875d15`.
+Selected extension SHA256: `6dbf65f82da0d11b9e736da09715848b5babc67bc6effce37300a16799688b91`.
+Current baseline extension SHA256: `a1888f1c9e406212164a03f4b8657ebcf6365f6f66f25c826c2f63188b6eba67`.
+
+Persistent archive: `/home/tianmuli/vllm_test/snc_scaling_analysis/quant_pipeline_64db699a4f_20261030`. Its `README.md` records replay commands, original-path substitutions and dependencies. Source snapshots, all raw cold/warm samples, failed experiments, build commands and hashes, frozen link inputs/control binaries, phase/RFO evidence, codegen review, test/model/hook logs and a SHA256 integrity manifest are retained. Original root: `/tmp/sgl-quant-64db699a4f-20261030`. No system settings were changed. AI assistance was used.
+
+## Previous result: bounded 200-TOPS investigation (2026-10-30)
 
 **200 cold full-operator TOPS was not reached.** The retained partial improvement
 measures **2.534940 ms / 162.65 cold TOPS**, compared with **2.564961 ms / 160.75

@@ -437,6 +437,43 @@ def test_cpu_sgl_int8_dense_schedulers_preserve_scaled_mm_result(tmp_path):
                     dtype=x.dtype,
                 )
                 x[[2, 31, 32, m - 1]] = boundary.repeat(k // 16)
+                # Pending rows must retain their scales across a 128-row panel.
+                x[96:128] = boundary.repeat(k // 16) * 0.125
+                x[224:256] = boundary.repeat(k // 16) * 8
+                if case_group == "single_shape" and not has_bias:
+                    # MAXPS can forget earlier maxima after a NaN in the
+                    # same 32-lane recurrence, or propagate one at its merge.
+                    patterns = (
+                        (0, 32, 64),
+                        (64, 32, 0),
+                        (32, 0, 64),
+                        (64, 0, 32),
+                        (0, k - 32, 32),
+                        (0, k - 16, 32),
+                        (16, k - 32, 48),
+                        (0, 17, 64),
+                    )
+                    row = 64
+                    for payload in (
+                        0x7FC1, 0xFFC1, 0x7FFF, 0xFFFF,
+                        0x7F81, 0xFF81, 0x7FBF, 0xFFBF,
+                    ):
+                        for large, nan, small in patterns:
+                            x[row].fill_(1)
+                            x[row, large] = 64
+                            x[row, small] = -0.5
+                            x.view(torch.int16)[row, nan] = (
+                                payload if payload < 0x8000 else payload - 0x10000
+                            )
+                            row += 1
+                    for payload in (0x7F80, 0xFF80):
+                        x[row].fill_(1)
+                        x[row, 0] = 64
+                        x[row, 64] = -0.5
+                        x.view(torch.int16)[row, 32] = (
+                            payload if payload < 0x8000 else payload - 0x10000
+                        )
+                        row += 1
             if not target_shape:
                 reference_weight = weight.float()
             if is_vnni:
@@ -453,9 +490,25 @@ def test_cpu_sgl_int8_dense_schedulers_preserve_scaled_mm_result(tmp_path):
             result = torch.ops._C.int8_scaled_mm_with_quant(
                 x, weight, weight_scale, bias, x.dtype, is_vnni
             )
+            if (
+                target_shape
+                and has_bias
+                and os.environ["VLLM_CPU_SGL_SCHEDULER"] == "single_shape"
+                and os.environ["OMP_THREAD_LIMIT"] == "96"
+            ):
+                # Repeated calls exercise shared scratch allocation and reuse.
+                for _ in range(2):
+                    repeated = torch.ops._C.int8_scaled_mm_with_quant(
+                        x, weight, weight_scale, bias, x.dtype, is_vnni
+                    )
+                    torch.testing.assert_close(
+                        repeated, result, rtol=0, atol=0, equal_nan=True
+                    )
             if case_group.startswith("single_shape"):
                 for tensor, saved in zip(inputs, saved_inputs, strict=True):
-                    torch.testing.assert_close(tensor, saved, rtol=0, atol=0)
+                    assert torch.equal(
+                        tensor.view(torch.uint8), saved.view(torch.uint8)
+                    )
             if target_shape:
                 # Compare every target element against legacy below, avoiding
                 # a second full-size floating-point GEMM in each subprocess.
@@ -768,7 +821,9 @@ def test_cpu_sgl_int8_dense_schedulers_preserve_scaled_mm_result(tmp_path):
         for legacy, single_shape in zip(
             legacy_results, single_shape_results, strict=True
         ):
-            torch.testing.assert_close(legacy, single_shape, rtol=0, atol=0)
+            torch.testing.assert_close(
+                legacy, single_shape, rtol=0, atol=0, equal_nan=True
+            )
 
 
 @pytest.mark.skipif(
