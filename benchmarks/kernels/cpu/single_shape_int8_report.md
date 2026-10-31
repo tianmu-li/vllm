@@ -1,6 +1,199 @@
-# Full-K CPU INT8 single-shape experiment
+# CPU INT8 single-shape experiments
 
-## Production selection: paired quantization replicas (2026-10-30)
+## Expanded search: selected stateless K-blocked kernel (2026-10-30)
+
+**Integrate `b_256_64_1024` as a partial cold improvement; 200 TOPS was not reached.** The five-pair qualification gives **2.208672 ms / 186.68 cold TOPS**, versus 2.245464 ms for frozen `af3cabd16a`. The median latency reduction is 1.639%; the geometric paired change is -1.299%, with process-pair bootstrap 95% interval [-2.102%, -0.434%]. This passes the predeclared partial integration gate. All five finalist process medians exceed 2.06158430208 ms, so none passes the 200-TOPS gate. Another 0.147088 ms / 6.660% latency reduction is needed from this result.
+
+The tradeoff is material: standalone warm latency is 1.957159 versus 1.939355 ms (+0.918%). A separate five-pair operator-plus-`torch.sum(output, dtype=float32)` consuming chain is 3.019710 versus 2.930580 ms cold (+3.041%), and 2.779562 versus 2.684401 ms warm (+3.545%). The chain's geometric paired regression is +2.602%, with 95% interval [+1.034%, +4.025%]. Cold standalone latency determines selection under the supplied acceptance rule. These results do not establish an end-to-end improvement, and subtracting independent chain and standalone timings cannot isolate fence cost.
+
+### Implementation and complete bounded search
+
+All **24 new optimization configurations** were built outside production, verified against seeded frozen legacy output before screening, and screened with five cold and five warm samples in fresh processes bracketed by fresh committed processes. Frozen and diagnostic controls do not count toward that budget. Ranking uses adjacent committed-bracket latency ratios; candidates within 1% follow the fixed preference for committed production, full-K execution, smaller scratch, cached publication, shared-max schedule, then ID. No screen reached the 200-TOPS threshold.
+
+The eight quantize-once variants partition each M256 group's rows among its six producers, convert each row once in an aligned 4 KiB local buffer, and publish completed 64-byte chunks to R2/R3/R6 replicas. Cached and non-temporal variants retain shared maxima; two additional non-temporal R3/R6 variants fuse unchanged row maxima with conversion. Arena allocation remains worker-zero-only inside the actual-96-worker guard, with publication barriers and producer fences for NT stores. They reuse the existing row arithmetic and full-K lower-first GEMM. The new fan-out combinations trade conversion savings for approximately 32.53/48.80/97.59 MiB of activation publication. Committed preparation wins this family.
+
+The twelve blocked variants cross M={128,256}, N={64,128,256}, K={512,1024}, using committed preparation. The selected kernel retains each worker's M256×N2048 output rectangle, `mgroup=worker%16`, `ngroup=worker/16`, half-range N phase offset, public N32 weight packing, and exact 32×32 AMX arithmetic. It traverses K in ascending four 1024 blocks, zeroes INT32 accumulators for the first block, reloads/stores partial sums thereafter, and applies compensation and floating-point epilogue only after full K. Archival macroblock overlap consumes the previous completed macroblock before overwriting its C slots; replica-local activation/scale offsets also apply to pending output and final drain. Tile release and output fence follow the final drain.
+
+A fresh heap C tensor contributes **7.5 MiB per eligible call**, with 80 KiB per worker and `Cstride=80`. It is allocated inside the timed actual-team guard and published with the existing 48.8 MiB activation arena. There is no retained scratch in production; output remains fresh and inputs/weights remain immutable. The selected active-slice estimate is 400 KiB, versus measured 2 MiB L2 per core; this estimate does not prove residency. Relative to full-K execution, logical extra partial-C traffic is **1,152 MiB per call** for K1024 and 2,688 MiB for K512, excluding the final epilogue C read common to both.
+
+| Configuration | Screen cold ms | Screen warm ms |
+| --- | ---: | ---: |
+| `a_r2_cached` | 2.738238 | 2.468694 |
+| `a_r2_nt` | 2.629183 | 2.374747 |
+| `a_r3_cached` | 2.383160 | 2.111935 |
+| `a_r3_nt` | 2.311473 | 2.014685 |
+| `a_r3_nt_fused` | 2.297494 | 1.982799 |
+| `a_r6_cached` | 2.424205 | 2.155958 |
+| `a_r6_nt` | 2.468632 | 2.180535 |
+| `a_r6_nt_fused` | 2.520674 | 2.220503 |
+| `b_128_128_1024` | 2.297005 | 2.046765 |
+| `b_128_128_512` | 2.715393 | 2.632664 |
+| `b_128_256_1024` | 2.516303 | 2.212586 |
+| `b_128_256_512` | 2.526391 | 2.187751 |
+| `b_128_64_1024` | 2.267934 | 2.084202 |
+| `b_128_64_512` | 2.352829 | 2.052460 |
+| `b_256_128_1024` | 2.247577 | 2.010858 |
+| `b_256_128_512` | 2.308173 | 1.984514 |
+| `b_256_256_1024` | 2.372471 | 2.097381 |
+| `b_256_256_512` | 2.418069 | 2.117936 |
+| `b_256_64_1024` | 2.209222 | 1.964007 |
+| `b_256_64_512` | 2.278946 | 1.968742 |
+| `r_b_256_64_1024_1` | 2.158018 | 1.894135 |
+| `r_b_256_64_1024_2` | 2.166863 | 1.889993 |
+| `r_committed_1` | 2.209759 | 1.921745 |
+| `r_committed_2` | 2.206734 | 1.923476 |
+
+The four retained-scratch variants cross the best full-K and blocked implementations with one or two caller-local arenas. They recompute maxima, activation bytes and scales each call, retain local Tensor ownership through team completion, and allocate fresh outputs. First-use allocation is recorded separately. The best retained finalist has 2.172175 ms / 189.82 cold TOPS against 2.205496 ms frozen stateless, median latency ratio 0.984892 and geometric change -2.262% (95% interval [-3.434%, -1.572%]). It fails both required greater-than-5% gain checks. **Reusable state is rejected**, even though its generic partial-improvement statistic passes; that statistic cannot override the retained-state gate.
+
+### Qualification and conditioning
+
+| Pair | Selected cold ms | Committed cold ms | Legacy cold ms |
+| --- | ---: | ---: | ---: |
+| 1 | 2.208178 | 2.245464 | 3.196471 |
+| 2 | 2.208672 | 2.241863 | 3.221924 |
+| 3 | 2.220709 | 2.241151 | 3.211635 |
+| 4 | 2.193512 | 2.254065 | 3.251930 |
+| 5 | 2.264644 | 2.258560 | 3.204865 |
+
+Process medians range from 2.193512 to 2.264644 ms, standard deviation 0.027201 ms. No samples or process outliers are excluded. Five separate alternating consuming-chain pairs and five alternating retained/stateless pairs are archived. Process pairs are bootstrap units; within-process windows are not independent observations.
+
+Measurements use Intel Xeon 6972P, CPUs96–191/node1, verified Intel OpenMP/tcmalloc preloads, performance governor, 33 disjoint packed-weight banks, full packed huge-page backing, and 1,612,185,600 intervening packed bytes. Builds, tests, cleanup and diagnostic measurements stop during timing. All per-call preparation, allocation, GEMM, epilogue and fence costs are retained for the selected implementation.
+
+### Native phases and conditional CHA evidence
+
+Native groups retain offcore `config1`, untimed counter initialization followed by restored conditioning, five marked calls, actual 96-worker evidence, positive enabled time and exact running/enabled equality. Clock-only captures are separate. Startup covers N256 (64 full-K tiles per worker), and remaining GEMM N1792 (448 tiles). These spans match accumulation coverage, but full-K retains one pending tile while the blocked kernel retains a 16-tile macroblock. Output publication therefore differs at phase boundaries; whole-worker measurements through final drain/fence compare completed output. Independent event-set medians are not an additive elapsed-time balance.
+
+| Absolute count, million cycles per marked call | Committed startup / remaining | Private256 startup / remaining | Selected startup / remaining |
+| --- | ---: | ---: | ---: |
+| AMX busy | 25.232 / 176.170 | 25.177 / 176.166 | 25.344 / 176.170 |
+| Load bound | 99.800 / 331.206 | 67.507 / 327.385 | 85.642 / 340.984 |
+| L2-miss stalls | 73.972 / 111.152 | 38.235 / 112.442 | 60.516 / 115.655 |
+| Fill-buffer full | 53.878 / 156.421 | 35.876 / 157.231 | 42.452 / 153.170 |
+
+Selected startup load-bound cycles decrease versus committed, but remaining load-bound cycles increase. Versus private256, 42.852% of positive load-bound excess persists beyond startup, and the bracket-normalized screen gain is 1.561%; both predeclared gates trigger the bounded driverless EMON repeat. Clock-only median worker durations for preparation/startup/remaining/drain are 140.117/401.140/1556.041/0.203 us committed and 149.995/369.851/1535.001/5.354 us selected. These instrumented durations are excluded from acceptance.
+
+All three implementations have five bounded sequential CHA event sets, verified socket-1 topology (120 CHAs), positive clocks/activity, restored conditioning, and durable collector/workload reaping. Same-set demand-hit inserts/CHA clock are 0.006732 committed, 0.006014 private256 and 0.006682 selected; demand-miss inserts/clock are 0.000400/0.000390/0.000378. RFO-hit inserts/clock are 0.000094/0.000093/0.000112. Raw occupancy, inserts and per-CHA distributions remain archived with separate event-set interpretation. ITOM is zero with unvalidated filter activity, so it cannot establish absent output ownership traffic. These measurements do not prove L2 residency, isolate operand traffic, or establish CHA saturation.
+
+### Correctness, generated code and reproduction
+
+All 24 configurations match frozen seed-123 legacy output exactly with and without bias, over all 50,331,648 output elements. Target-shape fixtures cover unequal scales, quantization ties/boundaries, zero/tiny rows, NaN/Inf, strided inputs and bytewise input immutability. Per-build activation and C allocations plus actual-team evidence replace fixed arena-size recognition. Final selected fixtures additionally prove constrained-team and shape fallback. Retained experiments pass changing-input/weight/bias, prior-output immutability, arena reuse and two overlapping callers with actual 96-worker evidence on every call, despite failing performance acceptance.
+
+Disassembly confirms complete ascending K coverage, first-block zeroing, expected partial-C loads/stores, full-K epilogue lifetime, pending macroblock consumption before overwrite, and final drain before tile release/fence. There are no vector/AMX accumulator spills; scalar pointer/control stack traffic remains. Static instruction-site counts are not runtime work reductions. Diagnostic exports and phase instrumentation remain outside production.
+
+The nearest scaled-MM suite passes **26 tests**, covering team/shape fallback, repeated eligible calls, first direct AMX execution, strided inputs and direct/BRGEMM alternation. The cached RedHatAI/Meta-Llama-3.1-8B-Instruct-quantized.w8a8 comparison passes with identical greedy output for two long prompts and 32 generated tokens. Its six-thread execution is **fallback-only**; it does not qualify model execution of the 96-worker specialization. `verification/final_checks.py b_256_64_1024` runs the scaled-MM pytest entry point and cached comparison with the frozen staged library; exact expanded argument vectors and environments are in its terminal records.
+
+Archive: `/home/tianmuli/vllm_test/snc_scaling_analysis/expanded_200_af3cabd16a_20261030`. It retains all candidate sources, seeded/edge verification, raw five-window samples, complete commands, source/library hashes, assembly, native event descriptors/captures, EMON sets, selection and cleanup/restoration records. Selected source SHA256 is `457cd8a07fa05046a5237ad171be95163d5ee62858631ab604e707cccebe8c0a`; measured library SHA256 is `3019776decad6a1df42d8d57d73064f17ab6a38e41fdd739a92e3d801c8681c5`.
+
+### Cleanup and final delivery
+
+Initial cleanup reclaimed 7,226,421,248 allocated bytes and established more than 8 GiB free before building. Final cleanup compressed rejected/diagnostic libraries and objects (3,876,839,424 bytes reclaimed), deduplicated identical new-iteration source/header aliases with matching permissions (317,468,672 bytes), and compressed 76 additional completed historical libraries/objects (3,043,618,816 bytes). Total recorded gross allocated-block reclamation is **14,464,348,160 bytes / 13.47 GiB**, with **8.15 GiB free** at finalization. Gross artifact savings differ from available-space growth because this iteration retains new evidence and builds. Shared-memory tensor cleanup is recorded separately from disk reclamation.
+
+Each compressed payload was decompressed and SHA256-checked before originals were removed; path/inode/alias hashes, compressed hashes and restoration commands are journaled. Candidate source paths remain separately addressable after deduplication. Unmatched temporary mirrors remain untouched because full canonical equivalence was unproven. Sources, raw measurements, generated assembly, original commands/manifests, frozen controls, legacy tensors, all 44 checked link inputs, required builder directories, archival blocked source, runtime/model environments and pre-existing working-tree edits are preserved. Final checks revalidate 13,026 protected inode hashes, 1,424 directories and three symlinks; two pre-existing FIFOs are observed without mutation. Readable active references were checked, while the non-dumpable systemd/PAM/SSH services' `/proc` inspection limitation is recorded. Every owned build, measurement, verification, model and collector process completed and was reaped before cleanup.
+
+`cleanup_manifest.json` retains its original actions and points to immutable final iteration snapshots. `cleanup_iterations.json`, `supplemental_cleanup.json`, `rejected_cleanup.json` and `source_deduplication.json` provide the combined accounting; `CLEANUP_RESTORATION.md` and `FINAL_RESTORATION.md` provide verified restoration commands. The selected library stays directly loadable. Repository pre-commit hooks and `git diff --check` pass, and the integrated C++ SHA256 remains identical to the qualified source. No new repository tests/helpers were needed: existing public-entry coverage plus archived experiment fixtures cover the consequential behavior risks.
+
+Historical results below remain unchanged. This work used AI assistance and has not opened a PR.
+
+---
+
+## Retained production: bounded GEMM locality experiment (2026-10-30)
+
+**Retain `af3cabd16a` and its lower-first paired implementation.** The selected upper-first traversal reaches 2.237864 ms / 184.25 cold TOPS, versus 2.243848 ms / 183.75 TOPS for the frozen committed baseline. None of its five process medians meets the 2.06158430208 ms threshold. Its geometric paired latency change is -0.631%, with process-pair bootstrap 95% interval [-1.172%, -0.181%]. This improvement is below the greater-than-1% integration gate; the median-of-process-medians improvement is only 0.267%. The retained baseline still needs 0.182264 ms / 8.12% lower latency to reach 200 TOPS in this rerun. The original committed qualification was 2.245140 ms / 183.65 TOPS.
+
+Only four configurations were tested: committed lower-first, constant upper-first, ownership-aware local-first, and the conditional 16-ID pairing follow-up. Production C++ is unchanged. No tuning controls enter production, and `VLLM_CPU_SGL_SCHEDULER=single_shape` retains its existing eligibility guards and fallback.
+
+### Traversal screen and standalone qualification
+
+The outer N64-window loop remains intact, and both M128 halves are processed inside every window. Upper-first visits the upper half then lower; local-first starts at quantization rank `(worker/16)/3`. N-window offsets, output rectangles, pending epilogue, barriers, allocation, arithmetic and full-K `32×32` AMX kernels remain unchanged. Fresh committed processes bracket each candidate screen.
+
+| Screen | Cold median ms | Decision |
+| --- | ---: | --- |
+| Committed brackets, median of three processes | 2.251443 | More than 1% from the fastest screen |
+| Upper-first | 2.238657 | Within 1% of local-first; preferred by the fixed tie rule |
+| Local-first | 2.222271 | Rejected by the tie rule |
+| Upper-first with 16-ID pairing | 2.280568 | Slower than committed brackets 2.245784 / 2.242415 |
+
+The five-pair qualification alternates finalist/committed order, interleaves a fresh legacy control between the arms of every pair, and records five cold and five warm windows per process. Process pairs are the bootstrap units; timing windows inside a process are not independent observations. The controller reference is the frozen committed paired binary, never the old 165.8-TOPS control.
+
+| Pair | Upper-first cold ms | Committed cold ms | Legacy cold ms |
+| --- | ---: | ---: | ---: |
+| 1 | 2.209614 | 2.243848 | 3.185051 |
+| 2 | 2.243523 | 2.251080 | 3.231254 |
+| 3 | 2.213519 | 2.235913 | 3.226300 |
+| 4 | 2.241288 | 2.247510 | 3.211020 |
+| 5 | 2.237864 | 2.238061 | 3.232408 |
+
+Candidate process medians range from 2.209614 to 2.243523 ms, with standard deviation 0.016247 ms. Warm medians are 1.938449 ms upper-first versus 1.931309 ms committed (+0.370% latency). Standalone cold timing determines selection.
+
+Every timing process uses CPUs96–191/node1, explicit verified Intel OpenMP/tcmalloc preloads, checked performance governor, 33 disjoint packed-weight banks, full verified packed huge-page backing and 1,612,185,600 intervening packed bytes. Builds, tests, native diagnostics and EMON collection are stopped during timing. Source-matched actual-96-worker arena proofs establish optimized-path eligibility separately; the timing harness itself records requested/Torch thread counts rather than instrumenting the native team. A pre-existing PCM accelerator service remains recorded in the environment inventory.
+
+### Native startup and steady traversal
+
+Native diagnostics initialize worker perf descriptors in one untimed call, retain that initialization record separately, then restore the full 33-bank cold rotation. Five marked calls per group have 32 intervening packed banks; every marked call records 96 actual workers, positive enabled time and exact running/enabled equality. Preparation, tile setup, first N64 window, remaining 31 windows and final epilogue/fence are separate intervals. The private control also records its conversion inside GEMM separately. Counter groups and clock-only captures use separate processes; their medians do not form an additive elapsed-time balance. Diagnostic sources and event descriptors, including offcore `config1`, remain outside production.
+
+| Absolute count per marked call | Committed first | Private first | Upper first | Committed remaining31 | Private remaining31 | Upper remaining31 |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| AMX busy, million cycles | 6.363 | 6.293 | 6.371 | 195.052 | 195.044 | 195.045 |
+| Load bound, million cycles | 49.910 | 28.690 | 50.572 | 383.166 | 367.179 | 389.684 |
+| L2-miss stalls, million cycles | 46.957 | 23.076 | 45.328 | 139.886 | 132.087 | 143.056 |
+| Fill-buffer full, million cycles | 26.879 | 16.292 | 25.656 | 184.351 | 175.678 | 187.885 |
+| L2 fills, MiB equivalent | 140.636 | 73.366 | 141.128 | 772.376 | 796.002 | 773.535 |
+| Dirty L2 evictions, MiB equivalent | 13.598 | 24.511 | 14.158 | 6.033 | 49.086 | 6.000 |
+| Demand modified-peer, MiB equivalent | 6.585 | 0.001 | 6.918 | 0.002 | 0.007 | 0.004 |
+| All-read modified-peer, MiB equivalent | 48.333 | 0.132 | 48.337 | 0.026 | 0.234 | 0.036 |
+
+Modified-peer request equivalents are approximately 48 MiB in the first window and nearly absent afterward. These are request counts times 64 bytes, including repeated requests, RFO/code/prefetch for the all-read mask; they are not unique bytes or pure LLC-array bandwidth. Mandatory partner-half reads remain.
+
+Committed paired retains +21.220M first-window and +15.987M remaining-window load-bound cycles versus private256. Upper-first retains +21.882M and +22.505M respectively, with positive total GEMM excess in all five calls and +48.005 MiB-equivalent modified-peer requests. Its steady share of positive excess is 50.702%; committed paired's is 42.967%. Both predeclared gates pass. Clock-only median worker remaining-window durations are 1775.31/1690.72/1783.19 microseconds for committed/private/upper. These instrumented durations are excluded from cold acceptance.
+
+The sole pairing follow-up changes `replica=ngroup/2` and `rank=ngroup%2` while retaining upper-first, the original M/N output rectangles, three replicas, 128 converted rows per worker, single-worker allocation, both barriers and the 48.8 MiB arena. Worker IDs do not establish physical die proximity. Near-pair minus upper-first median load-bound differences are +2.948M first, -1.085M remaining and +3.302M complete GEMM cycles; the five call differences vary in sign. Complete-GEMM and interval medians need not add. Modified-peer equivalents remain 48.438 versus 48.370 MiB, and remaining-window clocks are 1783.91 versus 1783.19 microseconds. No reproducible delivery benefit supports the pairing change.
+
+### Conditional CHA checkpoint
+
+The steady-excess gate triggered driverless EMON. Committed paired, private256 and upper-first each receive five sequential bounded event-group collections after allocation, correctness, warmup and cold conditioning. Socket-1 totals and all 120 per-CHA distributions are retained in `emon/comparison.json`. Actual topology, schedules and activity are validated; hit inserts/clocks and occupancy use separate event sets. Every successful collector and workload is reaped.
+
+| Socket-1 diagnostic | Committed | Private256 | Upper-first |
+| --- | ---: | ---: | ---: |
+| Demand-hit inserts, billion/s | 1.704 | 1.473 | 1.803 |
+| Demand-hit occupancy, billion occupied cycles/s | 89.677 | 39.552 | 102.061 |
+| Demand-miss occupancy, billion occupied cycles/s | 25.420 | 24.227 | 28.687 |
+| Demand-hit occupancy per-CHA coefficient of variation | 0.123 | 0.080 | 0.128 |
+| Same-set hit inserts / CHA clock | 0.006633 | 0.005949 | 0.007418 |
+
+Upper-first retains elevated demand-hit occupancy; it does not remove the cache-delivery signal. These whole-operator captures do not isolate the steady GEMM interval or establish CHA saturation. Occupancy/inserts ratios across separate sets are not simultaneous exact latency measurements. Each group has one sequential process per control and no paired confidence interval. RFO counters are active; ITOM remains zero, so activity of that filter is unvalidated and zero is not proof of absent ownership traffic.
+
+The collector's initial soft descriptor limit is 65,536; EMON subsequently changes its own runtime limit to 94,092, recorded in `fd_validation.json`. No driver was loaded and no persistent system setting changed. Two failed initialization/control attempts are preserved: finite paused loops could expire before conditioning, and `--driverless -resume` initialized a competing session. The successful collector runs driverless with bounded parent lifecycle and plain `-resume`/`-stop` control commands.
+
+### Separate output-consuming chain
+
+Five separate alternating fresh-process pairs measure the operator followed immediately by `torch.sum(result, dtype=torch.float32)`. They retain the same cold-conditioning and preload controls. Chain medians are 2.934177 ms upper-first versus 2.963215 ms committed; geometric paired latency change -0.079%, bootstrap 95% interval [-1.779%, +1.940%]. Warm chain medians are 2.735873 versus 2.749555 ms (-0.498% latency). This diagnostic does not replace standalone cold acceptance.
+
+| Pair | Upper-first chain cold ms | Committed chain cold ms |
+| --- | ---: | ---: |
+| 1 | 3.068527 | 2.963215 |
+| 2 | 2.929343 | 2.947146 |
+| 3 | 2.914645 | 2.985892 |
+| 4 | 2.934177 | 2.986570 |
+| 5 | 2.971299 | 2.944606 |
+
+### Verification and reproducibility
+
+All three new configurations pass frozen seeded legacy comparisons through the real public operator: bias/no-bias, strided input, unequal scales, quantization boundaries, NaN/Inf cases, bytewise immutable inputs and fallback. Each compares all 100,666,464 output elements exactly and records the 51,167,232-byte arena on both eligible target calls. Source review verifies the traversal/pairing-only changes. Generated AMX instruction-site counts remain unchanged across controls: 160 `tdpbusd`, 160 `tileloadd`, 8 `tilestored`, 16 `tilezero`, 2 `ldtilecfg`, 2 `tilerelease`, 34 `vmovntdq`, 2 `sfence` across bias specializations.
+
+The existing `tests/kernels/quantization/test_scaled_mm_kernel_selection.py` suite passes **26 tests** (2 warnings, 302.69 s) against the finalist stage. It covers strided eligible input, shape/team fallback, repeated eligible calls, first direct AMX execution and alternating direct/BRGEMM execution. No new test file or duplicate repeated-call fixture was added. The cached `RedHatAI/Meta-Llama-3.1-8B-Instruct-quantized.w8a8` comparison gives exact legacy/single-shape tokens for two long prompts and 32 greedy output tokens. It verifies fallback generation only: six OpenMP threads were configured, while observed spawned threads were bound to CPU0. It does not establish model performance or 96-worker model execution. All test/model processes are reaped; temporary comparison tensors were removed after successful checks.
+
+Required pre-commit hooks and `git diff --check` are recorded in the completed archive. No production kernel, public interface or eligibility behavior changed. The retained source SHA256 is `8b54af658715cbbc940ffc382bc43906b40b069f132e883e55b3cc28330cbf7d`; committed library SHA256 `fbbb24219ac74295276d96164fbfdf1b552f7b3632f92a137fc7eaa745a3ef01`. Finalist library SHA256 is `441fd51d6072410f465dae5e55b783760b4f2fd75932f952feadb6b929f24daa`. `controls.json` binds private256 and legacy sources/libraries too.
+
+Archive: `/home/tianmuli/vllm_test/snc_scaling_analysis/gemm_locality_af3cabd16a_20261030`. It preserves source snapshots, binaries, exact compile/link commands, generated-code review, raw samples/counters, initialization records, EMON distributions, failed collection attempts, original/compressed hashes, terminal/reaping records and final selection. `README.md` documents dependencies and restore/reproduction commands. The prior archives remain immutable. AI assistance was used for implementation, measurements and reporting.
+
+```sh
+# Archived commands; use fresh output paths/tags for a new measurement campaign.
+.venv/bin/python /home/tianmuli/vllm_test/snc_scaling_analysis/gemm_locality_af3cabd16a_20261030/experiment.py qualify upper_first --tag fresh_qualification
+.venv/bin/python /home/tianmuli/vllm_test/snc_scaling_analysis/gemm_locality_af3cabd16a_20261030/profile.py /home/tianmuli/vllm_test/snc_scaling_analysis/gemm_locality_af3cabd16a_20261030/upper_first/stage/vllm /home/tianmuli/vllm_test/snc_scaling_analysis/gemm_locality_af3cabd16a_20261030/empty.json --reference /home/tianmuli/vllm_test/snc_scaling_analysis/gemm_locality_af3cabd16a_20261030/controls/committed/stage/vllm --chain-only --out /path/to/fresh_chain_pair
+/home/tianmuli/vllm_test/vllm_local/.venv/bin/python -m pre_commit run --files docs/getting_started/installation/cpu.md benchmarks/kernels/cpu/single_shape_int8_report.md
+```
+
+## Previous production selection: paired quantization replicas (2026-10-30)
 
 **Selected: 2.245140 ms / 183.65 cold TOPS, with 9.841% lower latency than the frozen current control. The 200-TOPS target remains unmet.** All five candidate process medians exceed 2.06158430208 ms; another 0.183556 ms (8.18%) latency reduction is required. The paired process-bootstrap 95% interval for latency change is [-10.364%, -9.239%]. The preselected partial-improvement gate passes.
 

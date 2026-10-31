@@ -16,6 +16,9 @@
 namespace {
 
 constexpr int64_t SINGLE_SHAPE_A_STRIDE = 4160;
+constexpr int64_t SINGLE_SHAPE_M_MACRO = 256;
+constexpr int64_t SINGLE_SHAPE_N_MACRO = 64;
+constexpr int64_t SINGLE_SHAPE_K_BLOCK = 1024;
 
 template <typename scalar_t, bool has_bias, int BLOCK_N, bool stream_output = false>
 struct scale_C {
@@ -387,40 +390,32 @@ struct alignas(64) Int8TileConfig {
   }
 };
 
-struct SingleShapePending {
-  at::BFloat16* out = nullptr;
-  const int8_t* B = nullptr;
-  const int32_t* C = nullptr;
-  const float* As = nullptr;
-  const float* Bs = nullptr;
-  const float* bias = nullptr;
-};
+
 
 template <bool has_bias, bool has_pending>
 void single_shape_tile(
     const uint8_t* __restrict__ A,
     const int8_t* __restrict__ B,
     int32_t* __restrict__ Ctmp,
-    const SingleShapePending& pending) {
-  constexpr int64_t K = 4096, N = 12288;
-  __m512 scale0, scale1, bias0, bias1;
-  __m512i comp0, comp1;
-  if constexpr (has_pending) {
-    const auto* comp = reinterpret_cast<const int32_t*>(pending.B + 32 * K);
-    scale0 = _mm512_loadu_ps(pending.Bs);
-    scale1 = _mm512_loadu_ps(pending.Bs + 16);
-    comp0 = _mm512_loadu_si512(comp);
-    comp1 = _mm512_loadu_si512(comp + 16);
-    if constexpr (has_bias) {
-      bias0 = _mm512_loadu_ps(pending.bias);
-      bias1 = _mm512_loadu_ps(pending.bias + 16);
-    }
+    int64_t k_begin,
+    at::BFloat16* __restrict__ pending_out,
+    const float* __restrict__ pending_As,
+    const float* __restrict__ pending_Bs,
+    const float* __restrict__ pending_bias,
+    const int32_t* __restrict__ pending_comp) {
+  constexpr int64_t C_STRIDE = SINGLE_SHAPE_N_MACRO + 16;
+  if (k_begin == 0) {
+    _tile_zero(0);
+    _tile_zero(1);
+    _tile_zero(2);
+    _tile_zero(3);
+  } else {
+    _tile_loadd(0, Ctmp, C_STRIDE * sizeof(int32_t));
+    _tile_loadd(1, Ctmp + 16, C_STRIDE * sizeof(int32_t));
+    _tile_loadd(2, Ctmp + 16 * C_STRIDE, C_STRIDE * sizeof(int32_t));
+    _tile_loadd(3, Ctmp + 16 * C_STRIDE + 16, C_STRIDE * sizeof(int32_t));
   }
-  _tile_zero(0);
-  _tile_zero(1);
-  _tile_zero(2);
-  _tile_zero(3);
-  for (int64_t k0 = 0; k0 < 512; k0 += 256) {
+  for (int64_t k0 = k_begin; k0 < k_begin + SINGLE_SHAPE_K_BLOCK; k0 += 256) {
     Unroll<4>{}([&](auto u) {
       const int64_t k = k0 + u * 64;
       _tile_loadd(4, A + k, SINGLE_SHAPE_A_STRIDE);
@@ -432,45 +427,81 @@ void single_shape_tile(
       _tile_dpbusd(1, 4, 7);
       _tile_dpbusd(3, 5, 7);
       if constexpr (has_pending) {
-        Unroll<4>{}([&](auto row) {
-          const int64_t m = (k / 64) * 4 + row;
-          const __m512 row_scale = _mm512_set1_ps(pending.As[m]);
-          __m512 v0 = _mm512_cvtepi32_ps(_mm512_sub_epi32(
-              _mm512_loadu_si512(pending.C + m * 32), comp0));
-          __m512 v1 = _mm512_cvtepi32_ps(_mm512_sub_epi32(
-              _mm512_loadu_si512(pending.C + m * 32 + 16), comp1));
-          if constexpr (has_bias) {
-            v0 = _mm512_fmadd_ps(_mm512_mul_ps(v0, row_scale), scale0, bias0);
-            v1 = _mm512_fmadd_ps(_mm512_mul_ps(v1, row_scale), scale1, bias1);
-          } else {
-            v0 = _mm512_mul_ps(_mm512_mul_ps(v0, row_scale), scale0);
-            v1 = _mm512_mul_ps(_mm512_mul_ps(v1, row_scale), scale1);
-          }
-          _mm512_stream_si512(reinterpret_cast<__m512i*>(pending.out + m * N),
-              (__m512i)_mm512_cvtne2ps_pbh(v1, v0));
-        });
+        constexpr int64_t ROWS_PER_STEP = 2048 / SINGLE_SHAPE_K_BLOCK;
+        const int64_t step = (k - k_begin) / 64;
+        for (int64_t row = step * ROWS_PER_STEP; row < (step + 1) * ROWS_PER_STEP; ++row) {
+          scale_C<at::BFloat16, has_bias, 32, true>::apply(
+              pending_out + row * 12288, Ctmp + row * C_STRIDE,
+              pending_comp, pending_bias, pending_As[row], pending_Bs);
+        }
       }
     });
   }
-  for (int64_t k0 = 512; k0 < K; k0 += 256) {
-    Unroll<4>{}([&](auto u) {
-      const int64_t k = k0 + u * 64;
-      _tile_loadd(4, A + k, SINGLE_SHAPE_A_STRIDE);
-      _tile_loadd(6, B + k * 32, 128);
-      _tile_dpbusd(0, 4, 6);
-      _tile_loadd(5, A + 16 * SINGLE_SHAPE_A_STRIDE + k, SINGLE_SHAPE_A_STRIDE);
-      _tile_dpbusd(2, 5, 6);
-      _tile_loadd(7, B + k * 32 + 64, 128);
-      _tile_dpbusd(1, 4, 7);
-      _tile_dpbusd(3, 5, 7);
-    });
-  }
-  _tile_stored(0, Ctmp, 128);
-  _tile_stored(1, Ctmp + 16, 128);
-  _tile_stored(2, Ctmp + 16 * 32, 128);
-  _tile_stored(3, Ctmp + 16 * 32 + 16, 128);
+  _tile_stored(0, Ctmp, C_STRIDE * sizeof(int32_t));
+  _tile_stored(1, Ctmp + 16, C_STRIDE * sizeof(int32_t));
+  _tile_stored(2, Ctmp + 16 * C_STRIDE, C_STRIDE * sizeof(int32_t));
+  _tile_stored(3, Ctmp + 16 * C_STRIDE + 16, C_STRIDE * sizeof(int32_t));
 }
 
+template <bool has_bias>
+void single_shape_gemm(
+    at::BFloat16* __restrict__ out,
+    const uint8_t* __restrict__ A,
+    const int8_t* __restrict__ B,
+    const float* __restrict__ As,
+    const float* __restrict__ Bs,
+    const float* __restrict__ bias,
+    int32_t* __restrict__ workspace,
+    int64_t worker) {
+  constexpr int64_t K = 4096, N = 12288;
+  constexpr int64_t C_STRIDE = SINGLE_SHAPE_N_MACRO + 16;
+  constexpr int64_t WINDOWS = 2048 / SINGLE_SHAPE_N_MACRO;
+  const int64_t m0 = (worker % 16) * 256;
+  const int64_t n0 = (worker / 16) * 2048;
+  int32_t* Ctmp = workspace + worker * SINGLE_SHAPE_M_MACRO * C_STRIDE;
+  int64_t previous_mc = 0, previous_nc = 0;
+  bool previous_valid = false;
+  at::native::cpublas::brgemm_release();
+  const Int8TileConfig config;
+  _tile_loadconfig(&config);
+  for (int64_t w = 0; w < WINDOWS; ++w) {
+    const int64_t first_window = (worker % 2) * (WINDOWS / 2);
+    const int64_t nc = n0 + ((w + first_window) % WINDOWS) * SINGLE_SHAPE_N_MACRO;
+    for (int64_t mc = m0; mc < m0 + 256; mc += SINGLE_SHAPE_M_MACRO) {
+      for (int64_t kb = 0; kb < K; kb += SINGLE_SHAPE_K_BLOCK) {
+        AT_DISPATCH_BOOL(kb == 0 && previous_valid, has_pending, [&] {
+          for (int64_t n = nc; n < nc + SINGLE_SHAPE_N_MACRO; n += 32) {
+            for (int64_t m = mc; m < mc + SINGLE_SHAPE_M_MACRO; m += 32) {
+              const int64_t old_m = previous_mc + (m - mc);
+              const int64_t old_n = previous_nc + (n - nc);
+              single_shape_tile<has_bias, has_pending>(
+                  A + (m - m0) * SINGLE_SHAPE_A_STRIDE, B + n * (K + 4),
+                  Ctmp + (m - mc) * C_STRIDE + (n - nc), kb,
+                  has_pending ? out + old_m * N + old_n : nullptr,
+                  has_pending ? As + old_m - m0 : nullptr,
+                  has_pending ? Bs + old_n : nullptr,
+                  has_pending && has_bias ? bias + old_n : nullptr,
+                  has_pending ? reinterpret_cast<const int32_t*>(B + old_n * (K + 4) + 32 * K) : nullptr);
+            }
+          }
+        });
+      }
+      previous_mc = mc;
+      previous_nc = nc;
+      previous_valid = true;
+    }
+  }
+      for (int64_t n = previous_nc; n < previous_nc + SINGLE_SHAPE_N_MACRO; n += 32) {
+        const auto* comp = reinterpret_cast<const int32_t*>(B + n * (K + 4) + 32 * K);
+        for (int64_t m = previous_mc; m < previous_mc + SINGLE_SHAPE_M_MACRO; ++m) {
+          scale_C<at::BFloat16, has_bias, 32, true>::apply(
+              out + m * N + n, Ctmp + (m - previous_mc) * C_STRIDE + (n - previous_nc),
+              comp, has_bias ? bias + n : nullptr, As[m - m0], Bs + n);
+        }
+      }
+  _tile_release();
+  _mm_sfence();
+}
 inline float single_shape_row_amax(const at::BFloat16* __restrict__ A) {
   constexpr int64_t K = 4096;
   constexpr float eps = 1e-7;
@@ -516,52 +547,7 @@ inline void single_shape_quant_from_amax(
   As = scale;
 }
 
-template <bool has_bias>
-void single_shape_gemm(
-    at::BFloat16* __restrict__ out,
-    const uint8_t* __restrict__ A,
-    const int8_t* __restrict__ B,
-    const float* __restrict__ As,
-    const float* __restrict__ Bs,
-    const float* __restrict__ bias,
-    int64_t worker) {
-  constexpr int64_t K = 4096, N = 12288;
-  alignas(64) int32_t Cbuffers[2][32 * 32];
-  int buffer = 0;
-  SingleShapePending pending;
-  const int64_t m0 = (worker % 16) * 256;
-  const int64_t n0 = (worker / 16) * 2048;
-  at::native::cpublas::brgemm_release();
-  const Int8TileConfig config;
-  _tile_loadconfig(&config);
-  for (int64_t w = 0; w < 32; ++w) {
-    const int64_t first_window = (worker % 2) * 16;
-    const int64_t nc = n0 + ((w + first_window) % 32) * 64;
-    for (int64_t mc = m0; mc < m0 + 256; mc += 128) {
-      for (int64_t n = nc; n < nc + 64; n += 32) {
-        for (int64_t m = mc; m < mc + 128; m += 32) {
-          if (pending.out) {
-            single_shape_tile<has_bias, true>(
-                A + (m - m0) * SINGLE_SHAPE_A_STRIDE, B + n * (K + 4), Cbuffers[buffer], pending);
-          } else {
-            single_shape_tile<has_bias, false>(
-                A + (m - m0) * SINGLE_SHAPE_A_STRIDE, B + n * (K + 4), Cbuffers[buffer], pending);
-          }
-          pending = {out + m * N + n, B + n * (K + 4), Cbuffers[buffer],
-                     As + m - m0, Bs + n, has_bias ? bias + n : nullptr};
-          buffer ^= 1;
-        }
-      }
-    }
-  }
-  const auto* comp = reinterpret_cast<const int32_t*>(pending.B + 32 * K);
-  for (int64_t m = 0; m < 32; ++m) {
-    scale_C<at::BFloat16, has_bias, 32, true>::apply(
-        pending.out + m * N, pending.C + m * 32, comp, pending.bias, pending.As[m], pending.Bs);
-  }
-  _tile_release();
-  _mm_sfence();
-}
+
 #endif
 
 }  // anonymous namespace
@@ -740,6 +726,7 @@ at::Tensor int8_scaled_mm_with_quant(
   auto buffer = at::empty({buffer_size}, mat1.options().dtype(at::kByte));
   auto out = at::empty({M, N}, mat1.options().dtype(out_dtype));
   at::Tensor paired_arena;
+  at::Tensor accumulator_arena;
 
   const bool has_bias = bias.has_value();
   const float* bias_data = nullptr;
@@ -783,6 +770,9 @@ at::Tensor int8_scaled_mm_with_quant(
           if (execute.worker == 0) {
             paired_arena = at::empty({48 * pair_segment_bytes},
                 mat1.options().dtype(at::kByte));
+            accumulator_arena = at::empty(
+                {96 * SINGLE_SHAPE_M_MACRO * (SINGLE_SHAPE_N_MACRO + 16)},
+                mat1.options().dtype(at::kInt));
           }
           execute.quantize(M, [&](int64_t begin, int64_t end) __attribute__((always_inline)) {
             for (int64_t m = begin; m < end; ++m) {
@@ -808,7 +798,8 @@ at::Tensor int8_scaled_mm_with_quant(
           AT_DISPATCH_BOOL(has_bias, with_bias, [&] {
             single_shape_gemm<with_bias>(
                 out.data_ptr<at::BFloat16>(), pair_Aq, packed_w.data_ptr<int8_t>(),
-                pair_As, scales2.data_ptr<float>(), bias_data, execute.worker);
+                pair_As, scales2.data_ptr<float>(), bias_data,
+                accumulator_arena.data_ptr<int32_t>(), execute.worker);
           });
           return;
         }
