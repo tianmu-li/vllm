@@ -53,6 +53,8 @@ if TYPE_CHECKING:
     VLLM_CPU_KVCACHE_SPACE: int | None = 0
     VLLM_CPU_OMP_THREADS_BIND: str = "auto"
     VLLM_CPU_NUM_OF_RESERVED_CPU: int | None = None
+    VLLM_CPU_SGL_SCHEDULER: str = ""
+    VLLM_CPU_SGL_DISPATCH: bool = False
     VLLM_CPU_CI_ENV: bool = False
     VLLM_CPU_ATTN_SPLIT_KV: bool = True
     VLLM_ZENTORCH_WEIGHT_PREPACK: bool = True
@@ -907,6 +909,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
         if "VLLM_CPU_NUM_OF_RESERVED_CPU" in os.environ
         else None
     ),
+    # (Experimental CPU backend only) dense INT8 scheduling: legacy (default) or
+    # generic (actual-team execution with direct AMX kernels when eligible).
+    # Restart after changing the mode.
+    "VLLM_CPU_SGL_SCHEDULER": lambda: os.getenv("VLLM_CPU_SGL_SCHEDULER", ""),
+    # Report the executed dense INT8 kernel and actual OpenMP team size.
+    "VLLM_CPU_SGL_DISPATCH": lambda: bool(int(os.getenv("VLLM_CPU_SGL_DISPATCH", "0"))),
     # (CPU backend only) whether vLLM is running in a CI environment.
     "VLLM_CPU_CI_ENV": lambda: bool(int(os.getenv("VLLM_CPU_CI_ENV", "0"))),
     # (CPU backend only) whether to enable attention spilt KV.
@@ -2427,6 +2435,9 @@ def compile_factors() -> dict[str, object]:
         "VLLM_ENABLE_V1_MULTIPROCESSING",
         "VLLM_V1_OUTPUT_PROC_CHUNK_SIZE",
         "VLLM_CPU_KVCACHE_SPACE",
+        # Native work assignment does not change compiled graph code.
+        "VLLM_CPU_SGL_SCHEDULER",
+        "VLLM_CPU_SGL_DISPATCH",
         "VLLM_CPU_MOE_PREPACK",
         "VLLM_ZENTORCH_WEIGHT_PREPACK",
         "VLLM_TEST_FORCE_LOAD_FORMAT",
